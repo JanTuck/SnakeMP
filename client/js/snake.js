@@ -1,26 +1,23 @@
-import {ARROW_DOWN, ARROW_LEFT, ARROW_RIGHT, ARROW_UP} from "./userInput.js";
-
-let snakeX;
-let snakeY;
-let addBody = false;
 export default class Snake {
     constructor(ctx, data) {
         this.scale = 16;
-        this.color = data.color;
-        this.snake = [];
         this.ctx = ctx;
         this.canvas = ctx.canvas;
+        this.snake = [];
+        this.update(data);
+    }
+
+    // Refresh the mutable state of an already existing snake.
+    update(data) {
+        this.color = data.color;
         this.snake = data.snake;
         this.id = data.id;
         this.displayName = data.displayName;
         this.bodyLength = data.bodyLength;
-        this.pressingRight = data.pressingRight;
-        if (data.pressingRight) this.direction = ARROW_RIGHT;
-        if (data.pressingLeft) this.direction = ARROW_LEFT;
-        if (data.pressingUp) this.direction = ARROW_UP;
-        if (data.pressingDown) this.direction = ARROW_DOWN;
+        this.score = data.score;
     }
     setDirection(direction) {
+        // Direction is authoritative on the server; kept for future use.
         this.direction = direction;
     }
 

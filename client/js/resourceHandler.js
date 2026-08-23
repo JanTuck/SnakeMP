@@ -12,7 +12,7 @@ export default class ResourceHandler {
 
 
     getImage(name) {
-        this.images.get(name);
+        return this.images.get(name);
     }
 
     addImage(name, image) {

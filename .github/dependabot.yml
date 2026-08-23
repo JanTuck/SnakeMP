@@ -1,0 +1,20 @@
+version: 2
+updates:
+  # Keep server dependencies patched.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    # Batch non-breaking updates so security/patch PRs stay reviewable.
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Keep any future GitHub Actions workflows patched too.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

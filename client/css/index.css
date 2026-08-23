@@ -4,7 +4,7 @@
 h1{
     text-align: center;
     font-size: 2.2em;
-    color: white;
+    color: #222222;
     margin: 7% 0;
 }
 
@@ -41,7 +41,6 @@ body {
     text-align: center;
     cursor: pointer;
     text-transform: uppercase;
-    outline: none;
     overflow: hidden;
     position: relative;
     color: #fff;
@@ -75,6 +74,13 @@ body {
 .btn:hover:after {
     -webkit-transform: translateX(-9%) translateY(-25%) rotate(45deg);
     transform: translateX(-9%) translateY(-25%) rotate(45deg);
+}
+
+.btn:focus-visible,
+input:focus-visible,
+button:focus-visible {
+    outline: 2px solid #ffffff;
+    outline-offset: 2px;
 }
 
 .link {
