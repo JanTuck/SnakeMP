@@ -10,6 +10,7 @@
 <body>
 <h1>Snek - The multiplayer snake</h1>
 <div class="small-container">
+    <p id="join_error" role="alert" hidden></p>
     <form method="post" action="/joingame">
         <label for="gameId">
             Join a game using its url or id
@@ -25,5 +26,15 @@
         <input class="btn" type="submit" value="Create Game"/>
     </form>
 </div>
+<script>
+    (function () {
+        var params = new URLSearchParams(window.location.search);
+        if (params.get('error') === 'unknown-game') {
+            var el = document.getElementById('join_error');
+            el.textContent = 'That game id does not exist. Double-check it or create a new game.';
+            el.hidden = false;
+        }
+    })();
+</script>
 </body>
 </html>

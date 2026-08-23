@@ -43,15 +43,20 @@ app.post('/generateid', (req, res) => {
         gameId = uniqueId();
     } while (LOBBY_LIST.has(gameId));
     LOBBY_LIST.set(gameId, {createdAt: Date.now()});
-    res.redirect(`/game/${encodeURIComponent(gameId)}`);
+    // 303 so a refresh of the landing page cannot re-submit the POST.
+    res.redirect(303, `/game/${encodeURIComponent(gameId)}`);
 });
 app.post('/joingame', (req, res) => {
-    const gameId = req.body && req.body.gameId;
-    if (typeof gameId === 'string' && LOBBY_LIST.has(gameId)) {
-        res.redirect(`/game/${encodeURIComponent(gameId)}`);
-    } else {
-        res.redirect('/');
+    const rawGameId = req.body && req.body.gameId;
+    if (typeof rawGameId === 'string') {
+        const gameId = rawGameId.trim();
+        if (LOBBY_LIST.has(gameId)) {
+            res.redirect(303, `/game/${encodeURIComponent(gameId)}`);
+            return;
+        }
     }
+    // Unknown/bad id: back home with feedback instead of a silent bounce.
+    res.redirect(303, '/?error=unknown-game');
 });
 
 app.get('/game/:id', (req, res) => {
