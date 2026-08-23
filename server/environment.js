@@ -1,6 +1,4 @@
 const CONSTANTS = require('./constants');
-const food = require('./food');
-const Collision = require('./collision');
 
 class Environment {
 
@@ -11,18 +9,30 @@ class Environment {
         }
     };
 
-    static startPosition(sockets) {
+    /**
+     * Pick a random location that no player currently occupies.
+     * The old recursive version discarded its own result, so overlaps were
+     * still possible; this retries iteratively instead.
+     */
+    static startPosition(players) {
+        const MAX_ATTEMPTS = 1000;
         let location = this.getRanLocation();
-        for (let socket of sockets) {
-            let player = socket.player;
-            let snake = player.snake;
-            for (let i = 0; i < snake.length; i++) {
-                if (location.x === snake[i].x && location.y === snake[i].y) {
-                    this.startPosition(sockets);
+        for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+            let overlaps = false;
+            for (let player of players) {
+                for (let part of player.snake) {
+                    if (location.x === part.x && location.y === part.y) {
+                        overlaps = true;
+                        break;
+                    }
                 }
+                if (overlaps) break;
             }
+            if (!overlaps) return {x: location.x, y: location.y};
+            location = this.getRanLocation();
         }
-        return {x: location.x, y: location.y}
+        // Board is effectively saturated; any free-looking spot will do.
+        return {x: location.x, y: location.y};
     }
 }
 
