@@ -34,27 +34,50 @@ img {
     left: 50%;
     top: 40%;
     transform: translate(-50%, -50%);
-    min-width: 300px;
-    min-height: 140px;
-    border-radius: 5px;
-    border: 1px solid darkgray;
-    background-color: white;
+    min-width: 320px;
+    border-radius: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    background-color: #141822;
+    color: #faebd7;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
 }
 .popup > .popup_content{
-    margin: 15px;
+    margin: 22px 24px;
+}
+.popup h1{
+    margin: 0 0 14px;
+    font-size: 1.25em;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: rgba(250, 235, 215, 0.65);
+}
+.popup label{
+    display: block;
+    margin-bottom: 6px;
+    color: rgba(250, 235, 215, 0.65);
+    font-size: 0.92em;
 }
 .popup input[type="text"]{
     display: block;
-    width: 90%;
-    padding: 7px 5px;
-    background-color: #222222;
-    border: none;
-    color: white;
+    width: 100%;
+    padding: 11px 12px;
+    background-color: #0d1017;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    color: #faebd7;
+    font-size: 1em;
+    text-align: center;
+    transition: border-color 0.15s ease;
 }
+.popup input[type="text"]:focus{ border-color: #e0362c; }
 .popup .btn {
     display: block;
-    margin: 15px auto 0; /* centre the action under the form */
+    margin: 16px auto 0; /* centre the action under the form */
+    background: linear-gradient(180deg, #ea4a3f, #b02a22);
+    box-shadow: 0 6px 18px rgba(224, 54, 44, 0.35);
 }
+.popup .btn:hover{ background: linear-gradient(180deg, #f2554a, #c22f27); }
 .btn {
     border: none;
     display: inline-block;
@@ -71,6 +94,8 @@ img {
     margin-top: 15px;
     box-shadow: 0 5px 15px rgba(0, 0, 0, 0.20);
     font-family: 'Montserrat', sans-serif;
+    border-radius: 8px;
+    letter-spacing: 0.1em;
 }
 .btn:hover {
     background-color: #000;
@@ -95,3 +120,82 @@ button:focus-visible {
     font-size: 1.2em;
     text-align: center;
 }
+
+/* ---- HUD overlay ---- */
+#hud{
+    position: fixed;
+    inset: 0;
+    pointer-events: none; /* the board keeps receiving clicks */
+    font-family: 'Montserrat', sans-serif;
+    z-index: 50;
+}
+.hud-panel{
+    position: absolute;
+    left: 16px;
+    background: rgba(20, 24, 34, 0.82);
+    color: #f4f4f4;
+    border-radius: 8px;
+    padding: 10px 14px;
+    min-width: 170px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+    backdrop-filter: blur(3px);
+}
+#hud_score{
+    top: 16px;
+    display: flex;
+    gap: 14px;
+    align-items: baseline;
+    font-size: 15px;
+}
+#hud_score .hud-you{
+    font-weight: 700;
+    max-width: 160px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+#hud_score .hud-stat{ font-variant-numeric: tabular-nums; }
+#hud_board{
+    top: 74px;
+    font-size: 13px;
+    line-height: 1.5;
+}
+.hud-row{ display: flex; gap: 8px; }
+.hud-row .hud-rank{ opacity: 0.6; width: 18px; }
+.hud-row .hud-name{ flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px; }
+.hud-row .hud-pts{ font-variant-numeric: tabular-nums; font-weight: 700; }
+.hud-row.hud-me .hud-name{ color: #8fd3ff; }
+#hud_feed{
+    position: absolute;
+    right: 16px;
+    top: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    align-items: flex-end;
+}
+.hud-feed-item{
+    background: rgba(20, 24, 34, 0.82);
+    color: #f4f4f4;
+    border-radius: 8px;
+    padding: 6px 12px;
+    font-size: 13px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+    backdrop-filter: blur(3px);
+}
+.hud-feed-item .hud-icon{ margin-right: 4px; }
+#hud_mute{
+    position: absolute;
+    right: 16px;
+    bottom: 16px;
+    pointer-events: auto;
+    border: none;
+    background: rgba(20, 24, 34, 0.82);
+    color: #f4f4f4;
+    font-size: 18px;
+    border-radius: 8px;
+    padding: 8px 10px;
+    cursor: pointer;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+#hud_mute:hover{ background: rgba(40, 46, 62, 0.9); }

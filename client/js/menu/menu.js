@@ -13,12 +13,12 @@ export default class Menu{
     drawButtons(){
         let ctx = this.ctx;
         let buttonArray = this.buttonArray;
-        ctx.fillStyle = "lightblue";
+        ctx.fillStyle = this.buttonColor || "lightblue";
         ctx.textAlign = "center";
         ctx.font = "bold 16px Verdana";
         for (let i = 0; i < buttonArray.length; i++) {
             ctx.fillRect(buttonArray[i].x, buttonArray[i].y, buttonArray[i].width, buttonArray[i].height);
-            ctx.fillStyle = "black";
+            ctx.fillStyle = this.buttonTextColor || "black";
             ctx.fillText(buttonArray[i].text, buttonArray[i].x+buttonArray[i].width/2, buttonArray[i].y+buttonArray[i].height/1.5);
         }
 

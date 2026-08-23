@@ -1,110 +1,195 @@
+/* Snek theme: dark navy backdrop echoing the arena, cream type,
+   apple-red and leaf-green actions. */
 @import url('https://fonts.googleapis.com/css?family=Lexend+Exa|Raleway&display=swap');
 
-
-h1{
-    text-align: center;
-    font-size: 2.2em;
-    color: #222222;
-    margin: 7% 0;
+:root {
+    --bg: #232733;
+    --panel: #141822;
+    --panel-edge: rgba(255, 255, 255, 0.08);
+    --cream: #faebd7;
+    --cream-dim: rgba(250, 235, 215, 0.65);
+    --apple: #e0362c;
+    --apple-dark: #b02a22;
+    --leaf: #2ecc71;
+    --leaf-dark: #239a55;
+    --gold: #f7d31e;
 }
+
+* { box-sizing: border-box; }
 
 body {
     margin: 0;
-    height: 100%;
-    background-image: linear-gradient(to top, #9796f0 0%, #fbc7d4 100%);
-    background-repeat: no-repeat;
-    background-size: cover;
-    background-attachment: fixed;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: var(--bg);
+    /* Same faint grid as the arena board, for a matched feel. */
+    background-image:
+        linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+    background-size: 32px 32px;
     font-family: 'Raleway', sans-serif;
+    color: var(--cream);
 }
 
-.button_container {
-    position: absolute;
-    left: 0;
-    right: 0;
-    top: 30%;
-}
-
-.description, .link {
-    font-family: 'Amatic SC', cursive;
+.hero {
+    width: min(460px, 92vw);
     text-align: center;
+    padding: 24px 0;
 }
 
-.description {
-    font-size: 35px;
+.brand { margin-bottom: 26px; }
+.brand-snek {
+    display: block;
+    margin: 0 auto 6px;
+    animation: sway 2.6s ease-in-out infinite;
+}
+@keyframes sway {
+    0%, 100% { transform: rotate(-8deg); }
+    50% { transform: rotate(8deg); }
+}
+.brand h1 {
+    margin: 0;
+    font-family: 'Lexend Exa', 'Raleway', sans-serif;
+    font-size: 3em;
+    letter-spacing: 0.06em;
+    color: var(--cream);
+    text-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+}
+.brand .tagline {
+    margin: 4px 0 0;
+    color: var(--cream-dim);
+    font-size: 1.05em;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+}
+
+#join_error {
+    background: rgba(224, 54, 44, 0.16);
+    border: 1px solid rgba(224, 54, 44, 0.55);
+    color: #ffb4ae;
+    padding: 10px 14px;
+    border-radius: 10px;
+    margin: 0 0 16px;
+    font-weight: 600;
+}
+
+.card {
+    background: var(--panel);
+    border: 1px solid var(--panel-edge);
+    border-radius: 14px;
+    padding: 26px 28px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+    text-align: left;
+}
+.card-title {
+    margin: 0 0 14px;
+    font-size: 1.05em;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--cream-dim);
+}
+
+label {
+    display: block;
+    margin-bottom: 6px;
+    color: var(--cream-dim);
+    font-size: 0.92em;
+}
+
+input {
+    display: block;
+    width: 100%;
+    padding: 11px 12px;
+    text-align: center;
+    background: #0d1017;
+    border: 1px solid var(--panel-edge);
+    border-radius: 8px;
+    color: var(--cream);
+    font-size: 1em;
+    font-family: 'Raleway', sans-serif;
+    transition: border-color 0.15s ease;
+}
+input::placeholder { color: rgba(250, 235, 215, 0.35); }
+input:focus {
+    outline: none;
+    border-color: var(--apple);
 }
 
 .btn {
     font-family: 'Raleway', sans-serif;
     border: none;
     display: block;
+    width: 100%;
     max-width: 100%;
+    padding: 13px 20px;
     text-align: center;
     cursor: pointer;
     text-transform: uppercase;
-    overflow: hidden;
-    position: relative;
-    color: #fff;
+    letter-spacing: 0.1em;
     font-weight: 700;
-    font-size: 15px;
-    background-color: #222;
-    padding: 17px 60px;
-    margin: 20px auto;
-    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.20);
+    font-size: 0.95em;
+    color: #fff;
+    border-radius: 8px;
+    transition: transform 0.12s ease, background-color 0.15s ease, box-shadow 0.15s ease;
+}
+.btn:active { transform: translateY(1px) scale(0.99); }
+.btn-join {
+    margin-top: 12px;
+    background: linear-gradient(180deg, #ea4a3f, var(--apple-dark));
+    box-shadow: 0 6px 18px rgba(224, 54, 44, 0.35);
+}
+.btn-join:hover { background: linear-gradient(180deg, #f2554a, #c22f27); }
+.btn-create {
+    background: transparent;
+    border: 2px solid var(--leaf);
+    color: var(--leaf);
+}
+.btn-create:hover { background: rgba(46, 204, 113, 0.12); }
+.form-hint {
+    margin: 10px 0 0;
+    text-align: center;
+    color: var(--cream-dim);
+    font-size: 0.82em;
 }
 
-.btn span {
-    position: relative;
-    z-index: 1;
+.divider {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 20px 0;
+    color: var(--cream-dim);
+    font-size: 0.85em;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+}
+.divider::before, .divider::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: var(--panel-edge);
 }
 
-.btn:hover {
-    background-color: #000;
+.hints {
+    margin-top: 26px;
+    display: flex;
+    gap: 18px;
+    justify-content: center;
+    flex-wrap: wrap;
+    color: var(--cream-dim);
+    font-size: 0.9em;
 }
 
 .btn:focus-visible,
 input:focus-visible,
 button:focus-visible {
-    outline: 2px solid #ffffff;
+    outline: 2px solid var(--gold);
     outline-offset: 2px;
 }
 
-.link {
-    font-size: 20px;
-    margin-top: 30px;
-}
-a{
-    text-decoration: none;
-}
-.link a {
-    color: #000;
-    font-size: 25px;
-}
-.small-container{
-    width: min(420px, 86%);
-    margin: 0 auto;
-    text-align: center;
-}
-input{
-    display: block;
-    width: 100%;
-    box-sizing: border-box;
-    padding: 7px 5px;
-    text-align: center;
-    background-color: #222222;
-    border: none;
-    color: white;
-}
-label{
-    display: block;
-    margin-bottom: 6px;
-}
-
-#join_error{
-    color: #7a1010;
-    background-color: rgba(255, 255, 255, 0.75);
-    padding: 10px;
-    margin-bottom: 15px;
-    border-radius: 4px;
-    font-weight: 600;
+@media (max-width: 480px) {
+    .brand h1 { font-size: 2.3em; }
+    .card { padding: 20px 18px; }
 }

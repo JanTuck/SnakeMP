@@ -4,6 +4,8 @@ export default class GameOverMenu extends Menu{
     constructor(ctx){
         super(ctx);
         this.ctx = ctx;
+        this.buttonColor = "#e0362c";
+        this.buttonTextColor = "#ffffff";
         super.addText("Game Over", this.ctx.canvas.width/2, 300, 64);
         // A single actionable button: the previous pair overlapped exactly
         // and had no click handling at all.
