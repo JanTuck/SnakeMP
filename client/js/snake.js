@@ -42,8 +42,10 @@ export default class Snake {
         this.ctx.fillStyle = "black";
         this.ctx.font = "15px Arial";
         this.ctx.textAlign = "center";
-        this.ctx.fillText(this.displayName, this.snake[0].x, this.snake[0].y-10);
-        //this.ctx.fillText(playerName,this.snake.x-10,this.snake.y-10);
+        const head = this.snake[0];
+        // Flip the label below the head when it would clip at the top edge.
+        const y = head.y < 30 ? head.y + this.scale + 18 : head.y - 10;
+        this.ctx.fillText(this.displayName, head.x, y);
     }
     setDisplayName(name){
         this.displayName = name;

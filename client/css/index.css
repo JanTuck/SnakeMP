@@ -38,6 +38,7 @@ body {
     font-family: 'Raleway', sans-serif;
     border: none;
     display: block;
+    max-width: 100%;
     text-align: center;
     cursor: pointer;
     text-transform: uppercase;
@@ -57,23 +58,8 @@ body {
     z-index: 1;
 }
 
-.btn:after {
-    content: "";
-    position: absolute;
-    left: 0;
-    top: 0;
-    height: 490%;
-    width: 140%;
-    background: #9796f0;
-    -webkit-transition: all .3s ease-in-out;
-    transition: all .3s ease-in-out;
-    -webkit-transform: translateX(-98%) translateY(-25%) rotate(45deg);
-    transform: translateX(-98%) translateY(-25%) rotate(45deg);
-}
-
-.btn:hover:after {
-    -webkit-transform: translateX(-9%) translateY(-25%) rotate(45deg);
-    transform: translateX(-9%) translateY(-25%) rotate(45deg);
+.btn:hover {
+    background-color: #000;
 }
 
 .btn:focus-visible,
@@ -95,14 +81,30 @@ a{
     font-size: 25px;
 }
 .small-container{
-    width: 30%;
+    width: min(420px, 86%);
     margin: 0 auto;
+    text-align: center;
 }
 input{
     display: block;
+    width: 100%;
+    box-sizing: border-box;
     padding: 7px 5px;
-    text-align: left;
+    text-align: center;
     background-color: #222222;
     border: none;
     color: white;
+}
+label{
+    display: block;
+    margin-bottom: 6px;
+}
+
+#join_error{
+    color: #7a1010;
+    background-color: rgba(255, 255, 255, 0.75);
+    padding: 10px;
+    margin-bottom: 15px;
+    border-radius: 4px;
+    font-weight: 600;
 }

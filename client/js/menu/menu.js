@@ -15,6 +15,7 @@ export default class Menu{
         let buttonArray = this.buttonArray;
         ctx.fillStyle = "lightblue";
         ctx.textAlign = "center";
+        ctx.font = "bold 16px Verdana";
         for (let i = 0; i < buttonArray.length; i++) {
             ctx.fillRect(buttonArray[i].x, buttonArray[i].y, buttonArray[i].width, buttonArray[i].height);
             ctx.fillStyle = "black";

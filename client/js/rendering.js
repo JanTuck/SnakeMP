@@ -84,7 +84,8 @@ socket.on("gameTick", (data) => {
 socket.on('init', (initData) => {
     document.getElementById('game_popup').style.display = 'none';
 
-    SCALE = initData.scale;
+    // Grid size comes from the server payload; the drawing helpers keep their
+    // own matching default so there is no circular module binding anymore.
     food = new Food(ctx, initData.food.x, initData.food.y);
     gameOver = false;
     gameOverMenu = null;
