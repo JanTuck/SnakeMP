@@ -25,10 +25,12 @@ class Player{
         this.score = 0;
         // Direction currently applied on the last game tick (null while stationary).
         this.direction = null;
-        // Direction requested by the player, applied on the next tick.
-        this.pendingDirection = null;
-        // Per-player growth flag. The tail is kept exactly once after eating.
-        this.growNextTick = false;
+        // Directions requested by the player. Up to two turns may be queued;
+        // each is validated against the previous one, so fast L-shaped input
+        // chains register instantly without ever allowing a reversal.
+        this.directionQueue = [];
+        // Pending growth in segments; consumed one per tick after eating.
+        this.pendingGrowth = 0;
         this.color = color;
     }
 
@@ -70,23 +72,27 @@ class Player{
 
     /**
      * Queue a direction change. Ignores values that are not one of the four
-     * arrows and rejects 180 degree turns, which would instantly kill the snake.
-     * Returns true when the direction was accepted.
+     * arrows and rejects 180 degree turns relative to the last queued
+     * direction, which would instantly kill the snake. Returns true when the
+     * direction was accepted.
      */
     setDirection(direction){
         if (!DIRECTIONS.includes(direction)) return false;
-        if (this.direction !== null && direction === OPPOSITE[this.direction]) return false;
-        if (direction === this.direction) return false;
-        this.pendingDirection = direction;
+        const last = this.directionQueue.length > 0
+            ? this.directionQueue[this.directionQueue.length - 1]
+            : this.direction;
+        if (last !== null && direction === OPPOSITE[last]) return false;
+        if (direction === last) return false;
+        if (this.directionQueue.length >= 2) return false; // bounded buffer
+        this.directionQueue.push(direction);
         return true;
     }
 
     updatePosition(){
-        // Only one queued turn is applied per tick, so two rapid key presses
-        // cannot smuggle in a reversal within a single tick.
-        if (this.pendingDirection !== null) {
-            this.direction = this.pendingDirection;
-            this.pendingDirection = null;
+        // One queued turn is applied per tick; chained turns carry over to
+        // following ticks so rapid key presses feel immediate.
+        if (this.directionQueue.length > 0) {
+            this.direction = this.directionQueue.shift();
         }
         if (this.direction === null) return; // Stationary until the first input.
 
@@ -100,8 +106,8 @@ class Player{
             case ARROW_UP:    oldHead.y -= gridSize; break;
             case ARROW_DOWN:  oldHead.y += gridSize; break;
         }
-        if(this.growNextTick){
-            this.growNextTick = false; // Keep the tail so the snake grows by one.
+        if(this.pendingGrowth > 0){
+            this.pendingGrowth--; // Keep the tail so the snake grows by one.
         }else{
             this.snake.pop();
         }
@@ -109,10 +115,13 @@ class Player{
         this.bodyLength = this.snake.length;
     }
 
-    eat(){
-        this.growNextTick = true;
-        this.score++;
-        this.bodyLength = this.snake.length + 1;
+    /**
+     * Award points and queue growth. Supply crates can grant more of both.
+     */
+    eat(points = 1, growth = 1){
+        this.score += points;
+        this.pendingGrowth += growth;
+        this.bodyLength = this.snake.length + this.pendingGrowth;
     }
 }
 module.exports = Player;

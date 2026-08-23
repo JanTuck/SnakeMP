@@ -14,7 +14,12 @@ const InputValidation = require("./server/inputvalidation");
 const app = express();
 
 const http = require('http').createServer(app);
-const io = require('socket.io')(http);
+const io = require('socket.io')(http, {
+    // Heartbeats reap clients that vanished without a disconnect (closed tab,
+    // dropped network) within roughly pingInterval + pingTimeout.
+    pingInterval: 20000,
+    pingTimeout: 15000,
+});
 
 // view engine setup
 app.set('views', path.join(__dirname, 'views'));
@@ -33,6 +38,7 @@ app.use(express.urlencoded({extended: false}));
 app.use(express.json());
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, "public")));
+app.use('/vendor', express.static(path.join(__dirname, 'node_modules', 'gsap', 'dist')));
 
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'client', 'index.html'));
@@ -121,7 +127,66 @@ LOBBY_LIST.set("12345", {createdAt: Date.now()});
 // Single shared food item for the default lobby.
 let food = new Food();
 
+// ---- Bonus world state: supply drops, bonus apples, golden apple ----
+const BONUS_CAP = 12;
+const DROP_TTL = 25000;          // crates despawn 25s after landing
+const GOLDEN_TTL = 12000;        // golden apple lasts 12s
+const DROP_POINTS = 2;           // opening a crate scores this much...
+const DROP_GROWTH = 2;           // ...and grows the snake by this much
+const DROP_APPLES = 4;           // apples released when a crate opens
+const GOLDEN_POINTS = 3;
+
+let bonusFoods = [];             // [{x, y}]
+let drops = [];                  // [{id, x, y, expiresAt}]
+let golden = null;               // {x, y, expiresAt} | null
+let nextDropAt = Date.now() + 8000;
+let nextGoldenAt = Date.now() + 20000;
+let dropSeq = 1;
+
 const activePlayers = () => [...SOCKET_LIST.values()].map((socket) => socket.player);
+
+/**
+ * Find a random cell free of snakes and every pickup kind.
+ */
+const randomFreeCell = () => {
+    for (let attempt = 0; attempt < 200; attempt++) {
+        const cell = Environment.getRanLocation();
+        const taken =
+            activePlayers().some((p) => p.snake.some((s) => s.x === cell.x && s.y === cell.y)) ||
+            (food.x === cell.x && food.y === cell.y) ||
+            bonusFoods.some((b) => b.x === cell.x && b.y === cell.y) ||
+            drops.some((d) => d.x === cell.x && d.y === cell.y) ||
+            (golden !== null && golden.x === cell.x && golden.y === cell.y);
+        if (!taken) return cell;
+    }
+    return null;
+};
+
+const spawnDrop = () => {
+    const cell = randomFreeCell();
+    if (cell === null) return;
+    drops.push({ id: 'drop-' + (dropSeq++), x: cell.x, y: cell.y, expiresAt: Date.now() + DROP_TTL });
+    io.to(LOBBY_ROOM).emit('feed', { type: 'drop-incoming' });
+};
+
+const spawnGolden = () => {
+    const cell = randomFreeCell();
+    if (cell === null) return;
+    golden = { x: cell.x, y: cell.y, expiresAt: Date.now() + GOLDEN_TTL };
+};
+
+const openDrop = (player) => {
+    player.eat(DROP_POINTS, DROP_GROWTH);
+    let spawned = 0;
+    for (let i = 0; i < DROP_APPLES; i++) {
+        if (bonusFoods.length >= BONUS_CAP) break;
+        const cell = randomFreeCell();
+        if (cell === null) break;
+        bonusFoods.push(cell);
+        spawned++;
+    }
+    io.to(LOBBY_ROOM).emit('feed', { type: 'drop-open', who: player.displayName, apples: spawned });
+};
 
 io.on('connection', (socket) => {
     let player = null;
@@ -148,6 +213,7 @@ io.on('connection', (socket) => {
         SOCKET_LIST.set(socket.id, socket);
         // Live players receive the periodic broadcasts; dead ones stop.
         socket.join(LOBBY_ROOM);
+        io.to(LOBBY_ROOM).emit('feed', {type: 'join', who: player.displayName});
         ensureGameLoopRunning();
     });
 
@@ -199,6 +265,14 @@ const stopGameLoopIfIdle = () => {
 };
 
 const gameTick = () => {
+    // Reap players whose socket died without a disconnect event (zombies).
+    for (const socket of [...SOCKET_LIST.values()]) {
+        if (socket.connected === false) {
+            io.to(LOBBY_ROOM).emit('feed', {type: 'death', who: socket.player.displayName, score: socket.player.score});
+            removePlayer(socket.player);
+        }
+    }
+
     // Snapshot: players that die mid-tick must not keep acting this tick.
     const sockets = [...SOCKET_LIST.values()];
 
@@ -211,6 +285,7 @@ const gameTick = () => {
         //Player collides with himself or the wall.
         if (player.collided()) {
             socket.emit('death', player.score);
+            io.to(LOBBY_ROOM).emit('feed', {type: 'death', who: player.displayName, score: player.score});
             removePlayer(player);
             continue;
         }
@@ -223,6 +298,8 @@ const gameTick = () => {
             if (otherSocket) {
                 otherSocket.emit('death', collided.score);
             }
+            io.to(LOBBY_ROOM).emit('feed', {type: 'death', who: player.displayName, score: player.score});
+            io.to(LOBBY_ROOM).emit('feed', {type: 'death', who: collided.displayName, score: collided.score});
             removePlayer(player);
             removePlayer(collided);
             continue;
@@ -235,18 +312,59 @@ const gameTick = () => {
             io.to(LOBBY_ROOM).emit('updateFood', {x: food.x, y: food.y});
         }
 
+        // Bonus apples from opened supply crates.
+        for (let i = bonusFoods.length - 1; i >= 0; i--) {
+            if (player.snake[0].x === bonusFoods[i].x && player.snake[0].y === bonusFoods[i].y) {
+                bonusFoods.splice(i, 1);
+                player.eat();
+            }
+        }
+
+        // Golden apple: rare, timed, worth extra.
+        if (golden !== null && player.snake[0].x === golden.x && player.snake[0].y === golden.y) {
+            golden = null;
+            player.eat(GOLDEN_POINTS);
+            io.to(LOBBY_ROOM).emit('feed', {type: 'golden', who: player.displayName, points: GOLDEN_POINTS});
+        }
+
+        // Supply crates.
+        for (let i = drops.length - 1; i >= 0; i--) {
+            if (player.snake[0].x === drops[i].x && player.snake[0].y === drops[i].y) {
+                drops.splice(i, 1);
+                openDrop(player);
+            }
+        }
+
         player.updatePosition();
+    }
+
+    // Expire stale pickups and schedule the next supply drop / golden apple.
+    const now = Date.now();
+    drops = drops.filter((d) => d.expiresAt > now);
+    if (golden !== null && golden.expiresAt <= now) golden = null;
+    if (now >= nextDropAt && drops.length < 2 && SOCKET_LIST.size > 0) {
+        spawnDrop();
+        nextDropAt = now + 12000 + Math.floor(Math.random() * 8000);
+    }
+    if (now >= nextGoldenAt && golden === null && SOCKET_LIST.size > 0) {
+        spawnGolden();
+        nextGoldenAt = now + 25000 + Math.floor(Math.random() * 15000);
     }
 
     // One broadcast of plain data objects instead of an emit per socket;
     // also avoids leaking internal player fields over the wire.
-    io.to(LOBBY_ROOM).emit('gameTick', activePlayers().map((p) => ({
-        id: p.id,
-        displayName: p.displayName,
-        color: p.color,
-        snake: p.snake,
-        score: p.score,
-        bodyLength: p.bodyLength,
-    })));
+    io.to(LOBBY_ROOM).emit('gameTick', {
+        players: activePlayers().map((p) => ({
+            id: p.id,
+            displayName: p.displayName,
+            color: p.color,
+            snake: p.snake,
+            score: p.score,
+            bodyLength: p.bodyLength,
+        })),
+        bonus: bonusFoods,
+        drops: drops.map((d) => ({id: d.id, x: d.x, y: d.y, ttl: Math.max(0, d.expiresAt - now)})),
+        golden: golden === null ? null : {x: golden.x, y: golden.y, ttl: Math.max(0, golden.expiresAt - now)},
+    });
     stopGameLoopIfIdle();
 };
