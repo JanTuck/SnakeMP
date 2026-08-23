@@ -44,12 +44,14 @@
     } catch (e) { /* storage unavailable; keep default */ }
     domUsername.focus();
 
-    document.getElementById('join_form').addEventListener('submit', () => {
+    document.getElementById('join_form').addEventListener('submit', (event) => {
+        event.preventDefault(); // Stay on the page; the form must not reload it.
         const username = domUsername.value;
         socket.emit('clientReady', username);
         hasJoined = true;
         try {
             localStorage.setItem("snake_username", username);
+            savedUsername = username; // Reconnects replay the last used name.
         } catch (e) { /* storage unavailable */ }
     });
 
