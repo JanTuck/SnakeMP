@@ -179,7 +179,11 @@ assert.equal(transport.emit('chat', '🐍'.repeat(41)), false, '164 UTF-8 bytes 
 assert.equal(transport.emit('chat', '   '), false, 'empty trimmed chat is rejected');
 assert.equal(second.sent.length, beforeChat + 3);
 
-second.close();
+const timersBeforeForcedReconnect = timers.length;
+transport.reconnect();
+assert.equal(second.readyState, FakeWebSocket.CLOSED, 'forced reconnect closes a half-open transport');
+assert.equal(timers.length, timersBeforeForcedReconnect + 1);
+assert.equal(timers.at(-1).delay, 250);
 assert.equal(transport.emit('chat', 'offline'), false, 'chat is never queued while disconnected');
 assert.equal(transport.emit('boost', true), false, 'boost state is never queued while disconnected');
 

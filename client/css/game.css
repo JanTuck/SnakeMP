@@ -338,6 +338,15 @@ img { display: block; }
 .btn:active { transform: translateY(1px); }
 .btn:disabled { color: #aaa49b; background: #3a3d42; box-shadow: none; cursor: not-allowed; }
 
+.join-status {
+    min-height: 1.35em;
+    margin: 8px 0 0;
+    color: #bdb7ad;
+    font-size: 0.74rem;
+    line-height: 1.35;
+    text-align: center;
+}
+
 .btn:focus-visible,
 input:focus-visible,
 button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }

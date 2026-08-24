@@ -29,6 +29,16 @@
             handlers.push(handler);
             return this;
         }
+        reconnect() {
+            const ws = this.ws;
+            if (ws === undefined || ws.readyState === WebSocket.CLOSED) {
+                this.connect();
+                return;
+            }
+            if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+                try { ws.close(); } catch (_) { this.connect(); }
+            }
+        }
         dispatch(name, value) {
             const handlers = this.listeners.get(name);
             if (handlers !== undefined) {

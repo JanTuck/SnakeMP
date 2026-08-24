@@ -152,9 +152,12 @@ function game(overrides = {}) {
     username: control(),
     lobby_password: overrides.missingPassword ? null : control(),
     join_form: form,
+    join_status: control(),
   };
   const handlers = new Map();
   const emitted = [];
+  const timers = [];
+  let reconnects = 0;
   const socket = {
     emit(...args) { emitted.push(args); },
     on(name, handler) {
@@ -163,6 +166,7 @@ function game(overrides = {}) {
       list.push(handler);
     },
     fire(name, value) { for (const handler of handlers.get(name) || []) handler(value); },
+    reconnect() { reconnects += 1; },
   };
   const window = {
     name: overrides.windowName || '',
@@ -178,10 +182,12 @@ function game(overrides = {}) {
     localStorage: local,
     socket,
     fetch: overrides.fetch,
+    setTimeout(handler, delay) { timers.push({ handler, delay, cleared: false }); return timers.length; },
+    clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; },
     TextEncoder,
     JSON,
   }, { filename: 'client/game.html:inline' });
-  return { window, session, local, elements, form, button, socket, emitted };
+  return { window, session, local, elements, form, button, socket, emitted, timers, get reconnects() { return reconnects; } };
 }
 
 {
@@ -211,6 +217,19 @@ function game(overrides = {}) {
   page.elements.lobby_password.value = 'correct';
   page.form.fire('submit', submitEvent());
   assert.deepEqual(page.emitted.at(-1), ['clientReady', 'Alice', 'room seven', 'correct']);
+}
+
+{
+  const page = game();
+  page.elements.username.value = 'Alice';
+  page.form.fire('submit', submitEvent());
+  assert.equal(page.button.disabled, true);
+  assert.equal(page.elements.join_status.textContent, 'Joining lobby…');
+  assert.equal(page.timers.at(-1).delay, 5000);
+  page.timers.at(-1).handler();
+  assert.equal(page.button.disabled, false, 'a missing join acknowledgement cannot lock the form forever');
+  assert.equal(page.reconnects, 1, 'a stalled join forces one clean transport reconnect');
+  assert.match(page.elements.join_status.textContent, /connection stalled/i);
 }
 
 {

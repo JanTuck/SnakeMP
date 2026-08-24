@@ -51,6 +51,7 @@
                            autocomplete="current-password">
                 </div>
                 <button type="submit" class="btn"><span>Join lobby</span><span aria-hidden="true">&rarr;</span></button>
+                <p id="join_status" class="join-status" role="status" aria-live="polite"></p>
             </form>
             <p class="popup-footnote">Arrow keys or WASD to steer. Space activates your boost.</p>
         </section>
@@ -90,10 +91,13 @@
     const domPassword = document.getElementById('lobby_password');
     const joinForm = document.getElementById('join_form');
     const joinButton = joinForm.querySelector('button[type="submit"]');
+    const joinStatus = document.getElementById('join_status');
     let savedUsername = null;
     let savedPassword = '';
     let hasJoined = false;
     let joinPending = false;
+    let joinTimeout = 0;
+    const JOIN_TIMEOUT_MS = 5000;
     try {
         savedUsername = localStorage.getItem("snake_username");
         if (savedUsername !== null) {
@@ -130,10 +134,25 @@
     if (domPassword !== null) domPassword.value = savedPassword;
     domUsername.focus();
 
-    function setJoinPending(pending) {
+    function setJoinPending(pending, message = '') {
         joinPending = pending;
         joinButton.disabled = pending;
         joinForm.setAttribute('aria-busy', pending ? 'true' : 'false');
+        if (joinStatus !== null) joinStatus.textContent = message;
+        if (!pending && joinTimeout) {
+            clearTimeout(joinTimeout);
+            joinTimeout = 0;
+        }
+    }
+
+    function armJoinTimeout() {
+        if (joinTimeout) clearTimeout(joinTimeout);
+        joinTimeout = setTimeout(() => {
+            joinTimeout = 0;
+            if (!joinPending) return;
+            setJoinPending(false, 'The connection stalled. Reconnecting now…');
+            socket.reconnect?.();
+        }, JOIN_TIMEOUT_MS);
     }
 
     joinForm.addEventListener('submit', (event) => {
@@ -163,7 +182,8 @@
         savedUsername = username;
         savedPassword = password;
         hasJoined = true;
-        setJoinPending(true);
+        setJoinPending(true, 'Joining lobby…');
+        armJoinTimeout();
         socket.emit('clientReady', username, LOBBY_ID, password);
         try {
             localStorage.setItem("snake_username", username);
@@ -177,9 +197,12 @@
     // automatically with the last used username.
     socket.on('connect', () => {
         if (hasJoined && savedUsername !== null) {
+            setJoinPending(true, 'Reconnecting…');
+            armJoinTimeout();
             socket.emit('clientReady', savedUsername, LOBBY_ID, savedPassword);
         }
     });
+    socket.on('init', () => setJoinPending(false));
     socket.on('game_error', () => {
         setJoinPending(false);
         // A container refresh clears in-memory lobbies while an already-open
