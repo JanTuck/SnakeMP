@@ -6,7 +6,7 @@ up to 4.67 GHz) and Zig 0.16.0 `-O ReleaseFast -fstrip`.
 ## Outcome
 
 The production result is a Zig-only server using raw RFC 6455 WebSockets,
-binary input, binary snapshot v1, one epoll I/O reactor, and game workers that
+binary input, binary snapshot v3, one epoll I/O reactor, and game workers that
 expand at 128 lobbies per worker. The measured 12,000-player configuration used
 750 lobbies, six game workers, and seven process threads in total.
 
@@ -108,11 +108,43 @@ including shared server state. Reducing that further is possible, but at this
 point network fan-out and the kernel's per-socket cost matter more than storing
 the game integers.
 
-## Wire-format microbenchmark
+## Snapshot v3 production-encoder benchmark
 
-Representative world: 16 players, 18 cells per snake, three bonus apples, one
-drop, and one golden apple. The harness ran 100,000 encode and parse iterations.
-These are format/harness microbenchmarks, not Zig server tick timings.
+The current encoder was measured directly in Zig with 16 players, a retained
+output buffer, periodic keyframes, and stationary and moving delta streams. The
+harness reports the median of five samples and is reproducible with
+`cd servers/zig && zig run -O ReleaseFast bench_snapshot.zig`.
+
+| Cells/player | Stream | v3 ns/frame | v3 payload B/frame |
+|---:|---|---:|---:|
+| 1 | keyframe / stationary / moving | 240 / 138 / 209 | 140 / 31.73 / 31.73 |
+| 18 | keyframe / stationary / moving | 1,101 / 167 / 337 | 220 / 34.40 / 34.40 |
+| 256 | keyframe / stationary / moving | 13,463 / 572 / 1,083 | 1,164 / 65.89 / 65.89 |
+
+Against the immediately preceding v2 encoder on the same harness, direction
+deltas removed two absolute-coordinate bytes from every moving player row.
+Moving streams fell by 47-49% for one- and 18-cell snakes (31.9% at 256 cells,
+where periodic keyframes dominate more bytes), while encode time fell by
+20-26% for the representative short bodies. Stationary v3 streams also encoded
+14-19% faster at one and 18 cells because player transition state is computed
+once per frame.
+
+A separate 1,000-client v3 loopback run held all 1,000 clients with zero join
+failures or sampled disconnects, a 0.9992 configured-tick ratio, and
+66.659/67.449/68.864 ms cadence p50/p95/p99. It measured 34.48 B average
+userspace WebSocket write, 515,575 B/s egress, 8.97% CPU, and 2,838,528 B RSS.
+The earlier 1,000-player v2 scaling row below measured 172.11 B average wire and
+2,581,702 B/s egress; the workloads were both stationary but were separate
+runs, so this is evidence of the intended byte reduction rather than a formal
+paired performance trial.
+
+## Historical v1 wire-format microbenchmark
+
+This older format-selection benchmark is retained to document why binary
+replaced JSON. It predates the production v3 temporal format. Representative
+world: 16 players, 18 cells per snake, three bonus apples, one drop, and one
+golden apple. The harness ran 100,000 encode and parse iterations. These are
+format/harness microbenchmarks, not current Zig server tick timings.
 
 | Layout | Tick bytes | One-time roster | Encode/op | Parse/op |
 |---|---:|---:|---:|---:|

@@ -127,7 +127,7 @@ function resizeObjects(array, length) {
     array.length = length;
 }
 
-// The decoder validates the complete v2 frame into bounded scratch storage
+// The decoder validates the complete v3 frame into bounded scratch storage
 // before any visible game state is committed here.
 socket.on("b", (payload) => {
     if (!isSetup || gameOver) return;

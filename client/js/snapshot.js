@@ -28,7 +28,7 @@ function validCell(x, y) {
 }
 
 /**
- * Parse and validate a complete v2 snapshot into module-owned scratch state.
+ * Parse and validate a complete v3 snapshot into module-owned scratch state.
  * No caller-visible game state is mutated unless this function succeeds.
  */
 export function decodeSnapshot(payload, expectedPlayers, lastSequence, currentPlayers) {
@@ -36,7 +36,7 @@ export function decodeSnapshot(payload, expectedPlayers, lastSequence, currentPl
     if (view === null || view.byteLength < 12 || expectedPlayers > MAX_PLAYERS) return null;
     let at = 0;
     const need = (bytes) => bytes >= 0 && at + bytes <= view.byteLength;
-    if (view.getUint8(at++) !== 0x53 || view.getUint8(at++) !== 0x4e || view.getUint8(at++) !== 2) return null;
+    if (view.getUint8(at++) !== 0x53 || view.getUint8(at++) !== 0x4e || view.getUint8(at++) !== 3) return null;
     const kind = view.getUint8(at++);
     if (kind > 1 || !need(5)) return null;
     const sequence = view.getUint16(at, true); at += 2;
@@ -86,7 +86,7 @@ export function decodeSnapshot(payload, expectedPlayers, lastSequence, currentPl
         } else {
             if (!need(1)) return null;
             const flags = view.getUint8(at++);
-            if ((flags & 0xf8) !== 0) return null;
+            if ((flags & 0xe0) !== 0) return null;
             out.mode = flags & 3;
             if (out.mode === 3) return null;
             const current = currentPlayers[index];
@@ -99,13 +99,13 @@ export function decodeSnapshot(payload, expectedPlayers, lastSequence, currentPl
                 out.score = view.getInt32(at, true); at += 4;
             }
             if (out.mode === 1 || out.mode === 2) {
-                if (!need(2)) return null;
-                out.headX = view.getUint8(at++);
-                out.headY = view.getUint8(at++);
+                const direction = (flags >> 3) & 3;
+                out.headX = current.snake[0].x / 16;
+                out.headY = current.snake[0].y / 16;
+                if (direction === 0) out.headY--; else if (direction === 1) out.headY++;
+                else if (direction === 2) out.headX--; else out.headX++;
                 if (!validCell(out.headX, out.headY)) return null;
-                const oldHead = current.snake[0];
-                if (Math.abs(out.headX - oldHead.x / 16) + Math.abs(out.headY - oldHead.y / 16) !== 1) return null;
-            }
+            } else if ((flags & 0x18) !== 0) return null;
         }
     }
 

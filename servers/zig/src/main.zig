@@ -2236,6 +2236,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 test {
+    _ = binary_snapshot;
+    _ = collision;
     _ = stats_json;
     _ = worker_balance;
 }
@@ -2322,7 +2324,7 @@ test "compact roster and tick preserve world information" {
     defer wire.deinit(galloc);
     const result = try binary_snapshot.build(&wire, &lobby, 0, galloc);
     try std.testing.expectEqual(binary_snapshot.Kind.keyframe, result.kind);
-    try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', 2, 0 }, result.bytes[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', binary_snapshot.VERSION, 0 }, result.bytes[0..4]);
 }
 
 test "shared keyframe coalescing preserves partial frames and controls" {

@@ -34,7 +34,7 @@ Environment variables:
 | `PORT` | `3000` | HTTP and WebSocket listen port |
 | `SNEK_DEBUG` | unset | Set to `1` for `/debug/stats` |
 | `SNEK_MAX_PLAYERS` | `100` | Global player cap; 12k test used `12000` |
-| `SNEK_MAX_PLAYERS_PER_LOBBY` | `16` | Lobby cap; canonical binary-v1 browser is tested at 16 |
+| `SNEK_MAX_PLAYERS_PER_LOBBY` | `16` | Lobby cap; canonical binary-v3 browser is tested at 16 |
 | `SNEK_LOBBIES_PER_WORKER` | `128` | Game-worker packing threshold |
 | `SNEK_LOBBY_IDLE_MS` | `60000` | Empty non-default lobby lifetime |
 
@@ -52,8 +52,8 @@ lobbies are reaped.
 - `src/model.zig` - player, lobby, connection, turn queue, and movement state
 - `src/websocket.zig` - WebSocket header generation and fixed binary client
   packet validation
-- `src/snapshot.zig` - little-endian binary snapshot v1 encoder with explicit
-  clamps and no native-struct wire casts
+- `src/snapshot.zig` - little-endian binary snapshot v3 keyframe/delta encoder
+  with explicit clamps and no native-struct wire casts
 - `src/json.zig` - infrequent JSON control-event construction and escaping
 - `src/text.zig` - username, URI, form, and small JSON-field validation helpers
 - `src/assets_manifest.zig` - compile-time embedded public-asset manifest
@@ -101,4 +101,5 @@ npm install
 npm run parity
 npm run test:memory
 node benchmarks/wire-format-bench.js
+cd servers/zig && zig run -O ReleaseFast bench_snapshot.zig
 ```

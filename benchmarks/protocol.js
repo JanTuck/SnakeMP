@@ -6,11 +6,11 @@ function asView(payload) {
   return null;
 }
 
-// Transactional benchmark/parity decoder for the production v2 keyframe and
+// Transactional benchmark/parity decoder for the production v3 keyframe and
 // delta protocol. A rejected frame never replaces the last valid world.
 function decodeBinary(payload, roster, previous, lastSequence) {
   const view = asView(payload);
-  if (!view || view.byteLength < 12 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 2) return null;
+  if (!view || view.byteLength < 12 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 3) return null;
   const kind = view.getUint8(3);
   if (kind > 1) return null;
   const sequence = view.getUint16(4, true);
@@ -53,7 +53,7 @@ function decodeBinary(payload, roster, previous, lastSequence) {
       if (at >= view.byteLength) return null;
       const flags = view.getUint8(at++);
       const mode = flags & 3;
-      if ((flags & 0xf8) !== 0 || mode === 3) return null;
+      if ((flags & 0xe0) !== 0 || mode === 3) return null;
       const old = previous.players[i];
       let score = old.score;
       if ((flags & 4) !== 0) {
@@ -63,13 +63,17 @@ function decodeBinary(payload, roster, previous, lastSequence) {
       let snake;
       if (mode === 0) snake = old.snake.map(cell => ({ ...cell }));
       else {
-        if (at + 2 > view.byteLength) return null;
-        const head = { x: view.getUint8(at++) * 16, y: view.getUint8(at++) * 16 };
+        const direction = (flags >> 3) & 3;
+        const head = { x: old.snake[0].x, y: old.snake[0].y };
+        if (direction === 0) head.y -= 16; else if (direction === 1) head.y += 16;
+        else if (direction === 2) head.x -= 16; else head.x += 16;
+        if (head.x < 0 || head.x >= 1920 || head.y < 0 || head.y >= 960) return null;
         const length = old.snake.length + (mode === 2 ? 1 : 0);
         snake = new Array(length);
         snake[0] = head;
         for (let c = 1; c < length; c++) snake[c] = { ...old.snake[c - 1] };
       }
+      if (mode === 0 && (flags & 0x18) !== 0) return null;
       players[i] = { id: meta[0], displayName: meta[1], color: meta[2], score, bodyLength: snake.length, snake };
     }
   }

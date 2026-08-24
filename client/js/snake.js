@@ -15,7 +15,7 @@ export default class Snake {
         this.heading = "ArrowRight";
     }
 
-    // Commit a fully validated v2 absolute keyframe. Packed paths store the
+    // Commit a fully validated v3 absolute keyframe. Packed paths store the
     // head followed by 2-bit directions toward the tail.
     updateKeyframe(meta, view, player) {
         const next = this.prevSnake;

@@ -43,7 +43,7 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
   lifecycle test/deployment value with `SNEK_LOBBY_IDLE_MS`.
 - Default global capacity is 100 players (`SNEK_MAX_PLAYERS`).
 - Default lobby capacity is 16 players (`SNEK_MAX_PLAYERS_PER_LOBBY`). Snapshot
-  v1 has a one-byte player count, but the canonical browser deliberately
+  v3 has a one-byte player count, but the canonical browser deliberately
   enforces the tested 16-player lobby bound; do not raise the per-lobby value
   without changing and testing both protocol peers.
 - Full-server rejection is `game_error: "Server is full, try again later"`.
@@ -127,22 +127,38 @@ the same insertion order, eliminating per-tick ids, names, colors, keys, and
 object nesting. Feed types are `join`, `death`, `golden`, `drop-incoming`, and
 `drop-open`, with only the fields needed by that event.
 
-### Server-to-client binary snapshot v1
+### Server-to-client binary snapshot v3
 
 All multibyte fields are **little-endian**. Coordinates are one-byte grid-cell
 indices and the browser multiplies them by 16. No native Zig struct, padding,
 pointer, or uninitialized byte crosses the wire.
 
 ```text
-magic:[u8;2] = "SN"
-version:u8 = 1
-player_count:u8
+header:
+  magic:[u8;2] = "SN"
+  version:u8 = 3
+  kind:u8                 // 0 keyframe, 1 dependent delta
+  sequence:u16
+  base_sequence:u16       // sequence for keyframes, prior sequence for deltas
+  player_count:u8
 
-repeat player_count times:
+keyframe player, repeated player_count times:
   score:i32
-  body_length:u16
-  cell_count:u16
-  repeat cell_count times: x_cell:u8, y_cell:u8
+  encoded_cells:u16       // low 15 bits count; bit 15 selects packed body
+  if packed:
+    head_x_cell:u8, head_y_cell:u8
+    segment_directions:ceil((cell_count - 1) / 4) bytes
+      // four 2-bit directions per byte: up, down, left, right
+  otherwise:
+    repeat cell_count times: x_cell:u8, y_cell:u8
+
+delta player, repeated player_count times:
+  flags:u8
+    // bits 0..1: unchanged, shifted, shifted-and-grown (3 is invalid)
+    // bit 2: score:i32 follows
+    // bits 3..4: new-head direction for shifted/grown rows
+    // bits 5..7: reserved and zero
+  if score bit: score:i32
 
 bonus_count:u8
 repeat bonus_count times: x_cell:u8, y_cell:u8
@@ -154,10 +170,20 @@ golden_present:u8  // 0 or 1
 if 1: x_cell:u8, y_cell:u8, ttl_ms:u16
 ```
 
-The client checks magic, version, roster/player agreement, all section counts,
-remaining length before every read, gameplay bounds (16 players, 7,200 cells,
-12 bonus apples, two drops), golden presence, and exact end-of-frame alignment.
-Malformed or truncated snapshots are ignored.
+A keyframe is complete and has `base_sequence == sequence`. A delta is accepted
+only when its base equals the client's last accepted sequence and its sequence
+is the wrapping next `u16`. Moving delta rows reconstruct the new head as one
+adjacent cell in the encoded direction; the existing body shifts behind it.
+The server emits a keyframe at least every 30 snapshots, whenever membership or
+an unsupported transition invalidates history, and when a client returns from
+hidden-document throttling. This bounds recovery without per-client snapshots.
+
+The client checks magic, version, kind, sequence relationship, roster/player
+agreement, flags and packed-body padding, all section counts, remaining length
+before every read, gameplay bounds (16 players, 7,200 cells, 12 bonus apples,
+two drops), golden presence, and exact end-of-frame alignment. Malformed,
+truncated, or out-of-sequence snapshots are ignored without mutating game
+state.
 
 Drop ids are intentionally absent: the browser renders position and TTL and
 never consumes the server's internal drop id. TTL values are clamped to

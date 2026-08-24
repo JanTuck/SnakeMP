@@ -57,7 +57,7 @@ function addOne(job) {
       const view = payload instanceof ArrayBuffer
         ? new DataView(payload)
         : ArrayBuffer.isView(payload) ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength) : null;
-      if (!view || view.byteLength < 12 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 2) return;
+      if (!view || view.byteLength < 12 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 3) return;
       const kind = view.getUint8(3);
       const sequence = view.getUint16(4, true);
       const baseSequence = view.getUint16(6, true);
@@ -77,9 +77,9 @@ function addOne(job) {
           if (offset >= view.byteLength) return;
           const flags = view.getUint8(offset++);
           const mode = flags & 3;
-          if ((flags & 0xf8) !== 0 || mode === 3 || state.cells[i] === undefined) return;
+          if ((flags & 0xe0) !== 0 || mode === 3 || state.cells[i] === undefined) return;
           if ((flags & 4) !== 0) offset += 4;
-          if (mode !== 0) offset += 2;
+          if (mode === 0 && (flags & 0x18) !== 0) return;
           if (mode === 2) state.cells[i]++;
         }
         if (offset > view.byteLength) return;
