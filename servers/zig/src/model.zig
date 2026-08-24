@@ -21,7 +21,8 @@ pub fn opposite(direction: Direction) Direction {
 pub const CellPos = struct { x: i32, y: i32 };
 
 pub const Player = struct {
-    id: []u8,
+    /// Borrowed from `conn.sid`; the connection owns and outlives its player.
+    id: []const u8,
     name: []u8,
     color_hex: []u8,
     snake: std.ArrayListUnmanaged(CellPos) = .empty,

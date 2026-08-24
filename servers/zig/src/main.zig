@@ -762,7 +762,6 @@ fn detachPlayer(l: *Lobby, p: *Player) void {
 
 fn destroyPlayer(p: *Player) void {
     p.snake.deinit(galloc);
-    galloc.free(p.id);
     galloc.free(p.name);
     galloc.free(p.color_hex);
     galloc.destroy(p);
@@ -1148,13 +1147,11 @@ fn createPlayerLocked(c: *Conn, target: *Lobby, username: []const u8, aa: Alloca
     const p = try galloc.create(Player);
     errdefer galloc.destroy(p);
     p.* = .{
-        .id = undefined,
+        .id = c.sidSlice(),
         .name = undefined,
         .color_hex = undefined,
         .conn = c,
     };
-    p.id = try galloc.dupe(u8, c.sidSlice());
-    errdefer galloc.free(p.id);
     p.name = try galloc.dupe(u8, username);
     errdefer galloc.free(p.name);
     p.color_hex = try galloc.dupe(u8, randomColorHex(aa));
@@ -1924,7 +1921,6 @@ fn doUpgrade(c: *Conn, aa: Allocator, key: []const u8) bool {
         .{acc},
     ) catch return false;
     defer aa.free(resp);
-    connQueueRaw(c, resp);
 
     var raw: [16]u8 = undefined;
     g_io.random(&raw);
@@ -1935,6 +1931,10 @@ fn doUpgrade(c: *Conn, aa: Allocator, key: []const u8) bool {
     jsString(&args, aa, c.sidSlice()) catch return false;
     const hello = eventFrame(aa, "id", args.items) catch return false;
     defer aa.free(hello);
+
+    // Do not publish an irreversible protocol switch until every fallible
+    // piece of the initial WebSocket exchange has been prepared.
+    connQueueRaw(c, resp);
     connEnqueueText(c, hello);
     return true;
 }
@@ -2024,7 +2024,7 @@ fn processWsInput(c: *Conn, aa: Allocator) bool {
     return true;
 }
 
-fn processHttpInput(c: *Conn, aa: Allocator) bool {
+fn processHttpInput(c: *Conn, aa: Allocator, peer_eof: bool) bool {
     // Parse a complete pipeline with an offset and compact once on exit. The
     // previous per-request memmove made an N-request batch copy O(N²) bytes.
     var consumed: usize = 0;
@@ -2032,7 +2032,15 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
     while (c.mode == .http and !c.close_after_write) {
         const input = c.input.items[consumed..];
         const head_at = std.mem.indexOf(u8, input, CRLF ++ CRLF) orelse {
-            return input.len <= MAX_HTTP_HEAD_LINE;
+            if (!peer_eof) return input.len <= MAX_HTTP_HEAD_LINE;
+            // A FIN can arrive as a separate epoll notification after its
+            // requests were parsed. Drain their queued responses; discard
+            // only an incomplete trailing request.
+            if (input.len == 0 or consumed != 0) {
+                c.close_after_write = true;
+                return true;
+            }
+            return false;
         };
         if (head_at > MAX_HTTP_HEAD_LINE) return false;
         const head = input[0..head_at];
@@ -2104,7 +2112,14 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
         }
         const body_at = head_at + 2 * CRLF.len;
         const request_len = body_at + body_len;
-        if (input.len < request_len) return true;
+        if (input.len < request_len) {
+            if (!peer_eof) return true;
+            if (consumed != 0) {
+                c.close_after_write = true;
+                return true;
+            }
+            return false;
+        }
         const body = input[body_at..request_len];
 
         if (upgrade_ws) {
@@ -2128,7 +2143,9 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
             return processWsInput(c, aa);
         }
 
-        const keep_alive = if (http10) connection_keep and !connection_close else !connection_close;
+        const final_half_closed_request = peer_eof and input.len == request_len;
+        const keep_alive = (if (http10) connection_keep and !connection_close else !connection_close) and
+            !final_half_closed_request;
         routeAndRespond(c, aa, method, target, body, body_is_json, keep_alive);
         consumed += request_len;
         if (connPoisoned(c)) return false;
@@ -2136,14 +2153,18 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
     return true;
 }
 
-fn readAvailable(c: *Conn, aa: Allocator) bool {
+fn readAvailable(c: *Conn, aa: Allocator, peer_shutdown: bool) bool {
     var scratch: [16 * 1024]u8 = undefined;
+    var peer_eof = peer_shutdown;
     while (true) {
         const rc = linux.read(c.fd, &scratch, scratch.len);
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 const count: usize = @intCast(rc);
-                if (count == 0) return false;
+                if (count == 0) {
+                    peer_eof = true;
+                    break;
+                }
                 if (debug_enabled) _ = network_bytes_received.fetchAdd(count, .monotonic);
                 c.last_activity_ms = unixMillis();
                 c.input.appendSlice(galloc, scratch[0..count]) catch return false;
@@ -2155,10 +2176,21 @@ fn readAvailable(c: *Conn, aa: Allocator) bool {
             else => return false,
         }
     }
-    return switch (c.mode) {
-        .http => processHttpInput(c, aa),
+    const parsed = switch (c.mode) {
+        .http => processHttpInput(c, aa, peer_eof),
         .websocket => processWsInput(c, aa),
     };
+    if (!parsed) return false;
+    if (!peer_eof) return true;
+
+    // A TCP FIN closes only the peer's write side. Preserve any response
+    // generated from the final buffered request, then close our side after it
+    // drains. WebSocket EOF without a pending reply remains terminal.
+    if (!connOutputDrained(c)) {
+        c.close_after_write = true;
+        return true;
+    }
+    return false;
 }
 
 fn teardownConn(c: *Conn) void {
@@ -2273,8 +2305,11 @@ fn reactorLoop() void {
                 continue;
             }
             const c: *Conn = @ptrFromInt(event.data.ptr);
-            var alive = (event.events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) == 0;
-            if (alive and (event.events & linux.EPOLL.IN) != 0) alive = readAvailable(c, aa);
+            const peer_shutdown = (event.events & (linux.EPOLL.HUP | linux.EPOLL.RDHUP)) != 0;
+            var alive = (event.events & linux.EPOLL.ERR) == 0;
+            if (alive and ((event.events & linux.EPOLL.IN) != 0 or peer_shutdown)) {
+                alive = readAvailable(c, aa, peer_shutdown);
+            }
             if (alive and (event.events & linux.EPOLL.OUT) != 0) alive = flushOutput(c);
             if (alive and connPoisoned(c)) alive = false;
             if (alive and c.close_after_write and connOutputDrained(c)) alive = false;

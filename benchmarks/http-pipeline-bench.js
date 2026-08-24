@@ -23,9 +23,9 @@ function run(count) {
     let response = '';
     const started = process.hrtime.bigint();
     const timeout = setTimeout(() => socket.destroy(new Error('pipeline timeout')), 15000);
-    // Keep the write side open until the final `Connection: close` response;
-    // an immediate FIN can race an edge-triggered server's read batch.
-    socket.on('connect', () => socket.write(payload));
+    // Exercise the normal request-then-FIN path as well as pipeline parsing.
+    // A TCP write half-close must not discard already-buffered requests.
+    socket.on('connect', () => socket.end(payload));
     socket.on('data', (chunk) => { response += chunk.toString('latin1'); });
     socket.on('error', reject);
     socket.on('end', () => {

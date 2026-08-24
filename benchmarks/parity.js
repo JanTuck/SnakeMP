@@ -57,6 +57,19 @@ function rawPartsOutcome(parts) {
   });
 }
 async function rawParts(parts) { return (await rawPartsOutcome(parts)).response; }
+function rawHalfClose(payload) {
+  const port = Number(new URL(BASE).port || 80);
+  return new Promise((resolve) => {
+    let response = '';
+    const socket = net.connect(port, '127.0.0.1');
+    const finish = () => { socket.destroy(); resolve(response); };
+    socket.setTimeout(1500, finish);
+    socket.on('data', (chunk) => { response += chunk.toString('utf8'); });
+    socket.on('error', finish);
+    socket.on('end', finish);
+    socket.on('connect', () => socket.end(payload));
+  });
+}
 
 function maskedFrame(firstByte, payload) {
   const body = Buffer.from(payload);
@@ -183,6 +196,11 @@ const hasChainedUpLeft = (moves) => {
     bodyPipeline.indexOf('303 See Other') >= 0 && bodyPipeline.indexOf('303 See Other') < bodyPipeline.indexOf('200 OK'), bodyPipeline.slice(0, 32));
   const closePipeline = await rawParts(['GET / HTTP/1.1\r\nConnection: close\r\n\r\nGET /missing HTTP/1.0\r\n\r\n']);
   check('Connection close ignores later pipelined requests', (closePipeline.match(/HTTP\/1\.1 /g) || []).length === 1, closePipeline.slice(0, 32));
+  const halfClosedPipeline = await rawHalfClose('GET /missing HTTP/1.1\r\nHost:x\r\n\r\nGET / HTTP/1.1\r\nHost:x\r\n\r\n');
+  check('TCP half-close preserves buffered HTTP pipeline responses',
+    (halfClosedPipeline.match(/HTTP\/1\.1 /g) || []).length === 2 &&
+      halfClosedPipeline.indexOf('404 Not Found') < halfClosedPipeline.indexOf('200 OK'),
+    'responses=' + (halfClosedPipeline.match(/HTTP\/1\.1 /g) || []).length);
   await rawParts(['POST /joingame HTTP/1.1\r\nHost: x\r\nContent-Length: nope\r\n\r\n']);
   check('malformed HTTP closes safely and server remains healthy', (await get('/')).status === 200);
   const validWsHeaders =

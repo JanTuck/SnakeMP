@@ -108,6 +108,12 @@ including shared server state. Reducing that further is possible, but at this
 point network fan-out and the kernel's per-socket cost matter more than storing
 the game integers.
 
+Player identities now borrow the owning connection's inline 22-byte session ID
+instead of allocating a duplicate. At 12,000 players this deterministically
+removes 12,000 live allocations, 264,000 requested bytes, and about 384,000
+bytes of allocator size-class slots. The connection outlives its player, and
+teardown removes the lobby-map key before releasing either object.
+
 ## Snapshot v3 production-encoder benchmark
 
 The current encoder was measured directly in Zig with 16 players, a retained
@@ -192,8 +198,10 @@ with an offset and compacts the buffer once when the batch is complete.
 
 `npm run bench:http-pipeline` sends minimal keep-alive requests over one
 loopback connection, validates the exact number and ordering of responses, and
-reports the median of three ReleaseFast samples. Timing includes response I/O;
-the smallest batch is correspondingly noisy. The paired measurements were:
+reports the median of three ReleaseFast samples. The client write-half-closes
+after the batch, so the harness also verifies that a normal TCP FIN does not
+discard buffered requests. Timing includes response I/O; the smallest batch is
+correspondingly noisy. The paired measurements were:
 
 | Requests in one pipeline | Before | After | Change |
 |---:|---:|---:|---:|
