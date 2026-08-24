@@ -133,18 +133,18 @@ function connectPlayer(base, lobby, username, password = '') {
     const landing = await request(base, 'GET', '/');
     assert.strictEqual(landing.status, 200);
     assert.strictEqual(landing.headers['cache-control'], 'no-store', 'landing HTML must never pin an old asset graph');
-    assert.match(landing.body, /\/css\/index\.css\?v=20260824\.3/, 'landing CSS URL must bypass already-cached releases');
-    assert.match(landing.body, /\/js\/status\.js\?v=20260824\.3/, 'landing script URL must bypass already-cached releases');
+    assert.match(landing.body, /\/css\/index\.css\?v=[0-9a-f]{16}/, 'landing CSS URL must carry the content release fingerprint');
+    assert.match(landing.body, /\/js\/status\.js\?v=[0-9a-f]{16}/, 'landing script URL must carry the content release fingerprint');
 
-    const landingCss = await request(base, 'GET', '/css/index.css?v=20260824.3');
+    const landingCss = await request(base, 'GET', '/css/index.css?v=release-check');
     assert.strictEqual(landingCss.status, 200);
     assert.strictEqual(landingCss.headers['cache-control'], 'no-cache, must-revalidate', 'static assets must revalidate before reuse');
 
     const gamePage = await request(base, 'GET', '/game/12345');
     assert.strictEqual(gamePage.status, 200);
     assert.strictEqual(gamePage.headers['cache-control'], 'no-store', 'game HTML must never pin an old asset graph');
-    assert.match(gamePage.body, /\/css\/game\.css\?v=20260824\.3/, 'game CSS URL must bypass already-cached releases');
-    assert.match(gamePage.body, /\/js\/rendering\.js\?v=20260824\.3/, 'game module URL must bypass already-cached releases');
+    assert.match(gamePage.body, /\/css\/game\.css\?v=[0-9a-f]{16}/, 'game CSS URL must carry the content release fingerprint');
+    assert.match(gamePage.body, /\/js\/rendering\.js\?v=[0-9a-f]{16}/, 'game module URL must carry the content release fingerprint');
 
     const indexAsset = await request(base, 'GET', '/index.html');
     assert.strictEqual(indexAsset.status, 200);

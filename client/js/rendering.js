@@ -1,11 +1,11 @@
-import Snake from "./snake.js";
-import GameOverMenu from "./menu/gameOverMenu.js";
-import { Sprites } from "./sprites.js";
-import { Sfx } from "./audio.js";
-import { Particles } from "./particles.js";
-import { Hud, Motion } from "./hud.js";
-import { decodeSnapshot } from "./snapshot.js";
-import { releaseBoost, resetDirection, setGameMode, setGameplayEnabled, syncDirection } from "./userInput.js";
+import Snake from "./snake.js?v=__SNEK_ASSET_REV__";
+import GameOverMenu from "./menu/gameOverMenu.js?v=__SNEK_ASSET_REV__";
+import { Sprites } from "./sprites.js?v=__SNEK_ASSET_REV__";
+import { Sfx } from "./audio.js?v=__SNEK_ASSET_REV__";
+import { Particles } from "./particles.js?v=__SNEK_ASSET_REV__";
+import { Hud, Motion } from "./hud.js?v=__SNEK_ASSET_REV__";
+import { decodeSnapshot } from "./snapshot.js?v=__SNEK_ASSET_REV__";
+import { releaseBoost, resetDirection, setGameMode, setGameplayEnabled, syncDirection } from "./userInput.js?v=__SNEK_ASSET_REV__";
 
 // Module scripts run after the DOM is parsed, so the canvas/socket exist
 // already. Wiring handlers here instead of inside window.onload avoids a

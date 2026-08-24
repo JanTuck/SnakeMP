@@ -1,4 +1,4 @@
-import Menu from "./menu.js";
+import Menu from "./menu.js?v=__SNEK_ASSET_REV__";
 
 const OVERLAY_SELECTOR = "[data-game-over-overlay]";
 

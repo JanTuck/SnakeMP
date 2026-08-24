@@ -5,8 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>Snek | Game</title>
     <link rel="icon" href="/img/snek.png">
-    <link rel="stylesheet" href="/css/game.css?v=20260824.3">
-    <link rel="stylesheet" href="/css/chat.css?v=20260824.3">
+    <link rel="stylesheet" href="/css/game.css?v=__SNEK_ASSET_REV__">
+    <link rel="stylesheet" href="/css/chat.css?v=__SNEK_ASSET_REV__">
 </head>
 <body>
 <p id="game_error" role="alert"></p>
@@ -77,11 +77,10 @@
     <button id="chat_open" class="chat-open" type="button" aria-label="Open chat"
             aria-expanded="false" title="Open chat (T)">Chat</button>
 </section>
-<script src="/js/share.js?v=20260824.3"></script>
-<script src="/js/transport.js?v=20260824.3"></script>
-<script src="/js/chat.js?v=20260824.3"></script>
-<script src="/js/userInput.js?v=20260824.3" type="module"></script>
-<script src="/js/rendering.js?v=20260824.3" type="module"></script>
+<script src="/js/share.js?v=__SNEK_ASSET_REV__"></script>
+<script src="/js/transport.js?v=__SNEK_ASSET_REV__"></script>
+<script src="/js/chat.js?v=__SNEK_ASSET_REV__"></script>
+<script src="/js/rendering.js?v=__SNEK_ASSET_REV__" type="module"></script>
 <script>
     // This page always belongs to the lobby in its URL: /game/<id>.
     const LOBBY_ID = decodeURIComponent(location.pathname.split('/').filter(Boolean).pop() || '') || '12345';

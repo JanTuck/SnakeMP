@@ -20,7 +20,8 @@ function collectModuleGraph(entry) {
     importPattern.lastIndex = 0;
     for (let match; (match = importPattern.exec(source)) !== null;) {
       assert(match[1].startsWith('.'), `browser module uses an unexpected bare import: ${match[1]}`);
-      const dependency = path.resolve(path.dirname(filename), match[1]);
+      assert.match(match[1], /\?v=__SNEK_ASSET_REV__$/, `browser module import is not release-pinned: ${match[1]}`);
+      const dependency = path.resolve(path.dirname(filename), match[1].split('?')[0]);
       assert(fs.existsSync(dependency), `browser module import is missing: ${dependency}`);
       pending.push(dependency);
     }
@@ -37,7 +38,7 @@ for (const filename of graph) {
 
 const startupScripts = new Set([
   ...graph,
-  path.join(clientRoot, 'js/userInput.js'),
+  path.join(clientRoot, 'js/share.js'),
   path.join(clientRoot, 'js/transport.js'),
   path.join(clientRoot, 'js/chat.js'),
 ]);
@@ -78,4 +79,19 @@ assert(/const MAX_HISTORY = 100;/.test(chat), 'chat session history must remain 
 assert(!/\.innerHTML\b|insertAdjacentHTML|document\.write/.test(chat), 'chat must only render untrusted text through DOM text nodes');
 assert(/\.textContent = name;/.test(chat) && /\.textContent = text;/.test(chat), 'chat names and messages must use textContent');
 
-console.log(`client asset test passed (${graph.size} rendering modules; ${startupScripts.size} startup JS requests / ${startupBytes} B; 4 modules, 1 image, and GSAP removed)`);
+assert(!/<script[^>]+userInput\.js/.test(gamePage), 'user input must load once through the rendering module graph');
+assert(gamePage.includes('/js/rendering.js?v=__SNEK_ASSET_REV__'), 'rendering entry must carry the build revision placeholder');
+
+const stagedRoot = path.join(root, 'servers/zig/src/generated/client');
+const stagedFiles = [
+  path.join(stagedRoot, 'index.html'),
+  path.join(stagedRoot, 'game.html'),
+  path.join(stagedRoot, 'js/rendering.js'),
+  path.join(stagedRoot, 'js/menu/gameOverMenu.js'),
+].map((filename) => fs.readFileSync(filename, 'utf8'));
+const revisions = stagedFiles.flatMap((source) => [...source.matchAll(/\?v=([0-9a-f]{16})/g)].map((match) => match[1]));
+assert(revisions.length >= 15, 'staged asset graph is missing release-pinned URLs');
+assert.strictEqual(new Set(revisions).size, 1, 'one page can load dependencies from different release revisions');
+assert(stagedFiles.every((source) => !source.includes('__SNEK_ASSET_REV__')), 'staged client still contains an unresolved release placeholder');
+
+console.log(`client asset test passed (${graph.size} rendering modules; ${startupScripts.size} startup JS requests / ${startupBytes} B; one fingerprinted module graph)`);
