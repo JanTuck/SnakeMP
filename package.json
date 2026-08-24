@@ -4,18 +4,18 @@
   "private": true,
   "scripts": {
     "start": "npm run build:zig && servers/zig/snek-zig",
-    "build": "npm run build:go && npm run build:zig",
-    "build:go": "bash servers/go/build-assets.sh && cd servers/go && GOCACHE=$PWD/../../.scratch/.gocache go build -trimpath -ldflags='-s -w' -o snek-go .",
+    "build": "npm run build:zig",
     "build:zig": "bash servers/zig/build-assets.sh && cd servers/zig && ${ZIG_BIN:-zig} build-exe -O ReleaseFast -fstrip src/main.zig -femit-bin=snek-zig --cache-dir .zig-cache --global-cache-dir .zig-global-cache",
-    "format": "gofmt -w servers/go/*.go && zig fmt servers/zig/src/*.zig",
-    "check": "npm run check:go && npm run check:zig",
-    "check:go": "bash servers/go/build-assets.sh && cd servers/go && GOCACHE=$PWD/../../.scratch/.gocache go test ./... && GOCACHE=$PWD/../../.scratch/.gocache go vet ./...",
+    "format": "zig fmt servers/zig/src/*.zig",
+    "check": "npm run check:zig",
     "check:zig": "bash servers/zig/build-assets.sh && cd servers/zig && ${ZIG_BIN:-zig} fmt --check src/*.zig && ${ZIG_BIN:-zig} test src/main.zig --cache-dir .zig-cache --global-cache-dir .zig-global-cache",
+    "test:transport": "node benchmarks/transport-test.js",
+    "test:memory": "npm run build:zig && node benchmarks/run-memory-ramp.js",
     "parity": "bash benchmarks/run-parity.sh",
     "benchmark:build": "node benchmarks/build-release.js",
     "bench": "bash benchmarks/run-benchmarks.sh"
   },
   "dependencies": {
-    "socket.io-client": "2.5.0"
+    "ws": "~7.4.2"
   }
 }

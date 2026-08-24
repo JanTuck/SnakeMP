@@ -1,104 +1,224 @@
-// DOM HUD: score panel, live leaderboard, event feed and the mute toggle.
-// Rendered as DOM (not canvas) so it stays crisp and CSS-animatable.
-import { Sfx } from "./audio.js";
+// Lightweight DOM HUD: personal stats, leaderboard, event feed and sound state.
+// Nodes are retained and updated in place so game ticks do not rebuild markup.
 
-const G = () => window.gsap; // GSAP is optional juice; everything degrades fine.
+const MAX_LEADERS = 5;
+const leaders = new Array(MAX_LEADERS);
+const rowState = Array.from({ length: MAX_LEADERS }, () => ({
+    id: null,
+    name: '',
+    score: 0,
+    isMe: false,
+    visible: false,
+}));
+const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 let els = null;
-let myId = null;
-let lastSignature = '';
-const feedTimers = [];
+const lastMe = { id: null, name: '', score: 0, length: 0 };
+let scoreVisible = false;
+let boardVisible = false;
 
-function feedText(item) {
+function setText(element, value) {
+    const text = String(value);
+    if (element.textContent !== text) element.textContent = text;
+}
+
+function feedContent(item) {
     switch (item.type) {
-        case 'join': return { icon: '🐍', text: `${item.who} slithered in` };
-        case 'death': return { icon: '💀', text: `${item.who} crashed (score ${item.score})` };
-        case 'drop-incoming': return { icon: '📦', text: 'Supply drop incoming!' };
-        case 'drop-open': return { icon: '🎉', text: `${item.who} cracked a crate: +${item.apples} apples` };
-        case 'golden': return { icon: '⭐', text: `${item.who} grabbed the golden apple +${item.points}` };
-        default: return { icon: '•', text: JSON.stringify(item) };
+        case 'join':
+            return { asset: '/img/snek.png', className: '', text: `${item.who} slithered in` };
+        case 'death':
+            return { asset: '/img/snek.png', className: 'is-death', text: `${item.who} crashed — score ${item.score}` };
+        case 'drop-incoming':
+            return { asset: '/img/crate.png', className: '', text: 'Supply drop incoming' };
+        case 'drop-open':
+            return { asset: '/img/crate.png', className: '', text: `${item.who} cracked a crate — +${item.apples} apples` };
+        case 'golden':
+            return { asset: '/img/golden.png', className: '', text: `${item.who} caught the golden apple — +${item.points}` };
+        default:
+            return { asset: '/img/snek.png', className: '', text: 'Game update' };
     }
+}
+
+function selectLeaders(players) {
+    leaders.fill(null);
+    for (let playerIndex = 0; playerIndex < players.length; playerIndex++) {
+        const player = players[playerIndex];
+        for (let position = 0; position < MAX_LEADERS; position++) {
+            const current = leaders[position];
+            if (current === null || player.score > current.score) {
+                for (let shift = MAX_LEADERS - 1; shift > position; shift--) {
+                    leaders[shift] = leaders[shift - 1];
+                }
+                leaders[position] = player;
+                break;
+            }
+        }
+    }
+}
+
+function findMe(players, id) {
+    for (let index = 0; index < players.length; index++) {
+        if (players[index].id === id) return players[index];
+    }
+    return null;
 }
 
 export const Hud = {
     init() {
         const root = document.getElementById('hud');
         if (root === null) return;
+
         root.innerHTML = `
-            <div class="hud-panel" id="hud_score"></div>
-            <div class="hud-panel" id="hud_board"></div>
-            <div id="hud_feed"></div>
-            <button id="hud_mute" title="Toggle sound"></button>
+            <section class="hud-panel hud-score" id="hud_score" aria-label="Your game stats" hidden>
+                <span class="hud-you" id="hud_you"></span>
+                <span class="hud-stat hud-stat-score" title="Score">
+                    <svg aria-hidden="true" viewBox="0 0 20 20"><path d="m10 2.5 2.2 4.45 4.92.72-3.56 3.47.84 4.9L10 13.72l-4.4 2.32.84-4.9-3.56-3.47 4.92-.72L10 2.5Z"/></svg>
+                    <span id="hud_points">0</span><span class="sr-only"> points</span>
+                </span>
+                <span class="hud-stat" title="Snake length">
+                    <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M3 5h7a3 3 0 0 1 0 6H8a3 3 0 0 0 0 6h9"/><path d="m14 13 3 3-3 3"/></svg>
+                    <span id="hud_length">0</span><span class="sr-only"> segments</span>
+                </span>
+            </section>
+
+            <section class="hud-panel hud-board" id="hud_board" aria-labelledby="hud_board_title" hidden>
+                <header class="hud-board-header">
+                    <h2 id="hud_board_title">Leaderboard</h2>
+                    <span>Score</span>
+                </header>
+                <ol class="hud-rows" id="hud_rows"></ol>
+            </section>
+
+            <div id="hud_feed" role="log" aria-live="polite" aria-relevant="additions"></div>
+
+            <button id="hud_mute" type="button" aria-pressed="false" aria-label="Turn sound off" title="Turn sound off">
+                <svg class="sound-on" aria-hidden="true" viewBox="0 0 24 24"><path d="M5 9v6h4l5 4V5L9 9H5Z"/><path d="M17 9a4 4 0 0 1 0 6M19.5 6.5a8 8 0 0 1 0 11"/></svg>
+                <svg class="sound-off" aria-hidden="true" viewBox="0 0 24 24"><path d="M5 9v6h4l5 4V5L9 9H5Z"/><path d="m18 9 5 5m0-5-5 5"/></svg>
+            </button>
         `;
+
+        const rows = document.getElementById('hud_rows');
+        const rowElements = new Array(MAX_LEADERS);
+        for (let index = 0; index < MAX_LEADERS; index++) {
+            const row = document.createElement('li');
+            const name = document.createElement('span');
+            const score = document.createElement('span');
+            name.className = 'hud-name';
+            score.className = 'hud-pts';
+            row.append(name, score);
+            row.hidden = true;
+            rows.append(row);
+            rowElements[index] = { row, name, score };
+        }
+
         els = {
             root,
             score: document.getElementById('hud_score'),
             board: document.getElementById('hud_board'),
+            you: document.getElementById('hud_you'),
+            points: document.getElementById('hud_points'),
+            length: document.getElementById('hud_length'),
+            rows: rowElements,
             feed: document.getElementById('hud_feed'),
             mute: document.getElementById('hud_mute'),
         };
-        // Panels stay hidden until there is something to show (i.e. joined).
-        els.score.style.display = 'none';
-        els.board.style.display = 'none';
-        this.setMuted(this.muted);
-        els.mute.addEventListener('click', () => {
-            const m = this.toggleMute();
-            if (!m) Sfx && Sfx.eat && Sfx.eat();
-        });
     },
 
-    // Wired by rendering.js so the button can unmute with a confirmation blip.
     setMuted(muted) {
         if (els === null) return;
-        els.mute.textContent = muted ? '🔇' : '🔊';
+        const label = muted ? 'Turn sound on' : 'Turn sound off';
+        els.mute.dataset.muted = muted ? 'true' : 'false';
+        els.mute.setAttribute('aria-pressed', muted ? 'true' : 'false');
+        els.mute.setAttribute('aria-label', label);
+        els.mute.title = label;
     },
 
     update(players, meId) {
         if (els === null) return;
-        myId = meId;
-        let signature = meId;
-        for (let i = 0; i < players.length; i++) {
-            const p = players[i];
-            signature += `|${p.id}:${p.score}:${p.bodyLength}`;
+
+        const me = findMe(players, meId);
+        const nextScoreVisible = me !== null;
+        const nextBoardVisible = players.length !== 0;
+        if (scoreVisible !== nextScoreVisible) {
+            els.score.hidden = !nextScoreVisible;
+            scoreVisible = nextScoreVisible;
         }
-        if (signature === lastSignature) return;
-        lastSignature = signature;
-        if (players.length > 0) {
-            els.score.style.display = 'flex';
-            els.board.style.display = 'block';
+        if (boardVisible !== nextBoardVisible) {
+            els.board.hidden = !nextBoardVisible;
+            boardVisible = nextBoardVisible;
         }
-        const me = players.find((p) => p.id === meId);
-        const sorted = [...players].sort((a, b) => b.score - a.score).slice(0, 5);
-        els.score.innerHTML = me
-            ? `<span class="hud-you">${me.displayName}</span>
-               <span class="hud-stat">⭐ ${me.score}</span>
-               <span class="hud-stat">📏 ${me.snake.length}</span>`
-            : '';
-        els.board.innerHTML = sorted.map((p, i) =>
-            `<div class="hud-row${p.id === meId ? ' hud-me' : ''}">
-                <span class="hud-rank">${i + 1}.</span>
-                <span class="hud-name">${p.displayName}</span>
-                <span class="hud-pts">${p.score}</span>
-            </div>`).join('');
+
+        if (me !== null) {
+            const length = me.snake.length;
+            if (lastMe.id !== me.id || lastMe.name !== me.displayName) setText(els.you, me.displayName);
+            if (lastMe.id !== me.id || lastMe.score !== me.score) setText(els.points, me.score);
+            if (lastMe.id !== me.id || lastMe.length !== length) setText(els.length, length);
+            lastMe.id = me.id;
+            lastMe.name = me.displayName;
+            lastMe.score = me.score;
+            lastMe.length = length;
+        }
+
+        selectLeaders(players);
+        for (let index = 0; index < MAX_LEADERS; index++) {
+            const player = leaders[index];
+            const elements = els.rows[index];
+            if (player === null) {
+                if (rowState[index].visible) elements.row.hidden = true;
+                rowState[index].id = null;
+                rowState[index].visible = false;
+                continue;
+            }
+
+            if (!rowState[index].visible) elements.row.hidden = false;
+            const isMe = player.id === meId;
+            if (rowState[index].isMe !== isMe) elements.row.classList.toggle('hud-me', isMe);
+            if (rowState[index].id !== player.id || rowState[index].name !== player.displayName) {
+                setText(elements.name, player.displayName);
+            }
+            if (rowState[index].id !== player.id || rowState[index].score !== player.score) {
+                setText(elements.score, player.score);
+            }
+            rowState[index].id = player.id;
+            rowState[index].name = player.displayName;
+            rowState[index].score = player.score;
+            rowState[index].isMe = isMe;
+            rowState[index].visible = true;
+        }
     },
 
     feed(item) {
         if (els === null) return;
-        const { icon, text } = feedText(item);
-        const el = document.createElement('div');
-        el.className = 'hud-feed-item';
-        el.innerHTML = `<span class="hud-icon">${icon}</span> ${text}`;
-        els.feed.prepend(el);
-        if (G()) G().from(el, { x: 40, opacity: 0, duration: 0.3, ease: 'power2.out' });
-        while (els.feed.children.length > 5) els.feed.lastChild.remove();
-        const timer = setTimeout(() => {
-            el.remove();
-        }, 4500);
-        feedTimers.push(timer);
+        const content = feedContent(item);
+        const entry = document.createElement('div');
+        const icon = document.createElement('img');
+        const text = document.createElement('span');
+
+        entry.className = `hud-feed-item${content.className ? ` ${content.className}` : ''}`;
+        icon.className = 'hud-feed-icon';
+        icon.src = content.asset;
+        icon.alt = '';
+        icon.width = 72;
+        icon.height = 72;
+        text.textContent = content.text;
+        entry.append(icon, text);
+        els.feed.prepend(entry);
+
+        if (!reduceMotion && window.gsap) {
+            window.gsap.from(entry, { x: 24, opacity: 0.65, duration: 0.28, ease: 'power3.out' });
+        }
+
+        while (els.feed.children.length > 5) {
+            const oldest = els.feed.lastElementChild;
+            clearTimeout(oldest._hudTimer);
+            oldest.remove();
+        }
+
+        entry._hudTimer = setTimeout(() => entry.remove(), 4500);
     },
 
     popScore() {
-        if (els === null || !G()) return;
-        G().fromTo(els.score, { scale: 1.12 }, { scale: 1, duration: 0.25, ease: 'power2.out' });
+        if (els === null || reduceMotion || !window.gsap) return;
+        window.gsap.fromTo(els.score, { scale: 1.06 }, { scale: 1, duration: 0.22, ease: 'power3.out' });
     },
 };

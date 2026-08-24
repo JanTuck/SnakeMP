@@ -1,153 +1,199 @@
-# Snek server specification (parity target)
+# SnakeMP Zig server specification
 
-The maintained implementations under `servers/` implement this observable
-protocol. Zig uses the compact v2 snapshot below; Go and the client retain
-legacy `gameTick` compatibility.
+This document describes the maintained Zig server and canonical browser client.
+Socket.IO, Engine.IO, and the old JSON tick protocol are not part of the active
+transport.
 
-## Runtime model
+## Runtime and ownership model
 
-- Game tick: **every 66.67ms (15fps)**. One master timer iterates all lobbies.
-- Board: 1920x960 logical units; grid cell = **16px**; grid is **120 x 60** cells.
-- Movement: 16px per tick in the current direction. A snake is an array of
-  cells `{x, y}` (multiples of 16), index 0 = head.
-- A stationary snake (no input yet) does not move and cannot die.
+- The simulation runs at **15 Hz**, one tick every **66.67 ms**.
+- A single edge-triggered Linux epoll reactor owns listening, HTTP parsing,
+  WebSocket framing, connection lifetime, and nonblocking socket writes.
+- Game workers are allocated adaptively. A worker owns up to **128 lobbies** by
+  default, processes them sequentially each tick, and uses a 128 KiB stack plus
+  a retained per-tick arena. Each additional block of 128 lobbies creates
+  another worker; empty excess workers are removed again.
+- Each lobby has a mutex, private PRNG, stable insertion-ordered player map, and
+  retained snapshot buffer. The lock order is lobby, connection membership,
+  then connection output, which prevents player/connection use-after-free while
+  the reactor and game workers run concurrently.
+- Ready sockets use direct nonblocking writes. Per-connection output storage is
+  retained and copied into only when the socket applies backpressure.
 
-## Lobbies
+The worker packing threshold is configurable with `SNEK_LOBBIES_PER_WORKER`.
+The default of 128 was validated at 750 active lobbies: six game workers held
+the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
 
-- `Map<id, lobby>`. Each lobby: own players, food, bonus apples, drops, golden
-  apple, drop/golden timers, broadcast room, tick stats.
-- Lobby ids: created by `POST /generateid` (`id-<base36 rand><base36 time>`).
-- The default lobby `"12345"` always exists and is never deleted.
-- Non-default lobbies with 0 players are deleted after **60s** idle.
-- Broadcast room name: `lobby:<id>`.
+## Board and movement
 
-## Player caps
+- Board: 1920 x 960 logical pixels.
+- Cell: 16 pixels, so the board is 120 x 60 cells.
+- A snake is stored as ordered cells, head first, and moves one cell per tick.
+- A stationary snake (no accepted direction yet) does not move or die.
+- Input is a queue of at most two turns. A new turn is rejected if it repeats
+  or reverses the last queued/applied direction. One queued turn is applied per
+  tick.
 
-- **100** concurrent players across all lobbies (reject: "Server is full, try again later").
-- **16** players per lobby (reject: "This game is full").
-- Rejection = `game_error` event with the message; no `init`; player not added.
+## Lobbies and capacity
 
-## Joining
+- Lobby ids are created by `POST /generateid` as
+  `id-<base36-random><base36-time>`.
+- Lobby `12345` always exists and is never deleted.
+- Other empty lobbies are reaped after 60 seconds by default. Override the
+  lifecycle test/deployment value with `SNEK_LOBBY_IDLE_MS`.
+- Default global capacity is 100 players (`SNEK_MAX_PLAYERS`).
+- Default lobby capacity is 16 players (`SNEK_MAX_PLAYERS_PER_LOBBY`). Snapshot
+  v1 has a one-byte player count, but the canonical browser deliberately
+  enforces the tested 16-player lobby bound; do not raise the per-lobby value
+  without changing and testing both protocol peers.
+- Full-server rejection is `game_error: "Server is full, try again later"`.
+- Full-lobby rejection is `game_error: "This game is full"`.
 
-`clientReady` event with args `[username, lobbyId]`:
-1. username: string, trimmed length 4..16, charset `^[\p{L}\p{N}_\- ]+$` (unicode).
-   Invalid -> `game_error "Invalid username"`.
-2. Unknown lobbyId -> `game_error "That game does not exist any more"`.
-3. Caps (global first, then lobby) as above.
-4. On success emit `init` `{"scale":16,"food":{"x":..,"y":..}}` (to the joining
-   socket only), then add the player, join the room, broadcast feed `join`.
-- Spawn position: random free cell (not on any snake, not on the food), up to
-  100 attempts.
-- Colour: random hex from `rcolor`-style generator (any `#rrggbb` is fine).
-- **Rejoin on the same socket after death must work** (Retry without reload).
+At 12,000 players the tested configuration used 750 lobbies of 16 players and
+`SNEK_MAX_PLAYERS=12000`; the default production cap remains conservative.
 
-## Input
+## Join and connection lifecycle
 
-`keyPress` event with one of `ArrowUp/ArrowDown/ArrowLeft/ArrowRight`:
-- Keep a **queue of at most 2** pending turns. Validate each new input against
-  the last queued direction (or the applied direction if the queue is empty):
-  reject same direction and 180-degree reversals. Apply **one queued turn per
-  tick**; leftovers carry over to the next tick.
+The join fields are UTF-8 byte strings in client binary packet type 1. The
+username is trimmed, must be 4..16 Unicode code points, accepts ASCII letters,
+digits, underscore, hyphen, and space, and permits valid non-ASCII code points.
+Invalid data produces
+`["game_error","Invalid username"]`; an unknown lobby produces
+`["game_error","That game does not exist any more"]`.
 
-## Tick order (per lobby)
+On success the server:
 
-1. Expire drops/golden past their TTL.
-2. Schedule a supply drop (every 12-20s, max 2 alive) and a golden apple
-   (every 25-40s, one at a time) at a free cell.
-3. Reap disconnected-socket players (announce feed `death`).
-4. Per player, in insertion order (skip players already dead this tick):
-   a. wall/self collision -> `death` (score) to that socket + feed `death`,
-      remove. Continue.
-   b. head vs any other snake segment -> both die: `death` to both sockets +
-      2 feed `death`. Continue.
-   c. head on main food -> +1 score, +1 pending growth, respawn main food
-      (not on snakes), broadcast `updateFood {x,y}`.
-   d. head on bonus apple -> remove apple, +1/+1.
-   e. head on golden -> remove, +3 score, +1 growth, feed `golden`.
-   f. head on drop crate -> remove crate, +2 score, +2 growth, spawn up to 4
-      bonus apples (cap 12 total), feed `drop-open`.
-   g. apply one queued turn, then move (grow by consuming pendingGrowth
-     instead of popping the tail).
-5. Broadcast the world snapshot (see wire format).
+1. sends `init` with scale and food to the joining connection;
+2. creates the player at a random free cell;
+3. marks the lobby roster dirty;
+4. sends a `join` feed event to lobby members;
+5. sends the new roster before the next binary snapshot.
 
-## Growth model
+A socket may join again after its player dies. Closing a socket atomically
+detaches and frees the player before the file descriptor and retained buffers
+are destroyed.
 
-`eat(points = 1, growth = 1)`: score += points; pendingGrowth += growth.
-Each tick: if pendingGrowth > 0, keep the tail (pendingGrowth--) else pop it.
+## Raw WebSocket protocol
 
-## Pickups
+The endpoint is `GET /ws` with a standard RFC 6455 version-13 upgrade. The
+server sends standard WebSocket ping frames every 20 seconds and closes a peer
+that has not answered within 15 seconds. Client frames must be masked. Partial
+HTTP requests and fragmented WebSocket messages are accumulated; invalid,
+unmasked, oversized, or structurally inconsistent input is rejected without
+reading outside validated bounds.
 
-- Main food: exactly 1 per lobby, respawns (free cell) when eaten.
-- Bonus apples: up to 12, from opened crates, no expiry.
-- Drop crate: TTL 25s, blink client-side when ttl < 5000.
-- Golden apple: TTL 12s, blink when ttl < 3000.
-- "Free cell": not on any snake, main food, bonus apple, drop, or golden.
+There is no Socket.IO/Engine.IO envelope. Hot client messages and world
+snapshots are WebSocket binary frames. Infrequent server control messages are
+compact JSON arrays in WebSocket text frames.
 
-## Wire protocol (socket.io v2 over engine.io v3, websocket transport)
+### Client-to-server binary packets
 
-- Endpoint: `GET /socket.io/?EIO=3&transport=websocket` (HTTP Upgrade).
-- Compute `Sec-WebSocket-Accept` = base64(SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")).
-- After upgrade, immediately send engine.io open frame:
-  `0{"sid":"<20+ chars unique>","upgrades":[],"pingInterval":20000,"pingTimeout":15000}`
-  followed by socket.io CONNECT frame: `40`.
-- Frames are engine.io packets: first byte packet type:
-  `0` open, `2` ping, `3` pong, `4` message. A socket.io event is
-  `4` + `42` + JSON array: e.g. `42["keyPress","ArrowRight"]`.
-- Server MUST send `2` every pingInterval ms; any `3` from the client resets
-  the timer. If no pong within pingTimeout, close the connection.
-- Server->client events (message frames `42["<event>",<args...>]`):
-  `init`, `r`, `tick`, `updateFood`, `death` (score), `game_error` (message),
-  `feed` ({type, who?, score?, apples?, points?}).
-- Client->server events: `clientReady` [username, lobbyId], `keyPress` [dir].
-- On socket close: remove the player, broadcast feed `death`.
-
-## World snapshot payload
-
-Zig sends player identity metadata only after lobby membership changes:
+All byte lengths below are unsigned bytes.
 
 ```text
-r = [[id, displayName, color], ...]
+join:
+  type:u8 = 1
+  lobby_utf8_bytes:u8
+  username_utf8_bytes:u8
+  lobby:[u8; lobby_utf8_bytes]
+  username:[u8; username_utf8_bytes]
+
+input:
+  type:u8 = 2
+  direction:u8  // 0 up, 1 down, 2 left, 3 right
 ```
 
-Each subsequent tick is aligned by player index with that roster. Coordinates
-are grid-cell integers; clients multiply them by the `init.scale` value (16).
+The join frame length must be exactly `3 + lobby_bytes + username_bytes`, both
+fields must be non-empty, and each is limited to 255 UTF-8 bytes by the packet.
+The input frame must be exactly two bytes. Unknown packet types/directions and
+client text messages have no game effect.
 
-```text
-tick = [
-  [[score, bodyLength, [x, y, x, y, ...]], ...],
-  [bonusX, bonusY, ...],
-  [[dropId, x, y, ttlMs], ...],
-  [goldenX, goldenY, ttlMs] | null
-]
-```
+### Server-to-client JSON control events
 
-The client also accepts the legacy `gameTick` object used by Go:
+Each event is one JSON array whose first element is the event name:
 
 ```json
-{
-  "players": [{"id","displayName","color","snake":[{"x","y"}...],"score","bodyLength"}...],
-  "bonus": [{"x","y"}...],
-  "drops": [{"id","x","y","ttl"}...],
-  "golden": {"x","y","ttl"} | null
-}
+["id", "base64url-connection-id"]
+["init", {"scale": 16, "food": {"x": 0, "y": 0}}]
+["r", [["id", "displayName", "#rrggbb"]]]
+["updateFood", {"x": 0, "y": 0}]
+["death", 12]
+["game_error", "message"]
+["feed", {"type": "join", "who": "name"}]
 ```
+
+The `r` roster is sent only when membership changes. Snapshot player rows use
+the same insertion order, eliminating per-tick ids, names, colors, keys, and
+object nesting. Feed types are `join`, `death`, `golden`, `drop-incoming`, and
+`drop-open`, with only the fields needed by that event.
+
+### Server-to-client binary snapshot v1
+
+All multibyte fields are **little-endian**. Coordinates are one-byte grid-cell
+indices and the browser multiplies them by 16. No native Zig struct, padding,
+pointer, or uninitialized byte crosses the wire.
+
+```text
+magic:[u8;2] = "SN"
+version:u8 = 1
+player_count:u8
+
+repeat player_count times:
+  score:i32
+  body_length:u16
+  cell_count:u16
+  repeat cell_count times: x_cell:u8, y_cell:u8
+
+bonus_count:u8
+repeat bonus_count times: x_cell:u8, y_cell:u8
+
+drop_count:u8
+repeat drop_count times: x_cell:u8, y_cell:u8, ttl_ms:u16
+
+golden_present:u8  // 0 or 1
+if 1: x_cell:u8, y_cell:u8, ttl_ms:u16
+```
+
+The client checks magic, version, roster/player agreement, all section counts,
+remaining length before every read, gameplay bounds (16 players, 7,200 cells,
+12 bonus apples, two drops), golden presence, and exact end-of-frame alignment.
+Malformed or truncated snapshots are ignored.
+
+Drop ids are intentionally absent: the browser renders position and TTL and
+never consumes the server's internal drop id. TTL values are clamped to
+`0..65535`; game TTLs are lower than this bound.
+
+## Tick order
+
+For each lobby, under its ownership lock:
+
+1. expire drops and the golden apple;
+2. schedule drops (12-20 s, at most two) and a golden apple (25-40 s, one);
+3. reap disconnected players;
+4. for each player in insertion order: resolve wall/self and player collisions,
+   food/pickups, one queued turn, growth, then movement;
+5. send a roster if membership changed;
+6. serialize one binary snapshot and broadcast the same immutable bytes to all
+   remaining lobby connections.
+
+Food gives one point and one segment of pending growth. A golden apple gives
+three points and one growth. A crate gives two points, two growth, and spawns up
+to four bonus apples, capped at 12. Drops live 25 seconds and golden apples 12.
+A free cell contains no snake, food, bonus apple, drop, or golden apple.
 
 ## HTTP
 
-- `GET /` -> client/index.html
-- `GET /game/:id` -> client/game.html if the lobby exists, else 302 /
-- `GET /game.html` -> 302 / (lobby gate)
-- `POST /generateid` -> 303 to /game/<new id> (creates lobby)
-- `POST /joingame` (form urlencoded gameId) -> 303 /game/<id> or 303 /?error=unknown-game
-- Static: /css/*, /js/*, /img/*, /vendor/gsap.min.js, /socket.io/socket.io.js
-  (all sourced from the canonical `client/` tree and embedded where applicable).
-- `GET /debug/stats` -> JSON: {"rss": bytes, "uptime": s, "totalPlayers": n,
-  "lobbies": [{"id","players","drops","bonus","golden","lastTickMs","avgTickMs","maxTickMs"}...]}
-- Security headers on HTTP responses: X-Content-Type-Options: nosniff,
-  X-Frame-Options: DENY, Referrer-Policy: no-referrer. No x-powered-by.
+- `GET /` and `/index.html`: landing page
+- `GET /game/:id`: game page if the lobby exists, otherwise `302 /`
+- `GET /game.html`: `302 /` (lobby gate)
+- `POST /generateid`: create lobby and `303 /game/<id>`
+- `POST /joingame`: URL-encoded or JSON `gameId`, then a valid-game redirect or
+  `303 /?error=unknown-game`
+- `/css/*`, `/js/*`, `/img/*`, and `/vendor/gsap.min.js`: compile-time embedded
+  canonical client assets
+- `GET /debug/stats`: available only with `SNEK_DEBUG=1`; includes RSS,
+  connections, players, worker packing, network/frame counters, input timing,
+  and per-lobby tick/serialization/wire statistics
 
-## Validation rules
-
-- keyPress values not in the four arrows are ignored.
-- clientReady before a successful join: keyPress ignored.
-- Non-string username / lobbyId handled without crashing.
+Responses include `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+and `Referrer-Policy: no-referrer`, and do not expose an `x-powered-by` header.

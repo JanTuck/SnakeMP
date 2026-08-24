@@ -2,14 +2,12 @@
  * Usage: PARITY_BASE=http://127.0.0.1:4100 node benchmarks/parity.js
  * Exit code 0 = parity. Run against the Node reference first.
  */
-const io = require('socket.io-client');
+const io = require('./socket');
 const http = require('http');
 const net = require('net');
 const { attachWorld } = require('./protocol');
 
-// Node 22 ships a global WebSocket (undici) that engine.io-client prefers but
-// which fails the engine.io v3 handshake in some environments; hide it so the
-// client uses the ws package.
+// Keep the benchmark on the installed `ws` implementation across Node versions.
 try { delete globalThis.WebSocket; } catch (e) {}
 
 const BASE = process.env.PARITY_BASE || 'http://127.0.0.1:4000';
@@ -86,8 +84,8 @@ const moved = (samples, axis, sign) => {
   check('GET /lobby.html serves shared client', lobbyPage.status === 200 && lobbyPage.body.includes('Lobby'), 'status=' + lobbyPage.status);
   const clientScript = await get('/js/rendering.js');
   check('GET /js/rendering.js serves shared client', clientScript.status === 200 && clientScript.body.length > 100, 'status=' + clientScript.status);
-  const socketClient = await get('/socket.io/socket.io.js');
-  check('GET /socket.io/socket.io.js serves embedded vendor bundle', socketClient.status === 200 && socketClient.body.length > 1000, 'status=' + socketClient.status);
+  const socketClient = await get('/js/transport.js');
+  check('GET /js/transport.js serves native websocket client', socketClient.status === 200 && socketClient.body.includes('WebSocket'), 'status=' + socketClient.status);
   const gsap = await get('/vendor/gsap.min.js');
   check('GET /vendor/gsap.min.js serves embedded vendor bundle', gsap.status === 200 && gsap.body.length > 1000, 'status=' + gsap.status);
   const created = await post('/generateid');

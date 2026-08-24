@@ -4,7 +4,7 @@
  * (SNEK_DEBUG=1 recommended so /debug/stats can be correlated).
  */
 const path = require('path');
-const io = require('socket.io-client');
+const io = require('./socket');
 const http = require('http');
 const fs = require('fs');
 const { attachWorld } = require('./protocol');
@@ -16,7 +16,18 @@ const NAME = process.env.STRESS_NAME || 'server';
 const CRLF = String.fromCharCode(13, 10);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0; };
-const metrics = { name: NAME, base: BASE, phases: {} };
+const metrics = {
+  schemaVersion: 2,
+  name: NAME,
+  base: BASE,
+  methodology: {
+    topology: 'server and Node.js stress client share the loopback host',
+    idleRamp: 'connected native WebSockets that do not join a lobby; RSS is server process RSS only',
+    rawHostile: 'counts TCP connections opened for malformed payload attempts, not payload acceptance by the protocol parser',
+    lowInputRate: 'joined clients send one direction per second; this is not a slow-reader/socket-backpressure test',
+  },
+  phases: {},
+};
 
 function get(path) {
   return new Promise((resolve) => {
@@ -145,25 +156,24 @@ function rawSocket(port, payload) {
     if (s) {
       s.emit('clientReady', 'garbage-bot', '12345');
       await wait(300);
-      s.emit('keyPress', 'x'.repeat(1024 * 1024));
-      s.emit('clientReady', 'y'.repeat(8 * 1024 * 1024), '12345');
-      s.emit('keyPress', { huge: 'z'.repeat(1024 * 1024) });
+      // Bypass the bounded adapter to exercise the server's frame-size guard.
+      s.send(Buffer.alloc(2 * 1024 * 1024 + 1, 0xff));
       await wait(1000);
       try { s.close(); } catch (e) {}
     }
     const payloads = [
       'GARBAGE' + CRLF + CRLF,
-      'GET /socket.io/?EIO=3&transport=websocket HTTP/1.1' + CRLF + 'Host: x' + CRLF + CRLF,
+      'GET /ws HTTP/1.1' + CRLF + 'Host: x' + CRLF + CRLF,
       Buffer.from([0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]),
     ];
-    let rawOk = 0;
+    let rawConnectionsOpened = 0;
     for (let i = 0; i < 100; i++) {
-      if (await rawSocket(port, payloads[i % payloads.length])) rawOk++;
+      if (await rawSocket(port, payloads[i % payloads.length])) rawConnectionsOpened++;
     }
     await wait(500);
     const alive = (await get('/')).status === 200;
     const tickP95 = obsDeltas.length > 10 ? pct(obsDeltas.slice(-100), 0.95) : null;
-    metrics.phases.hostile = { rawAccepted: rawOk, serverAliveAfter: alive, tickP95After: tickP95 };
+    metrics.phases.hostile = { rawAttempts: 100, rawConnectionsOpened, serverAliveAfter: alive, tickP95After: tickP95 };
     console.log('S3 hostile: ' + JSON.stringify(metrics.phases.hostile));
   }
 
@@ -180,7 +190,7 @@ function rawSocket(port, payload) {
     console.log('S4 churn: ' + JSON.stringify(metrics.phases.churn));
   }
 
-  // S5: throttled clients — slow 1 input/sec bots, tick cadence must hold.
+  // S5: low-input-rate clients — one input/sec per bot, tick cadence must hold.
   {
     const bots = [];
     for (let i = 0; i < 12; i++) {
@@ -190,11 +200,17 @@ function rawSocket(port, payload) {
       bots.push(s);
     }
     const d0 = obsDeltas.length;
-    for (const s of bots) s.emit('keyPress', 'ArrowRight');
+    const directions = ['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp'];
+    let directionIndex = 0;
+    const lowRateInput = setInterval(() => {
+      const direction = directions[directionIndex++ % directions.length];
+      for (const s of bots) s.emit('keyPress', direction);
+    }, 1000);
     await wait(8000);
+    clearInterval(lowRateInput);
     const deltas = obsDeltas.slice(d0);
-    metrics.phases.throttled = { bots: bots.length, tickAvg: deltas.length ? Math.round(deltas.reduce((a, b) => a + b, 0) / deltas.length * 10) / 10 : null, tickP95: deltas.length ? pct(deltas, 0.95) : null, tickMax: deltas.length ? Math.max(...deltas) : null };
-    console.log('S5 throttled: ' + JSON.stringify(metrics.phases.throttled));
+    metrics.phases.lowInputRate = { bots: bots.length, inputsPerBotPerSec: 1, tickAvg: deltas.length ? Math.round(deltas.reduce((a, b) => a + b, 0) / deltas.length * 10) / 10 : null, tickP95: deltas.length ? pct(deltas, 0.95) : null, tickMax: deltas.length ? Math.max(...deltas) : null };
+    console.log('S5 low input rate: ' + JSON.stringify(metrics.phases.lowInputRate));
     for (const s of bots) try { s.close(); } catch (e) {}
   }
 

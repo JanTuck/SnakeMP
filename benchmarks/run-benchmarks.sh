@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Full benchmark + stress suite for the maintained Snek servers.
 # Usage: ./benchmarks/run-benchmarks.sh <name> [<name> ...]
-#   names: zig | go
+#   name: zig
 # Results land in .scratch/results/<name>.* plus .scratch/{bench,stress}-<name>.json
 set -u
 cd "$(dirname "$0")/.."
@@ -10,7 +10,7 @@ ulimit -n 65535 2>/dev/null || true
 REPO="$(pwd)"
 
 if (( $# == 0 )); then
-  set -- go zig
+  set -- zig
 fi
 
 start_server() { # name port cmd...
@@ -69,7 +69,6 @@ size_report() { # name dir
 
 for name in "$@"; do
   case "$name" in
-    go)   run_suite go   4102 "$REPO/servers/go/snek-go"; size_report go "$REPO/servers/go" ;;
     zig)  run_suite zig  4104 "$REPO/servers/zig/snek-zig"; size_report zig "$REPO/servers/zig" ;;
     *) echo "unknown suite: $name" ;;
   esac

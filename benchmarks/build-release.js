@@ -12,8 +12,6 @@ fs.mkdirSync(resultsDir, { recursive: true });
 
 const zig = process.env.ZIG_BIN || 'zig';
 const builds = [
-  ['go-assets', 'bash', ['servers/go/build-assets.sh'], root],
-  ['go', 'go', ['build', '-trimpath', '-ldflags=-s -w', '-o', 'snek-go', '.'], path.join(root, 'servers', 'go')],
   ['zig-assets', 'bash', ['servers/zig/build-assets.sh'], root],
   ['zig', zig, ['build-exe', '-O', 'ReleaseFast', '-fstrip', 'src/main.zig', '-femit-bin=snek-zig', '--cache-dir', '.zig-cache', '--global-cache-dir', '.zig-global-cache'], path.join(root, 'servers', 'zig')],
 ];
@@ -32,16 +30,12 @@ const result = {
     kernel: os.release(),
     arch: os.arch(),
     node: process.version,
-    go: version('go', ['version']),
     zig: version(zig, ['version']),
   },
 };
 for (const [name, command, args, cwd] of builds) {
   const start = process.hrtime.bigint();
-  const env = name === 'go'
-    ? { ...process.env, GOCACHE: path.join(root, '.scratch', '.gocache') }
-    : process.env;
-  const child = spawnSync(command, args, { cwd, env, encoding: 'utf8' });
+  const child = spawnSync(command, args, { cwd, env: process.env, encoding: 'utf8' });
   const elapsedMs = Number(process.hrtime.bigint() - start) / 1e6;
   if (child.status !== 0) {
     process.stderr.write(child.stdout || '');

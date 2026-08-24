@@ -36,6 +36,8 @@ pub const assets = [_]Asset{
     .{ .path = "/js/overlays/feedElement.js", .ctype = JS, .body = @embedFile("generated/client/js/overlays/feedElement.js") },
     .{ .path = "/js/overlays/playerfeed.js", .ctype = JS, .body = @embedFile("generated/client/js/overlays/playerfeed.js") },
     .{ .path = "/js/resourceHandler.js", .ctype = JS, .body = @embedFile("generated/client/js/resourceHandler.js") },
+    .{ .path = "/js/snapshot.js", .ctype = JS, .body = @embedFile("generated/client/js/snapshot.js") },
+    .{ .path = "/js/transport.js", .ctype = JS, .body = @embedFile("generated/client/js/transport.js") },
     .{ .path = "/js/userInput.js", .ctype = JS, .body = @embedFile("generated/client/js/userInput.js") },
     .{ .path = "/js/gameObject.js", .ctype = JS, .body = @embedFile("generated/client/js/gameObject.js") },
     .{ .path = "/js/sprites.js", .ctype = JS, .body = @embedFile("generated/client/js/sprites.js") },
@@ -57,7 +59,6 @@ pub const assets = [_]Asset{
     .{ .path = "/img/CREDITS.md", .ctype = MD, .body = @embedFile("generated/client/img/CREDITS.md") },
 
     .{ .path = "/vendor/gsap.min.js", .ctype = JS, .body = @embedFile("generated/client/vendor/gsap.min.js") },
-    .{ .path = "/socket.io/socket.io.js", .ctype = JS, .body = @embedFile("generated/client/socket.io/socket.io.js") },
 };
 
 /// Linear scan is fine: the table has ~30 fixed entries.

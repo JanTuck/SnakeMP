@@ -3,46 +3,83 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Snek - The multiplayer snake</title>
+    <meta name="theme-color" content="#20242f">
+    <title>Snek — The multiplayer snake</title>
     <link rel="icon" href="/img/snek.png">
-    <link rel="stylesheet" type="text/css" href="css/index.css">
+    <link rel="stylesheet" href="css/index.css">
 </head>
 <body>
-    <main class="hero">
-        <header class="brand">
-            <img class="brand-snek" src="/img/snek.png" alt="" width="72" height="72">
-            <h1>Snek</h1>
-            <p class="tagline">The multiplayer snake</p>
-        </header>
+    <main class="landing">
+        <section class="intro" aria-labelledby="page-title">
+            <div class="brand">
+                <img class="brand-snek" src="/img/snek.png" alt="" width="72" height="72">
+                <div>
+                    <h1 id="page-title">Snek</h1>
+                    <p class="tagline">The multiplayer snake</p>
+                </div>
+            </div>
 
-        <p id="join_error" role="alert" hidden></p>
+            <div class="board-preview" aria-hidden="true">
+                <span class="snake-cell snake-cell-1"></span>
+                <span class="snake-cell snake-cell-2"></span>
+                <span class="snake-cell snake-cell-3"></span>
+                <span class="snake-cell snake-cell-4"></span>
+                <span class="snake-cell snake-cell-5"></span>
+                <img class="preview-pickup preview-apple" src="/img/apple.png" alt="" width="72" height="72">
+                <img class="preview-pickup preview-golden" src="/img/golden.png" alt="" width="72" height="72">
+            </div>
 
-        <section class="card">
-            <h2 class="card-title">Join a game</h2>
-            <form method="post" action="/joingame" class="join-form">
-                <label for="gameId">Game id or link</label>
-                <input id="gameId" name="gameId" placeholder="e.g. 12345" autocomplete="off">
-                <button class="btn btn-join" type="submit"><span class="btn-icon">▶</span> Join game</button>
-            </form>
-            <div class="divider" role="separator"><span>or</span></div>
-            <form method="post" action="/generateid" class="create-form">
-                <button class="btn btn-create" type="submit"><span class="btn-icon">＋</span> Create a new game</button>
-                <p class="form-hint">Shares a link you can send to friends</p>
-            </form>
+            <ul class="hints" aria-label="Game objectives">
+                <li><img src="/img/apple.png" alt="" width="72" height="72"><span>Eat apples</span></li>
+                <li><img src="/img/crate.png" alt="" width="72" height="72"><span>Crack supply crates</span></li>
+                <li><img src="/img/golden.png" alt="" width="72" height="72"><span>Catch the golden apple</span></li>
+            </ul>
         </section>
 
-        <footer class="hints">
-            <span>🍎 eat apples</span>
-            <span>📦 crack supply crates</span>
-            <span>⭐ catch the golden apple</span>
-        </footer>
+        <section class="play-panel" aria-labelledby="join-title">
+            <header class="panel-header">
+                <h2 id="join-title">Join a game</h2>
+                <p>Enter a game ID or create a fresh arena.</p>
+            </header>
+
+            <p id="join_error" role="alert" hidden></p>
+
+            <form method="post" action="/joingame" class="join-form">
+                <label for="gameId">Game ID or link</label>
+                <input
+                    id="gameId"
+                    name="gameId"
+                    type="text"
+                    placeholder="e.g. 12345"
+                    autocomplete="off"
+                    autocapitalize="none"
+                    spellcheck="false"
+                    enterkeyhint="go"
+                >
+                <button class="btn btn-join" type="submit">
+                    <svg class="btn-icon" aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><path d="m7 4 6 6-6 6"/></svg>
+                    <span>Join game</span>
+                </button>
+            </form>
+
+            <div class="divider" role="separator"><span>or</span></div>
+
+            <form method="post" action="/generateid" class="create-form">
+                <button class="btn btn-create" type="submit">
+                    <svg class="btn-icon" aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><path d="M10 4v12M4 10h12"/></svg>
+                    <span>Create a new game</span>
+                </button>
+                <p class="form-hint">Get a link you can send to friends.</p>
+            </form>
+        </section>
     </main>
+
     <script>
         (function () {
             var params = new URLSearchParams(window.location.search);
             if (params.get('error') === 'unknown-game') {
                 var el = document.getElementById('join_error');
-                el.textContent = 'That game id does not exist. Double-check it or create a new game.';
+                el.textContent = 'That game ID does not exist. Double-check it or create a new game.';
                 el.hidden = false;
             }
         })();

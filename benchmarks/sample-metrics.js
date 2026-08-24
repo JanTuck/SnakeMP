@@ -3,11 +3,18 @@
  * Writes summary JSON on SIGINT/SIGTERM (or when the PID dies).
  */
 const fs = require('fs');
+const childProcess = require('child_process');
 
 const pid = parseInt(process.argv[2], 10);
 const out = process.argv[3];
 const interval = parseInt(process.argv[4] || '200', 10);
-const CLK_TCK = 100; // Linux _SC_CLK_TCK is virtually always 100
+const CLK_TCK = (() => {
+  try {
+    return Number(childProcess.execFileSync('getconf', ['CLK_TCK'], { encoding: 'utf8' }).trim()) || 100;
+  } catch (_) {
+    return 100;
+  }
+})();
 
 const samples = [];
 let lastCpu = null;

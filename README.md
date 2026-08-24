@@ -1,54 +1,65 @@
 # SnakeMP
 
-SnakeMP is a multiplayer snake game with one canonical browser client and two
-maintained servers: an aggressively optimized Zig implementation and an
-idiomatic Go implementation. The previous Node.js, Bun, and Rust servers were
-retired after their benchmark history was preserved in `docs/BENCHMARKS.md`.
+SnakeMP is a multiplayer snake game with one browser client and one production
+server: a Linux-native Zig epoll reactor with raw WebSockets, compact binary
+input, and versioned binary world snapshots. The former Node.js, Bun, Rust, and
+Go servers have been retired; their benchmark history remains in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
-## Repository layout
+## Architecture
 
 ```text
-client/       canonical browser client and vendored browser bundles
-docs/         protocol specification and benchmark history
-servers/
-  go/         net/http implementation
-  zig/        Linux epoll implementation on the newest installed Zig
-benchmarks/   parity, wire-format, load, stress, and metrics tooling
+client/       canonical browser UI and native WebSocket client
+servers/zig/  Zig HTTP, WebSocket, simulation, and serialization server
+benchmarks/   optional Node.js parity, load, wire, and memory test drivers
+docs/         protocol specification and measured performance history
 ```
 
-Go and Zig stage `client/` into ignored generated directories before compiling
-so there is only one tracked client source tree.
+One edge-triggered epoll reactor owns connections and HTTP/WebSocket I/O. Game
+workers are created only as lobby capacity requires them and process up to 128
+lobbies each by default. At 12,000 players in 750 lobbies this is six game
+workers, not 750 threads.
 
-## Build and verify
+The hot path no longer uses Socket.IO, Engine.IO, or JSON snapshots. Browser
+inputs are two small binary packet types and each 15 Hz world update is a
+bounds-checked binary snapshot. JSON is reserved for infrequent control events
+such as initialization, roster changes, errors, and the activity feed.
 
-The production Zig server has no Node.js dependency. Install Node.js only for
-the parity/load drivers, plus Go if you want to build the secondary server.
-The build uses the `zig` found on `PATH`; set `ZIG_BIN` only to select a newer
-installed binary.
+## Build and run
 
-```bash
-npm install
-npm run build
-npm run check
-npm run parity
-```
-
-Run Zig directly with:
+Production requires Zig and Linux; Node.js is not needed to build or run the
+server. The build uses the newest `zig` on `PATH`, or `ZIG_BIN` when explicitly
+set.
 
 ```bash
 bash servers/zig/build-assets.sh
 (cd servers/zig && zig build-exe -O ReleaseFast -fstrip src/main.zig \
   -femit-bin=snek-zig --cache-dir .zig-cache --global-cache-dir .zig-global-cache)
-PORT=3000 SNEK_DEBUG=1 servers/zig/snek-zig
+PORT=3000 servers/zig/snek-zig
 ```
 
-## Benchmark
+Useful runtime overrides are:
+
+- `SNEK_MAX_PLAYERS` (default `100`)
+- `SNEK_MAX_PLAYERS_PER_LOBBY` (default and supported browser value `16`)
+- `SNEK_LOBBIES_PER_WORKER` (default `128`)
+- `SNEK_LOBBY_IDLE_MS` (default `60000`)
+- `SNEK_DEBUG=1` to expose local benchmark statistics at `/debug/stats`
+
+## Development and verification
+
+Node.js is only an optional dependency for the development harnesses. Install
+it when running the commands below; it is not part of the deployed server.
 
 ```bash
+npm install
+npm run check
+npm run parity
+npm run test:memory
 node benchmarks/wire-format-bench.js
-BENCH_REPETITIONS=3 bash benchmarks/run-benchmarks.sh zig
 ```
 
-Raw measurements are written beneath ignored `.scratch/`. The methodology,
-before/after measurements, and historical Bun comparison are in
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+The raw protocol, worker ownership rules, HTTP routes, and safety bounds are in
+[`docs/SPEC.md`](docs/SPEC.md). The 12,000-player scaling run, accelerated
+lifecycle memory test, CPU guidance, wire microbenchmark, and historical Bun
+comparison are in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).

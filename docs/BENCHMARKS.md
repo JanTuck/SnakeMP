@@ -1,170 +1,241 @@
 # Zig optimization and benchmark report
 
-Measured 2026-08-24 on the same local Linux host and workload used by the
-preserved multi-runtime benchmark. The final server was built with the newest
-installed compiler, Zig 0.16.0, using `-O ReleaseFast -fstrip`.
+Measured 2026-08-24 on Linux with an AMD Ryzen 7 5700G (8 cores / 16 threads,
+up to 4.67 GHz) and Zig 0.16.0 `-O ReleaseFast -fstrip`.
 
-## Result
+## Outcome
 
-**Overall performance winner: optimized Zig.** Historical Bun remains slightly
-better in median connection establishment and sampled peak CPU, but optimized
-Zig matches its rate-limited message throughput while using 87.7% fewer bytes
-per tick, 89.1% less memory at 4,000 connections, 92.3% less peak RSS, one
-thread instead of 12, and slightly better HTTP and connection-tail latency.
+The production result is a Zig-only server using raw RFC 6455 WebSockets,
+binary input, binary snapshot v1, one epoll I/O reactor, and game workers that
+expand at 128 lobbies per worker. The measured 12,000-player configuration used
+750 lobbies, six game workers, and seven process threads in total.
 
-The Bun numbers below are the preserved same-machine benchmark history. Bun was
-deleted at the user's request, so it was not rerun after the Zig-only compact
-wire protocol was introduced. This is an honest historical comparison, not a
-claim that the final two binaries were run side by side in this revision.
+At the top stage it sustained:
 
-## Methodology
+- **12,000 concurrent players** with zero join failures and zero sampled
+  disconnects;
+- **181,931.2 received snapshots/s**;
+- **66.675 / 68.225 / 69.359 ms** client cadence p50/p95/p99;
+- **115.18% process CPU** (where 100% is one logical CPU);
+- **21,381,120 B RSS** (20.39 MiB) and **26,775,552 B VM** (25.54 MiB);
+- **32,299,021.8 B/s** application egress and **177.53 B** average measured
+  snapshot/frame;
+- **0.186 / 0.226 / 0.244 ms** per-lobby tick p50/p95/p99;
+- **12,764 file descriptors** at the sample point.
 
-- WebSocket-only Socket.IO v2 / Engine.IO v3 connections over loopback.
-- Three normal-load repetitions after equal 5-second warm-ups.
-- Active-player tiers: 5, 10, 20, 40, and 80 bots; 6-second samples per tier.
-- Connection test: 100 connections at concurrency 25, repeated three times.
-- HTTP test: 300 requests at concurrency 50 per endpoint and repetition.
-- One server process at a time; process RSS, CPU, threads, and FDs sampled every
-  200 ms. Throughput counts messages actually received by clients.
-- Stress suite: caps, 100→4,000 idle connections, 200-lobby flood, oversized
-  and malformed traffic, 200 connection churn cycles, throttled clients, and
-  five-second recovery. Full final sampled duration was 312.4 seconds.
-- Wire candidates were compared for bytes plus 100,000 encode and parse
-  iterations before choosing the protocol.
+The fixed 15 Hz simulation means the useful target is complete delivery at a
+stable cadence, not an unbounded request counter. The slight 1.0107 delivery
+ratio and rate above 180,000/s are five-second sampling-boundary effects, not a
+simulation frequency above 15 Hz.
 
-## Zig before and after
+## Final 12,000-player methodology
 
-| Metric | Zig 0.13 baseline | Zig 0.16 port baseline | Optimized Zig 0.16 |
-|---|---:|---:|---:|
-| Connection rate, median | 1,724/s | 1,923/s | 1,852/s |
-| 80-bot messages | 1,096.5/s | 1,098.7/s | 1,119.4/s |
-| 80-bot wire rate | 1.88 MiB/s | 1.87 MiB/s | 231.2 KiB/s |
-| Average 80-bot tick | 2,123 B | 2,059.7 B | 267.6 B |
-| 80-bot RSS | 7.09 MiB | 72.22 MiB | 1.56 MiB |
-| RSS at 4,000 sockets | 132.61 MiB | 2.02 GiB | 6.39 MiB |
-| Sampled peak RSS | 135.50 MiB | 2.07 GiB | 6.51 MiB |
-| Sampled peak CPU | 288.6% | 185.0% | 30.0% |
-| Maximum threads | 8,006 | 8,006 | 1 |
+- Server and load clients ran over loopback on the same host.
+- Players were staged cumulatively at 1,000, 3,000, 6,000, 9,000, then 12,000.
+- Each lobby held 16 stationary joined players. Stationary players exercise
+  connection state, 15 Hz scheduling, serialization, and full fan-out without
+  confounding the result with random deaths/rejoins or long synthetic snakes.
+- Sixteen Node.js load-generator processes opened raw `/ws` connections, sent
+  the same binary join packet as the browser, parsed and bounds-checked every
+  binary snapshot, and recorded receive cadence.
+- Each stage had a three-second warm-up and a five-second measured window.
+- CPU, RSS, VM, thread count, and file descriptors came from `/proc/<pid>`.
+  Byte/frame counters and per-lobby timing came from `/debug/stats` deltas.
+- Join latency includes intentionally batched connection establishment. Its
+  long tail is therefore a capacity-ramp result rather than single-user steady
+  state request latency.
+- This is a local server/fan-out capacity test. Internet RTT, TLS termination,
+  proxies, NIC limits, packet loss, and browser rendering are not represented.
 
-Against the original Zig 0.13 implementation, the final server increased the
-median connection rate by 7.4%, reduced 80-bot wire traffic by 88.0%, reduced
-4,000-socket RSS and peak RSS by 95.2%, and reduced sampled peak CPU by 89.6%.
-The direct Zig 0.16 port exposed an especially severe thread-stack cost; the
-reactor reduced its 4,000-socket RSS by 99.7%.
+Raw evidence: `.scratch/mass-zig.json` (ignored local benchmark output).
 
-## Wire-format decision
+## Scaling results
 
-Representative test lobby: 16 players, 18 segments each, three bonus apples,
-one drop, and one golden apple.
+| Players | Lobbies | Game workers | Snapshots/s | Fail/disconnect | CPU | RSS | VM | Egress B/s | Avg wire | Cadence p50/p95/p99 ms | Tick p50/p95/p99 ms | FDs |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|---:|
+| 1,000 | 63 | 1 | 15,000.0 | 0 / 0 | 7.99% | 3,031,040 | 7,569,408 | 2,581,701.6 | 172.11 B | 66.678 / 67.254 / 67.697 | .141 / .174 / .205 | 1,069 |
+| 3,000 | 188 | 2 | 45,000.0 | 0 / 0 | 24.16% | 6,512,640 | 11,173,888 | 7,824,787.0 | 173.88 B | 66.667 / 67.370 / 68.079 | .149 / .192 / .207 | 3,196 |
+| 6,000 | 375 | 3 | 90,798.6 | 0 / 0 | 50.26% | 11,468,800 | 15,888,384 | 15,973,446.0 | 175.92 B | 66.671 / 67.615 / 69.076 | .156 / .211 / .237 | 6,385 |
+| 9,000 | 563 | 5 | 136,676.2 | 0 / 0 | 85.18% | 16,760,832 | 21,123,072 | 24,169,081.6 | 176.83 B | 66.653 / 68.569 / 73.319 | .193 / .244 / .324 | 9,575 |
+| 12,000 | 750 | 6 | **181,931.2** | **0 / 0** | **115.18%** | **21,381,120** | **26,775,552** | **32,299,021.8** | **177.53 B** | **66.675 / 68.225 / 69.359** | **.186 / .226 / .244** | **12,764** |
 
-| JSON layout | Tick bytes | One-time roster | Encode CPU/op | Parse CPU/op |
+Join p50/p95/p99 was 95.74/1,092.35/1,099.82 ms at 1,000 and
+138.81/1,464.10/2,093.06 ms at 12,000. All 12,000 eventually joined. The 9,000
+stage had the largest cadence p99 (73.319 ms), while the 12,000 stage returned
+to 69.359 ms; that non-monotonicity is another reason to report all stages and
+not extrapolate from one sample.
+
+The measured `serializeUs` section includes snapshot construction plus its
+broadcast calls. At 12,000 players it was 181.483/220.317/235.876 us
+p50/p95/p99 (342.538 us max), accounting for most of the 186/226/244 us
+per-lobby tick. The data does not support spending complexity on the remaining
+few microseconds of scalar game logic.
+
+## CPU and deployment recommendation
+
+The 12,000-player loopback run consumed about 1.15 logical CPUs on the Ryzen 7
+5700G while six game workers and the reactor preserved the target cadence. A
+modern **2-core CPU is the measured compute floor** for this exact stationary,
+unencrypted workload, but it leaves too little room for TLS, kernel networking,
+moving/growing snakes, monitoring, or noisy neighbors. A **modern 4 physical
+core CPU is the practical recommendation** for 12,000 players, with at least
+eight cores when colocating TLS/proxying, load generation, or other services.
+
+Clock speed and predictable single-core latency matter more than a very large
+core count at this scale: only six game workers were required, and each worker
+still processes its assigned lobbies sequentially. The tested 8-core/16-thread
+Ryzen 7 5700G is comfortably above the compute requirement.
+
+Network capacity is more likely to constrain deployment. Measured application
+egress was 32.30 MB/s, about 258.4 Mbit/s before TCP/IP, WebSocket, retransmit,
+and TLS overhead. Use at least a **1 Gbit/s NIC/uplink** for the measured shape,
+and remeasure with realistic snake lengths and production TLS before committing
+capacity.
+
+## Why 12,000 players use megabytes, not only kilobytes
+
+The logical game payload is mostly small integers, but each player also has an
+OS socket/file descriptor, a connection object, membership/output locks,
+WebSocket parser state, retained input/output capacity, identity strings, map
+entries, and allocator alignment. Lobbies add hash tables, PRNG state, pickup
+arrays, metrics, mutexes, and reusable wire buffers. Process RSS does not
+include all kernel socket memory, and the separate client/load-generator memory
+is not included either.
+
+Even with those costs the measured Zig process RSS was only 20.39 MiB at
+12,000 players: about **1,782 bytes of process RSS per concurrent player**,
+including shared server state. Reducing that further is possible, but at this
+point network fan-out and the kernel's per-socket cost matter more than storing
+the game integers.
+
+## Wire-format microbenchmark
+
+Representative world: 16 players, 18 cells per snake, three bonus apples, one
+drop, and one golden apple. The harness ran 100,000 encode and parse iterations.
+These are format/harness microbenchmarks, not Zig server tick timings.
+
+| Layout | Tick bytes | One-time roster | Encode/op | Parse/op |
 |---|---:|---:|---:|---:|
-| Legacy objects | 7,164 B | — | 21.4 µs | 33.2 µs |
-| Compact self-contained arrays | 2,704 B | — | 6.2 µs | 7.9 µs |
-| Separate roster + compact tick | **1,952 B** | 785 B | **5.2 µs** | **6.0 µs** |
+| Legacy JSON objects | 7,164 B | - | 21.4 us | 33.2 us |
+| Compact self-contained JSON arrays | 2,704 B | - | 6.2 us | 7.9 us |
+| Separate roster + compact JSON tick | 1,952 B | 785 B | 5.204 us | 6.023 us |
+| Separate roster + binary snapshot v1 | **725 B** | 785 B | **1.366 us** | **0.310 us** |
 
-The winning layout sends `r = [[id,name,color],...]` only when membership
-changes. Each `tick` sends scores, body lengths, flattened cell coordinates,
-pickups, and TTLs as positional arrays. Coordinates use grid cells rather than
-pixel multiples. The result retains all required information without repeating
-identity keys or object field names 15 times per second.
+Against the already-compact roster JSON tick, binary cut the repeated snapshot
+by 62.9%, encode time by 73.8%, and parse time by 94.9%. The real 12,000-player
+average was smaller (177.53 B) because those stationary snakes contained one
+cell rather than the synthetic 18 cells.
 
-Under the real 80-bot load, average tick size fell from the Zig 0.16 baseline's
-2,059.7 B to 267.6 B (87.0%). The main lobby's measured Zig serialization cost
-at that tier averaged 138.3 µs, while total average tick work was about 0.2 ms.
-The compatibility normalizer used by the benchmark client averaged 2.22 µs
-(p95 5.27 µs, p99 12.20 µs) after Socket.IO parsing.
+The binary layout favors simple bounds-checked scalar loads/stores. SIMD was
+not added: rows are short and variable length, serialization-plus-broadcast is
+under 0.25 ms at p99 per lobby, and the measurable costs are fan-out/syscalls
+and network bytes. SIMD would need a targeted benchmark on long-snake or
+collision-heavy workloads before its added complexity could be justified.
 
-## Final load results
+## Adaptive workers versus the 8-worker JSON load-generator overload attempt
 
-| Bots | Messages/s | Run-to-run rates | Wire rate | Avg tick | Tick p50/p95/p99 | RSS | Client CPU peak |
-|---:|---:|---|---:|---:|---|---:|---:|
-| 5 | 68.6 | 69.5 / 67.0 / 69.2 | 9.23 KiB/s | 137.0 B | 67/68/68 ms | 1.34 MiB | 1.1% |
-| 10 | 142.9 | 142.0 / 142.1 / 144.7 | 31.35 KiB/s | 224.0 B | 67/68/68 ms | 1.35 MiB | 1.4% |
-| 20 | 277.9 | 273.3 / 275.5 / 285.0 | 49.27 KiB/s | 205.0 B | 67/68/68 ms | 1.38 MiB | 2.1% |
-| 40 | 545.6 | 549.8 / 539.2 / 547.8 | 114.54 KiB/s | 259.0 B | 67/68/68 ms | 1.44 MiB | 2.4% |
-| 80 | **1,119.4** | 1,114.2 / 1,121.5 / 1,122.7 | 231.20 KiB/s | 267.6 B | 67/68/68 ms | 1.56 MiB | 4.8% |
+An earlier experiment assigned one 128 KiB server thread to every lobby and
+used the then-current JSON stream. With eight (8) client load-generator processes,
+it successfully joined 12,000 players, but only 9,314 remained concurrent in
+the measured window and 1,820 disconnects were observed. It used 752 server
+threads, 228,618,240 B RSS, 331,005,952 B VM, 109.04% CPU, and 41,605,991.8 B/s
+egress. This was an overload/failure result, not a successful 12,000-player
+capacity claim.
 
-The 15 Hz loop caps useful fan-out throughput, so stable cadence and resource
-cost matter more here than an artificial unbounded request counter.
+The attempt exposed both load-generator pressure and the poor memory/scheduler
+shape of one thread per lobby. It was replaced with 128 lobbies per worker and
+16 client generators for the final run. At the same requested population the
+final server held all 12,000 connections with no sampled disconnects, used six
+game workers, and reduced RSS by 90.6% and VM by 91.9%. Raw evidence:
+`.scratch/mass-zig-8workers-overload.json`.
 
-### Latency
+## Accelerated lifecycle memory regression
 
-| Measurement | p50 | p95 | p99 | Failures |
+`npm run test:memory` launches an isolated server and runs four consecutive
+waves of 1,000 players across 63 temporary lobbies per wave. It accelerates the
+60-second empty-lobby lifetime to 60 ms (**1,000x lifecycle acceleration**),
+then verifies that players, connections, and temporary lobbies return to zero,
+approximately zero, and one respectively after every wave.
+
+| Point | RSS | Players | Connections | Lobbies |
 |---|---:|---:|---:|---:|
-| Connection establishment | 12.15 ms | 17.72 ms | 19.65 ms | 0/300 |
-| Input-to-observed-tick | 67 ms | 68 ms | 68 ms | 0 |
-| GET `/` | 5 ms | 8 ms | 11 ms | 0/900 |
-| POST `/joingame` | 4 ms | 7 ms | 9 ms | 0/900 |
+| Baseline | 1,339,392 B | 0 | 2 | 1 |
+| Wave 1 active / recovered | 3,457,024 / 3,461,120 B | 1,000 / 0 | 1,002 / 2 | 64 / 1 |
+| Wave 2 active / recovered | 3,825,664 / 3,825,664 B | 1,000 / 0 | 1,002 / 1 | 64 / 1 |
+| Wave 3 active / recovered | 4,198,400 / 4,202,496 B | 1,000 / 0 | 1,001 / 1 | 64 / 1 |
+| Wave 4 active / recovered | 4,202,496 / 4,202,496 B | 1,000 / 0 | 1,001 / 1 | 64 / 1 |
 
-Connection-rate repetitions were 1,449, 1,852, and 2,273/s. The range is why
-the median, complete percentiles, and all run rates are reported instead of a
-single best run.
+All assertions passed. Recovered RSS grew by 741,376 B from the first to fourth
+recovery, with a fitted slope of 260,096 B/wave, both below the 4 MiB and
+1 MiB/wave regression limits. RSS does **not** immediately fall when small
+allocations are freed because the allocator retains pages for reuse; claiming a
+per-wave RSS drop would therefore be misleading. The leak signal is zero live
+game resources plus bounded, flattening recovered RSS. Raw evidence:
+`.scratch/memory-ramp-zig.json`.
 
-## Stress and break-it behavior
+## Stress and malformed-input validation
+
+The raw-WebSocket parity/stress suite also covered:
 
 | Check | Result |
 |---|---|
-| Player caps | 99 joined, 21 cleanly rejected |
-| Idle connections | 4,000/4,000 held; 6.39 MiB server RSS |
-| 4,000-socket open time | 2.20 s total ramp step |
+| Capacity enforcement | 99 joined, 21 cleanly rejected |
+| Idle WebSockets | 4,000/4,000 held; 6,696,960 B server RSS |
+| 4,000-socket ramp | 2.204 s for the final ramp step |
 | Lobby flood | 200 created in 17 ms |
-| Malformed/oversized traffic | 100 raw cases; server stayed alive; tick p95 67 ms |
-| Connection churn | 200 cycles in 1.58 s; zero failures |
-| Throttled clients | tick average 66.7 ms, p95/max 68 ms |
-| Recovery | recovered in the 5 s window; p50/p95/p99 67/68/68 ms |
-| Process peak | 6.51 MiB RSS, 30% CPU, 1 thread, 4,007 FDs |
+| Malformed/oversized traffic | 100 raw cases; server alive; tick p95 67 ms |
+| Connection churn | 200 cycles in 1.582 s; zero failures |
+| Throttled clients | 66.7 ms average, 68 ms p95/max |
+| Recovery | successful in 5 s; tick p50/p95/p99 67/68/68 ms |
 
-Across the full normal plus stress run the server recorded 32,468,490 bytes
-sent, 5,201,119 bytes received, 138,679 outbound WebSocket frames, 31,920
-inbound frames, and 21,567 input events. Average measured input event handling
-was 5.77 µs. No sustained memory growth or post-overload tick degradation was
-observed; final RSS was 6.51 MiB with only two live connections.
+Zig unit tests additionally cover minimal WebSocket header lengths, malformed
+and partial binary client packets, snapshot bounds/clamping, player turn rules,
+and serializer edge cases. The browser parser validates every variable-length
+section before state mutation.
 
-## Optimized Zig versus historical Bun
+## Historical retired-server comparison (not side-by-side with final Zig)
 
-| Metric | Optimized Zig | Historical Bun | Winner |
+The following numbers are preserved from the earlier Socket.IO/Engine.IO JSON
+benchmark on the same machine. Bun was deleted before the raw-WebSocket binary
+revision, so it was **not rerun side by side** with the current server. These
+numbers explain the retirement decision but must not be presented as a current
+apples-to-apples binary-protocol comparison.
+
+| Historical metric | Earlier optimized Zig JSON | Historical Bun JSON | Historical winner |
 |---|---:|---:|---|
 | Median connection rate | 1,852/s | 1,923/s | Bun by 3.7% |
 | Connection p95 / p99 | 17.72 / 19.65 ms | 20.64 / 21.45 ms | Zig |
-| 80-bot messages | 1,119.4/s | 1,118.2/s | Tie (Zig +0.1%) |
+| 80-bot messages | 1,119.4/s | 1,118.2/s | Tie |
 | Average tick | 267.6 B | 2,170.8 B | Zig, 87.7% smaller |
-| 80-bot wire rate | 231.2 KiB/s | 1.99 MiB/s | Zig, 88.7% lower |
-| 80-bot RSS | 1.56 MiB | 57.80 MiB | Zig, 97.3% lower |
-| RSS at 4,000 sockets | 6.39 MiB | 58.65 MiB | Zig, 89.1% lower |
-| Peak RSS | 6.51 MiB | 84.14 MiB | Zig, 92.3% lower |
+| 80-bot wire rate | 231.2 KiB/s | 1.99 MiB/s | Zig |
+| 80-bot RSS | 1.56 MiB | 57.80 MiB | Zig |
+| RSS at 4,000 sockets | 6.39 MiB | 58.65 MiB | Zig |
+| Peak RSS | 6.51 MiB | 84.14 MiB | Zig |
 | Peak CPU | 30% | 25% | Bun by 5 points |
 | Maximum threads | 1 | 12 | Zig |
-| GET p95 / p99 | 8 / 11 ms | 9 / 12 ms | Zig |
-| Join p95 / p99 | 7 / 9 ms | 8 / 11 ms | Zig |
 
-### Why each wins where it does
+On that retired workload the earlier optimized Zig implementation was the
+overall winner for bandwidth, memory, tail latency, and thread count; Bun won
+median connection rate and sampled peak CPU. The current raw/binary Zig server
+is the only maintained implementation and has substantially better absolute
+wire and 12,000-connection results, but there is no responsible current
+Zig-versus-Bun winner claim without rebuilding Bun around the same protocol and
+rerunning identical workloads.
 
-- Zig's largest gains come from architectural work: epoll, one reactor/game
-  loop, nonblocking incremental parsers, direct `writev`, retained buffers, and
-  copying only under socket backpressure. Eliminating two threads per socket is
-  responsible for most of the concurrency memory and scheduler improvement.
-- The compact roster/tick protocol is responsible for most of the bandwidth
-  and client JSON parse improvement.
-- Bun still has the best sampled CPU peak and a slightly better median connect
-  rate. Zig's one-millisecond tick/input difference is timer phase at a fixed
-  15 Hz, not a meaningful simulation slowdown.
-- Remaining Zig work is mostly diminishing-return territory: spatial collision
-  indexing for much larger per-lobby caps, `sendmmsg` experiments for much
-  larger fan-out, and browser-profiler validation of rendering work. None is
-  justified by the current cap-16 lobby profile without new measurements.
+### Historical Zig optimization progression
 
-## Validation completed
+| Historical metric | Zig 0.13 baseline | Direct Zig 0.16 port | Earlier optimized Zig JSON |
+|---|---:|---:|---:|
+| Median connection rate | 1,724/s | 1,923/s | 1,852/s |
+| 80-bot messages | 1,096.5/s | 1,098.7/s | 1,119.4/s |
+| Average tick | 2,123 B | 2,059.7 B | 267.6 B |
+| RSS at 4,000 sockets | 132.61 MiB | 2.02 GiB | 6.39 MiB |
+| Peak RSS | 135.50 MiB | 2.07 GiB | 6.51 MiB |
+| Peak CPU | 288.6% | 185.0% | 30.0% |
+| Maximum threads | 8,006 | 8,006 | 1 |
 
-- Zig compilation and two Zig unit tests on 0.16.0.
-- Go tests/vet and Zig formatting/test checks via `npm run check`.
-- Full HTTP, Socket.IO, lifecycle, validation, lobby isolation, movement,
-  reversal, chained-turn, death, and rejoin parity.
-- Compact wire-format tests and legacy client compatibility.
-- Split/partial HTTP request assembly and malformed-request recovery.
-- Oversized WebSocket/events, malformed raw TCP, connection/disconnection,
-  high concurrency, throttling, churn, overload, and recovery.
-- Three repeated load iterations and a 312.4-second sampled run.
-
-Raw local evidence is retained in ignored `.scratch/final/`, with pre-change
-Zig baselines in `.scratch/baseline-013/` and `.scratch/baseline-016/`.
+The large direct-port memory result was caused by two threads per connection
+and their stacks. Replacing that model with epoll produced most of the memory
+and scheduler gain. The later raw-WebSocket, binary snapshot, modular source,
+and adaptive game-worker changes are the production architecture described in
+the rest of this report.

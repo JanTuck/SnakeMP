@@ -4,7 +4,7 @@
  * Writes .scratch/bench-<name>.json with all collected metrics.
  */
 const path = require('path');
-const io = require('socket.io-client');
+const io = require('./socket');
 const http = require('http');
 const fs = require('fs');
 const { attachWorld } = require('./protocol');
@@ -19,11 +19,20 @@ const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Mat
 const avg = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 const max = (arr) => arr.length ? Math.max(...arr) : 0;
 const metrics = {
+  schemaVersion: 2,
   name: NAME,
   base: BASE,
   repetitions: REPETITIONS,
   warmupMs: WARMUP_MS,
   sampleMs: SAMPLE_MS,
+  methodology: {
+    topology: 'server and one Node.js load generator share the loopback host',
+    rampWorkload: 'bots send random cardinal input every 280 ms; deaths can temporarily reduce the sampled active-player count during the 400 ms rejoin delay',
+    messageRate: 'decoded world snapshots received by bots, not unconstrained request throughput; the simulation is fixed at 15 Hz',
+    clientCpuPct: 'CPU consumed by this Node.js benchmark process; it is not server CPU',
+    rss: 'server process RSS reported by /debug/stats; excludes kernel socket buffers and the load generator',
+    inputLatency: 'loopback elapsed time from a binary direction send until an observer decodes a snapshot with movement on that cardinal axis',
+  },
   phases: {},
 };
 
@@ -234,6 +243,7 @@ async function ensureLobbies(nLobbies) {
       await wait(800);
     }
     metrics.phases.ramp[N] = {
+      requestedBots: N,
       runs,
       deltas: runs.flatMap((run) => run.deltas),
       bytes: runs.flatMap((run) => run.bytes),
@@ -263,14 +273,18 @@ async function ensureLobbies(nLobbies) {
       setTimeout(() => { obs.offWorld(h); r(null); }, 500);
     });
     if (!before) { await wait(200); continue; }
-    const t0 = Date.now();
+    const t0 = performance.now();
     bot.emit('keyPress', dir);
     const applied = await new Promise((r) => {
       const h = (w) => {
         const me = (w.players || []).find(p => p.id === bot.id);
         if (!me) return;
-        const moved = dir === 'ArrowRight' ? me.snake[0].x > before.x : me.snake[0].x < before.x;
-        if (moved) { obs.offWorld(h); r(Date.now() - t0); }
+        const head = me.snake[0];
+        const moved = dir === 'ArrowRight' ? head.x > before.x
+          : dir === 'ArrowLeft' ? head.x < before.x
+            : dir === 'ArrowDown' ? head.y > before.y
+              : head.y < before.y;
+        if (moved) { obs.offWorld(h); r(performance.now() - t0); }
       };
       obs.onWorld(h);
       setTimeout(() => { obs.offWorld(h); r(-1); }, 600);

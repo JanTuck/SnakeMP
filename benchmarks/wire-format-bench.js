@@ -4,6 +4,8 @@
 'use strict';
 
 const ITERATIONS = Math.max(10_000, Number(process.env.WIRE_ITERATIONS || 100_000));
+const REPETITIONS = Math.max(1, Number(process.env.WIRE_REPETITIONS || 3));
+const WARMUP_ITERATIONS = Math.min(10_000, Math.max(1_000, Math.floor(ITERATIONS / 10)));
 const players = Array.from({ length: 16 }, (_, p) => ({
   id: `AbCdEfGhIjKlMnOpQrSt${String(p).padStart(2, '0')}`,
   displayName: `player-${String(p).padStart(2, '0')}`,
@@ -39,19 +41,83 @@ const layouts = {
   ],
 };
 
+function encodeBinary(value) {
+  const size = 4 + value.players.reduce((sum, player) => sum + 8 + player.snake.length * 2, 0) +
+    1 + value.bonus.length * 2 + 1 + value.drops.length * 4 + 1 + (value.golden ? 4 : 0);
+  const out = Buffer.allocUnsafe(size);
+  let at = 0;
+  out[at++] = 0x53; out[at++] = 0x4e; out[at++] = 1; out[at++] = value.players.length;
+  for (const player of value.players) {
+    out.writeInt32LE(player.score, at); at += 4;
+    out.writeUInt16LE(player.bodyLength, at); at += 2;
+    out.writeUInt16LE(player.snake.length, at); at += 2;
+    for (const cell of player.snake) { out[at++] = cell.x / 16; out[at++] = cell.y / 16; }
+  }
+  out[at++] = value.bonus.length;
+  for (const cell of value.bonus) { out[at++] = cell.x / 16; out[at++] = cell.y / 16; }
+  out[at++] = value.drops.length;
+  for (const drop of value.drops) { out[at++] = drop.x / 16; out[at++] = drop.y / 16; out.writeUInt16LE(drop.ttl, at); at += 2; }
+  out[at++] = value.golden ? 1 : 0;
+  if (value.golden) { out[at++] = value.golden.x / 16; out[at++] = value.golden.y / 16; out.writeUInt16LE(value.golden.ttl, at); }
+  return out;
+}
+
+function parseBinary(buffer) {
+  let at = 4;
+  let checksum = 0;
+  const count = buffer[3];
+  for (let player = 0; player < count; player++) {
+    checksum += buffer.readInt32LE(at); at += 6;
+    const cells = buffer.readUInt16LE(at); at += 2;
+    for (let cell = 0; cell < cells; cell++) { checksum += buffer[at] + buffer[at + 1]; at += 2; }
+  }
+  const bonus = buffer[at++]; at += bonus * 2;
+  const drops = buffer[at++]; at += drops * 4;
+  const golden = buffer[at++]; at += golden * 4;
+  return at === buffer.length ? checksum : -1;
+}
+
 function timed(fn) {
-  const cpu0 = process.cpuUsage();
-  const t0 = performance.now();
-  for (let i = 0; i < ITERATIONS; i++) fn();
-  const elapsedMs = performance.now() - t0;
-  const cpu = process.cpuUsage(cpu0);
+  for (let i = 0; i < WARMUP_ITERATIONS; i++) fn();
+  const runs = [];
+  for (let repetition = 0; repetition < REPETITIONS; repetition++) {
+    const cpu0 = process.cpuUsage();
+    const t0 = performance.now();
+    for (let i = 0; i < ITERATIONS; i++) fn();
+    const elapsedMs = performance.now() - t0;
+    const cpu = process.cpuUsage(cpu0);
+    runs.push({
+      nsPerOp: Math.round(elapsedMs * 1e6 / ITERATIONS),
+      cpuNsPerOp: Math.round((cpu.user + cpu.system) * 1000 / ITERATIONS),
+    });
+  }
+  const median = (key) => [...runs].sort((a, b) => a[key] - b[key])[Math.floor(runs.length / 2)][key];
   return {
-    nsPerOp: Math.round(elapsedMs * 1e6 / ITERATIONS),
-    cpuNsPerOp: Math.round((cpu.user + cpu.system) * 1000 / ITERATIONS),
+    nsPerOp: median('nsPerOp'),
+    cpuNsPerOp: median('cpuNsPerOp'),
+    minNsPerOp: Math.min(...runs.map((run) => run.nsPerOp)),
+    maxNsPerOp: Math.max(...runs.map((run) => run.nsPerOp)),
+    runs,
   };
 }
 
-const out = { iterations: ITERATIONS, players: players.length, segmentsPerPlayer: 18, layouts: {} };
+const out = {
+  schemaVersion: 2,
+  iterations: ITERATIONS,
+  iterationsPerRun: ITERATIONS,
+  repetitions: REPETITIONS,
+  warmupIterations: WARMUP_ITERATIONS,
+  players: players.length,
+  segmentsPerPlayer: 18,
+  methodology: {
+    runtime: process.version,
+    scope: 'in-process JavaScript layout microbenchmark, not Zig server CPU time or end-to-end network latency',
+    bytes: 'application payload only; recurring tick bytes and one-time roster bytes are reported separately, without WebSocket/TCP/TLS framing',
+    parse: 'JSON.parse materializes its representation; binary parsing bounds-traverses the reusable fixed layout without creating render objects',
+    timing: 'median of warmed repetitions; CPU time includes allocation and garbage-collection work occurring inside the measured process',
+  },
+  layouts: {},
+};
 for (const [name, value] of Object.entries(layouts)) {
   const roster = name === 'rosterTick' ? JSON.stringify(value[0]) : '';
   const tickValue = name === 'rosterTick' ? value[1] : value;
@@ -65,4 +131,13 @@ for (const [name, value] of Object.entries(layouts)) {
   };
   if (!sink) process.exitCode = 1;
 }
+const binary = encodeBinary(world);
+let binarySink;
+out.layouts.binary = {
+  tickBytes: binary.length,
+  rosterBytes: Buffer.byteLength(JSON.stringify(layouts.rosterTick[0])),
+  encode: timed(() => { binarySink = encodeBinary(world); }),
+  parse: timed(() => { binarySink = parseBinary(binary); }),
+};
+if (binarySink === undefined) process.exitCode = 1;
 console.log(JSON.stringify(out, null, 2));

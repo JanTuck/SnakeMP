@@ -38,11 +38,10 @@ run_one() {
 }
 
 if (( $# == 0 )); then
-  set -- go zig
+  set -- zig
 fi
 for name in "$@"; do
   case "$name" in
-    go) run_one go 4102 "$REPO/servers/go/snek-go" ;;
     zig) run_one zig 4104 "$REPO/servers/zig/snek-zig" ;;
     *) echo "unknown implementation: $name" >&2; exit 2 ;;
   esac

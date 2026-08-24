@@ -1,12 +1,11 @@
-//! Snek multiplayer server - Zig port.
-//! Wire protocol: engine.io v3 (EIO=3) websocket transport carrying
-//! socket.io v2 frames, per docs/SPEC.md. Standard library only.
+//! Snek multiplayer server. Native WebSocket control packets and versioned
+//! binary snapshots, per docs/SPEC.md. Standard library only.
 //!
 //! Architecture:
-//!   - one edge-triggered epoll reactor owns HTTP, WebSocket, and game state;
+//!   - one edge-triggered epoll reactor owns HTTP and WebSocket I/O;
 //!   - direct writev on the ready-socket path, retained buffers only for
 //!     backpressure, and reusable per-lobby serialization buffers;
-//!   - one 66.67ms reactor deadline steps every lobby;
+//!   - adaptive workers each step up to a configurable number of lobbies;
 //!   - all public assets embedded at compile time via @embedFile.
 
 const std = @import("std");
@@ -14,73 +13,109 @@ const posix = std.posix;
 const linux = std.os.linux;
 const builtin = @import("builtin");
 const assets = @import("assets_manifest.zig");
+const config = @import("config.zig");
+const collision = @import("collision.zig");
+const json = @import("json.zig");
 const model = @import("model.zig");
+const binary_snapshot = @import("snapshot.zig");
+const stats_json = @import("stats.zig");
+const text = @import("text.zig");
+const websocket = @import("websocket.zig");
+const worker_balance = @import("worker_balance.zig");
 
 const Allocator = std.mem.Allocator;
-const Buf = std.ArrayListUnmanaged(u8);
+const Buf = json.Buf;
+const jsString = json.string;
+const jnum = json.number;
+const jstrField = json.stringField;
+const pf = json.print;
+const eventFrame = json.eventFrame;
+const jsTrim = text.jsTrim;
+const checkUsername = text.checkUsername;
+const percentDecode = text.percentDecode;
+const formDecode = text.formDecode;
+const uriEncodeComponent = text.uriEncodeComponent;
+const extractFormField = text.extractFormField;
+const extractJsonField = text.extractJsonField;
 
 // ------------------------------------------------------------------ tuning
 
-const GRID_W: i32 = 1920; // logical units (120 cells)
-const GRID_H: i32 = 960; // logical units (60 cells)
+const GRID_W = config.GRID_W;
+const GRID_H = config.GRID_H;
 const CELL: i32 = model.CELL;
 const COLS: i32 = GRID_W / CELL;
 const ROWS: i32 = GRID_H / CELL;
 
-const TICK_NS: u64 = 66_666_667; // 15 fps
-
-const MAX_PLAYERS_GLOBAL: usize = 100;
-const MAX_PLAYERS_PER_LOBBY: usize = 16;
-const LOBBY_IDLE_DELETE_MS: i64 = 60_000;
-const DEFAULT_LOBBY_ID = "12345";
-
-const BONUS_CAP: usize = 12;
-const DROP_MAX: usize = 2;
-const DROP_TTL_MS: i64 = 25_000;
-const GOLDEN_TTL_MS: i64 = 12_000;
-const GOLDEN_POINTS: i64 = 3;
-const DROP_POINTS: i64 = 2;
-const DROP_GROWTH: i64 = 2;
-const DROP_APPLES: usize = 4;
-
-const PING_INTERVAL_MS: i64 = 20_000;
-const PING_TIMEOUT_MS: i64 = 15_000;
-
-const ERR_INVALID_USERNAME = "Invalid username";
-const ERR_UNKNOWN_GAME = "That game does not exist any more";
-const ERR_SERVER_FULL = "Server is full, try again later";
-const ERR_LOBBY_FULL = "This game is full";
-
-const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const TICK_NS = config.TICK_NS;
+const BACKGROUND_SNAPSHOT_MS = config.BACKGROUND_SNAPSHOT_MS;
+const DEFAULT_MAX_PLAYERS_GLOBAL = config.DEFAULT_MAX_PLAYERS_GLOBAL;
+const DEFAULT_MAX_PLAYERS_PER_LOBBY = config.DEFAULT_MAX_PLAYERS_PER_LOBBY;
+const DEFAULT_LOBBIES_PER_WORKER = config.LOBBIES_PER_WORKER;
+const GAME_WORKER_STACK = config.GAME_WORKER_STACK;
+const DEFAULT_LOBBY_IDLE_DELETE_MS = config.LOBBY_IDLE_DELETE_MS;
+const DEFAULT_LOBBY_ID = config.DEFAULT_LOBBY_ID;
+const BONUS_CAP = config.BONUS_CAP;
+const DROP_MAX = config.DROP_MAX;
+const DROP_TTL_MS = config.DROP_TTL_MS;
+const GOLDEN_TTL_MS = config.GOLDEN_TTL_MS;
+const GOLDEN_POINTS = config.GOLDEN_POINTS;
+const DROP_POINTS = config.DROP_POINTS;
+const DROP_GROWTH = config.DROP_GROWTH;
+const DROP_APPLES = config.DROP_APPLES;
+const PING_INTERVAL_MS = config.PING_INTERVAL_MS;
+const PING_TIMEOUT_MS = config.PING_TIMEOUT_MS;
+const ERR_INVALID_USERNAME = config.ERR_INVALID_USERNAME;
+const ERR_UNKNOWN_GAME = config.ERR_UNKNOWN_GAME;
+const ERR_SERVER_FULL = config.ERR_SERVER_FULL;
+const ERR_LOBBY_FULL = config.ERR_LOBBY_FULL;
+const WS_MAGIC = config.WS_MAGIC;
 const SID_LEN = model.SID_LEN; // 16 random bytes -> base64url without padding
-
-const MAX_HTTP_HEAD_LINE: usize = 16 * 1024;
-const MAX_HTTP_BODY: usize = 1024 * 1024;
-const MAX_WS_FRAME: u64 = 1024 * 1024;
-const MAX_WS_INPUT: usize = 2 * 1024 * 1024;
-const MAX_QUEUE_BYTES: usize = 4 * 1024 * 1024; // slow-consumer cutoff
-const HTTP_IDLE_MS: i32 = 65_000;
+const MAX_HTTP_HEAD_LINE = config.MAX_HTTP_HEAD_LINE;
+const MAX_HTTP_BODY = config.MAX_HTTP_BODY;
+const MAX_HTTP_INPUT = config.MAX_HTTP_INPUT;
+const MAX_WS_INPUT = config.MAX_WS_INPUT;
+const MAX_QUEUE_BYTES = config.MAX_QUEUE_BYTES;
+const HTTP_IDLE_MS = config.HTTP_IDLE_MS;
 
 // ------------------------------------------------------------------ state
 
 var galloc: Allocator = undefined;
-var tick_arena: std.heap.ArenaAllocator = undefined;
 
 var g_io: std.Io = undefined;
 var rng_prng: std.Random.DefaultPrng = undefined;
 var lobbies: std.StringArrayHashMapUnmanaged(*Lobby) = .empty;
+var max_players_global: usize = DEFAULT_MAX_PLAYERS_GLOBAL;
+var max_players_per_lobby: usize = DEFAULT_MAX_PLAYERS_PER_LOBBY;
+var lobbies_per_worker: usize = DEFAULT_LOBBIES_PER_WORKER;
+var lobby_idle_delete_ms: i64 = DEFAULT_LOBBY_IDLE_DELETE_MS;
+var total_players: std.atomic.Value(usize) = .init(0);
 var start_ms: i64 = 0;
 var debug_enabled = false;
-var shutting_down = false;
+var shutting_down: std.atomic.Value(bool) = .init(false);
 var listen_fd: posix.fd_t = -1;
 var epoll_fd: posix.fd_t = -1;
 var connections: std.AutoHashMapUnmanaged(posix.fd_t, *Conn) = .empty;
-var network_bytes_sent: u64 = 0;
-var network_bytes_received: u64 = 0;
-var websocket_frames_sent: u64 = 0;
-var websocket_frames_received: u64 = 0;
+var network_bytes_sent: std.atomic.Value(u64) = .init(0);
+var network_bytes_received: std.atomic.Value(u64) = .init(0);
+var websocket_frames_sent: std.atomic.Value(u64) = .init(0);
+var websocket_frames_received: std.atomic.Value(u64) = .init(0);
 var input_event_ns_total: u64 = 0;
 var input_events: u64 = 0;
+var snapshot_pool_mutex: std.Io.Mutex = .init;
+var snapshot_pool: std.ArrayListUnmanaged(*model.SharedFrame) = .empty;
+const SNAPSHOT_POOL_LIMIT: usize = 64;
+const SNAPSHOT_POOL_MAX_CAPACITY: usize = 64 * 1024;
+
+const GameWorker = struct {
+    mutex: std.Io.Mutex = .init,
+    stop: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+    lobbies: std.ArrayListUnmanaged(*Lobby) = .empty,
+};
+
+var game_workers: std.ArrayListUnmanaged(*GameWorker) = .empty;
+var worker_migrations: u64 = 0;
+var last_worker_resize_ms: i64 = 0;
 
 inline fn clockNanos(clock: linux.clockid_t) i64 {
     var ts: linux.timespec = undefined;
@@ -100,17 +135,77 @@ inline fn closeFd(fd: posix.fd_t) void {
     _ = linux.close(fd);
 }
 
+fn sleepUntilMono(target_ns: i64) void {
+    const request = linux.timespec{
+        .sec = @intCast(@divTrunc(target_ns, std.time.ns_per_s)),
+        .nsec = @intCast(@mod(target_ns, std.time.ns_per_s)),
+    };
+    while (true) {
+        const rc = linux.clock_nanosleep(.MONOTONIC, .{ .ABSTIME = true }, &request, null);
+        if (linux.errno(rc) != .INTR) return;
+    }
+}
+
 const Direction = model.Direction;
 const CellPos = model.CellPos;
 const Player = model.Player;
 const Lobby = model.Lobby;
 const Conn = model.Conn;
 
+fn acquireSharedFrame() ?*model.SharedFrame {
+    snapshot_pool_mutex.lockUncancelable(g_io);
+    const reused = snapshot_pool.pop();
+    snapshot_pool_mutex.unlock(g_io);
+    const frame = reused orelse blk: {
+        const created = galloc.create(model.SharedFrame) catch return null;
+        created.* = .{};
+        break :blk created;
+    };
+    frame.refs.store(1, .release);
+    frame.header_len = 0;
+    frame.keyframe = true;
+    frame.payload.clearRetainingCapacity();
+    return frame;
+}
+
+fn retainSharedFrame(frame: *model.SharedFrame) void {
+    _ = frame.refs.fetchAdd(1, .monotonic);
+}
+
+fn releaseSharedFrame(frame: *model.SharedFrame) void {
+    if (frame.refs.fetchSub(1, .acq_rel) != 1) return;
+    snapshot_pool_mutex.lockUncancelable(g_io);
+    if (snapshot_pool.items.len < SNAPSHOT_POOL_LIMIT and frame.payload.capacity <= SNAPSHOT_POOL_MAX_CAPACITY) {
+        snapshot_pool.append(galloc, frame) catch {
+            snapshot_pool_mutex.unlock(g_io);
+            frame.payload.deinit(galloc);
+            galloc.destroy(frame);
+            return;
+        };
+        snapshot_pool_mutex.unlock(g_io);
+        return;
+    }
+    snapshot_pool_mutex.unlock(g_io);
+    frame.payload.deinit(galloc);
+    galloc.destroy(frame);
+}
+
+fn drainSnapshotPool() void {
+    snapshot_pool_mutex.lockUncancelable(g_io);
+    defer snapshot_pool_mutex.unlock(g_io);
+    for (snapshot_pool.items) |frame| {
+        frame.payload.deinit(galloc);
+        galloc.destroy(frame);
+    }
+    snapshot_pool.deinit(galloc);
+    snapshot_pool = .empty;
+}
+
 // ------------------------------------------------------------------ rng helpers
 
-fn randomCell() CellPos {
-    const cx = rng_prng.random().intRangeLessThan(i32, 0, COLS);
-    const cy = rng_prng.random().intRangeLessThan(i32, 0, ROWS);
+fn randomCell(l: *Lobby) CellPos {
+    const cx = l.rng.random().intRangeLessThan(i32, 0, COLS);
+    const cy = l.rng.random().intRangeLessThan(i32, 0, ROWS);
     return .{ .x = cx * CELL, .y = cy * CELL };
 }
 
@@ -127,7 +222,7 @@ fn snakeOccupies(l: *Lobby, cell: CellPos) bool {
 fn randomFreeCell(l: *Lobby) ?CellPos {
     var attempt: usize = 0;
     while (attempt < 200) : (attempt += 1) {
-        const c = randomCell();
+        const c = randomCell(l);
         var taken = snakeOccupies(l, c);
         if (!taken) taken = (l.food.x == c.x and l.food.y == c.y);
         if (!taken) {
@@ -158,12 +253,12 @@ fn randomFreeCell(l: *Lobby) ?CellPos {
 
 /// Join spawn: avoid snakes (inner retries) and food, up to 100 attempts.
 fn pickSpawnCell(l: *Lobby) CellPos {
-    var pos = randomCell();
+    var pos = randomCell(l);
     var attempt: usize = 0;
     while (attempt < 100) : (attempt += 1) {
         var t: usize = 0;
         while (t < 1000) : (t += 1) {
-            pos = randomCell();
+            pos = randomCell(l);
             if (!snakeOccupies(l, pos)) break;
         }
         if (!(pos.x == l.food.x and pos.y == l.food.y)) return pos;
@@ -184,10 +279,14 @@ fn randomColorHex(aa: Allocator) []const u8 {
     const tg = hueToRgb(p, q, hk);
     const tb = hueToRgb(p, q, hk - (1.0 / 3.0));
     return std.fmt.allocPrint(aa, "#{x:0>2}{x:0>2}{x:0>2}", .{
-        @as(u8, @intFromFloat(tr * 255.0)),
-        @as(u8, @intFromFloat(tg * 255.0)),
-        @as(u8, @intFromFloat(tb * 255.0)),
+        colorByte(tr),
+        colorByte(tg),
+        colorByte(tb),
     }) catch "#808080";
+}
+
+fn colorByte(unit: f64) u8 {
+    return @intFromFloat(std.math.clamp(unit, 0.0, 1.0) * 255.0);
 }
 
 fn hueToRgb(p: f64, q: f64, t_in: f64) f64 {
@@ -206,89 +305,22 @@ fn collidedWall(h: CellPos) bool {
     return h.x > GRID_W - CELL or h.x < 0 or h.y > GRID_H - CELL or h.y < 0;
 }
 
-fn collidedSelf(p: *Player) bool {
-    const head = p.snake.items[0];
-    for (p.snake.items[1..]) |seg| {
-        if (seg.x == head.x and seg.y == head.y) return true;
-    }
-    return false;
-}
-
+/// Exact high-cap override fallback. Canonical lobbies use collision.Index;
+/// this retains semantics if an operator raises the cap above 16 players.
 fn findCollidedOther(l: *Lobby, p: *Player) ?*Player {
     const head = p.snake.items[0];
-    for (l.players.values()) |o| {
-        if (o == p) continue;
-        for (o.snake.items) |seg| {
-            if (seg.x == head.x and seg.y == head.y) return o;
+    for (l.players.values()) |other| {
+        if (other == p) continue;
+        for (other.snake.items) |segment| {
+            if (segment.x == head.x and segment.y == head.y) return other;
         }
     }
     return null;
 }
 
-// ------------------------------------------------------------------ json emit
-
-fn jsString(b: *Buf, aa: Allocator, s: []const u8) !void {
-    try b.append(aa, '"');
-    for (s) |ch| {
-        switch (ch) {
-            '"', '\\' => {
-                try b.append(aa, '\\');
-                try b.append(aa, ch);
-            },
-            0x08 => try b.appendSlice(aa, "\\b"),
-            0x0C => try b.appendSlice(aa, "\\f"),
-            '\n' => try b.appendSlice(aa, "\\n"),
-            '\r' => try b.appendSlice(aa, "\\r"),
-            '\t' => try b.appendSlice(aa, "\\t"),
-            else => {
-                if (ch < 0x20) {
-                    var tmp: [8]u8 = undefined;
-                    const t = std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{ch}) catch unreachable;
-                    try b.appendSlice(aa, t);
-                } else {
-                    try b.append(aa, ch); // UTF-8 passes through untouched
-                }
-            },
-        }
-    }
-    try b.append(aa, '"');
-}
-
-fn jnum(b: *Buf, aa: Allocator, v: anytype) !void {
-    var tmp: [32]u8 = undefined;
-    const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
-    try b.appendSlice(aa, s);
-}
-
-fn jstrField(b: *Buf, aa: Allocator, name: []const u8, value: []const u8) !void {
-    try b.append(aa, '"');
-    try b.appendSlice(aa, name);
-    try b.appendSlice(aa, "\":");
-    try jsString(b, aa, value);
-}
-
-/// socket.io event frame: 42["<event>"<args-json>]
-fn eventFrame(aa: Allocator, event: []const u8, args_json: []const u8) ![]u8 {
-    return std.fmt.allocPrint(aa, "42[\"{s}\"{s}]", .{ event, args_json });
-}
-
 // ------------------------------------------------------------------ connection
 
-fn wsHeader(hdr: *[10]u8, opcode: u8, len: usize) usize {
-    hdr[0] = 0x80 | opcode; // FIN + opcode, unmasked (server -> client)
-    if (len < 126) {
-        hdr[1] = @intCast(len);
-        return 2;
-    }
-    if (len <= 0xFFFF) {
-        hdr[1] = 126;
-        std.mem.writeInt(u16, hdr[2..4], @intCast(len), .big);
-        return 4;
-    }
-    hdr[1] = 127;
-    std.mem.writeInt(u64, hdr[2..10], len, .big);
-    return 10;
-}
+const wsHeader = websocket.header;
 
 fn updateConnInterest(c: *Conn, want_write: bool) void {
     if (c.want_write == want_write or epoll_fd < 0) return;
@@ -302,29 +334,83 @@ fn updateConnInterest(c: *Conn, want_write: bool) void {
     if (linux.errno(rc) != .SUCCESS) c.poisoned = true;
 }
 
-fn appendOutput(c: *Conn, bytes: []const u8) bool {
-    const pending = c.output.items.len - c.output_offset;
-    if (pending + bytes.len > MAX_QUEUE_BYTES) {
+fn releasePending(output: model.PendingOutput) void {
+    switch (output) {
+        .owned => |bytes| galloc.free(bytes),
+        .shared => |frame| releaseSharedFrame(frame),
+    }
+}
+
+fn appendOwnedOutput(c: *Conn, first: []const u8, second: []const u8) bool {
+    const size = first.len + second.len;
+    if (c.output_bytes + size > MAX_QUEUE_BYTES) {
         c.poisoned = true;
         return false;
     }
-    if (pending == 0) {
-        c.output.clearRetainingCapacity();
-        c.output_offset = 0;
-    }
-    c.output.appendSlice(galloc, bytes) catch {
+    const bytes = galloc.alloc(u8, size) catch {
         c.poisoned = true;
         return false;
     };
+    @memcpy(bytes[0..first.len], first);
+    @memcpy(bytes[first.len..], second);
+    c.output.append(galloc, .{ .owned = bytes }) catch {
+        galloc.free(bytes);
+        c.poisoned = true;
+        return false;
+    };
+    c.output_bytes += size;
+    updateConnInterest(c, true);
+    return true;
+}
+
+/// A fresh keyframe makes every not-yet-started snapshot before it obsolete,
+/// including dependent deltas. Never remove the head after a partial write:
+/// websocket frame bytes may not be interleaved.
+fn coalesceForKeyframe(c: *Conn) void {
+    var index: usize = 0;
+    while (index < c.output.items.len) {
+        if (index == 0 and c.output_offset != 0) {
+            index += 1;
+            continue;
+        }
+        switch (c.output.items[index]) {
+            .owned => index += 1,
+            .shared => |frame| {
+                c.output_bytes -= frame.len();
+                releaseSharedFrame(frame);
+                _ = c.output.orderedRemove(index);
+            },
+        }
+    }
+}
+
+fn appendSharedOutput(c: *Conn, frame: *model.SharedFrame, offset: usize) bool {
+    std.debug.assert(offset <= frame.len());
+    if (frame.keyframe) coalesceForKeyframe(c);
+    const remaining = frame.len() - offset;
+    if (c.output_bytes + remaining > MAX_QUEUE_BYTES) {
+        c.poisoned = true;
+        return false;
+    }
+    retainSharedFrame(frame);
+    c.output.append(galloc, .{ .shared = frame }) catch {
+        releaseSharedFrame(frame);
+        c.poisoned = true;
+        return false;
+    };
+    if (c.output.items.len == 1) c.output_offset = offset;
+    c.output_bytes += remaining;
     updateConnInterest(c, true);
     return true;
 }
 
 /// Write immediately when the socket is ready; retain only the unsent suffix.
 fn connQueueRaw(c: *Conn, bytes: []const u8) void {
+    c.output_mutex.lockUncancelable(g_io);
+    defer c.output_mutex.unlock(g_io);
     if (c.closing or c.poisoned or bytes.len == 0) return;
-    if (c.output.items.len != c.output_offset) {
-        _ = appendOutput(c, bytes);
+    if (c.output.items.len != 0) {
+        _ = appendOwnedOutput(c, bytes, "");
         return;
     }
     while (true) {
@@ -332,13 +418,13 @@ fn connQueueRaw(c: *Conn, bytes: []const u8) void {
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 const sent: usize = @intCast(rc);
-                network_bytes_sent +%= sent;
-                if (sent < bytes.len) _ = appendOutput(c, bytes[sent..]);
+                _ = network_bytes_sent.fetchAdd(sent, .monotonic);
+                if (sent < bytes.len) _ = appendOwnedOutput(c, bytes[sent..], "");
                 return;
             },
             .INTR => continue,
             .AGAIN => {
-                _ = appendOutput(c, bytes);
+                _ = appendOwnedOutput(c, bytes, "");
                 return;
             },
             else => {
@@ -350,14 +436,16 @@ fn connQueueRaw(c: *Conn, bytes: []const u8) void {
 }
 
 /// Fast path uses one writev syscall and performs no allocation or copy.
-/// Backpressure copies only the unsent suffix into the retained output buffer.
+/// Infrequent control frames are copied only when a socket applies backpressure.
 fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
+    c.output_mutex.lockUncancelable(g_io);
+    defer c.output_mutex.unlock(g_io);
     if (c.closing or c.poisoned) return;
-    websocket_frames_sent +%= 1;
+    _ = websocket_frames_sent.fetchAdd(1, .monotonic);
     var hdr: [10]u8 = undefined;
     const hlen = wsHeader(&hdr, opcode, payload.len);
-    if (c.output.items.len != c.output_offset) {
-        if (appendOutput(c, hdr[0..hlen])) _ = appendOutput(c, payload);
+    if (c.output.items.len != 0) {
+        _ = appendOwnedOutput(c, hdr[0..hlen], payload);
         return;
     }
 
@@ -370,17 +458,57 @@ fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 const sent: usize = @intCast(rc);
-                network_bytes_sent +%= sent;
+                _ = network_bytes_sent.fetchAdd(sent, .monotonic);
                 if (sent < hlen) {
-                    if (appendOutput(c, hdr[sent..hlen])) _ = appendOutput(c, payload);
+                    _ = appendOwnedOutput(c, hdr[sent..hlen], payload);
                 } else if (sent < hlen + payload.len) {
-                    _ = appendOutput(c, payload[sent - hlen ..]);
+                    _ = appendOwnedOutput(c, payload[sent - hlen ..], "");
                 }
                 return;
             },
             .INTR => continue,
             .AGAIN => {
-                if (appendOutput(c, hdr[0..hlen])) _ = appendOutput(c, payload);
+                _ = appendOwnedOutput(c, hdr[0..hlen], payload);
+                return;
+            },
+            else => {
+                c.poisoned = true;
+                return;
+            },
+        }
+    }
+}
+
+/// Publish one immutable binary snapshot to a connection. All connections in
+/// the lobby reference the same payload under backpressure; fast writes retain
+/// no per-connection state at all.
+fn connEnqueueSharedFrame(c: *Conn, frame: *model.SharedFrame) void {
+    c.output_mutex.lockUncancelable(g_io);
+    defer c.output_mutex.unlock(g_io);
+    if (c.closing or c.poisoned) return;
+    _ = websocket_frames_sent.fetchAdd(1, .monotonic);
+    if (c.output.items.len != 0) {
+        _ = appendSharedOutput(c, frame, 0);
+        return;
+    }
+
+    const hlen: usize = frame.header_len;
+    const vec = [2]posix.iovec_const{
+        .{ .base = frame.header[0..hlen].ptr, .len = hlen },
+        .{ .base = frame.payload.items.ptr, .len = frame.payload.items.len },
+    };
+    while (true) {
+        const rc = linux.writev(c.fd, &vec, vec.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const sent: usize = @intCast(rc);
+                _ = network_bytes_sent.fetchAdd(sent, .monotonic);
+                if (sent < frame.len()) _ = appendSharedOutput(c, frame, sent);
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => {
+                _ = appendSharedOutput(c, frame, 0);
                 return;
             },
             else => {
@@ -396,43 +524,134 @@ fn connEnqueueText(c: *Conn, payload: []const u8) void {
 }
 
 fn flushOutput(c: *Conn) bool {
-    while (c.output_offset < c.output.items.len) {
-        const pending = c.output.items[c.output_offset..];
-        const rc = linux.write(c.fd, pending.ptr, pending.len);
+    c.output_mutex.lockUncancelable(g_io);
+    defer c.output_mutex.unlock(g_io);
+    while (c.output.items.len != 0) {
+        const output = c.output.items[0];
+        const total = output.len();
+        const rc = switch (output) {
+            .owned => |bytes| linux.write(c.fd, bytes[c.output_offset..].ptr, total - c.output_offset),
+            .shared => |frame| writeSharedFrame(c.fd, frame, c.output_offset),
+        };
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 const sent: usize = @intCast(rc);
                 c.output_offset += sent;
-                network_bytes_sent +%= sent;
+                c.output_bytes -= sent;
+                _ = network_bytes_sent.fetchAdd(sent, .monotonic);
+                if (c.output_offset == total) {
+                    releasePending(c.output.orderedRemove(0));
+                    c.output_offset = 0;
+                }
             },
             .INTR => continue,
             .AGAIN => return true,
             else => return false,
         }
     }
-    c.output.clearRetainingCapacity();
-    c.output_offset = 0;
     updateConnInterest(c, false);
     return !c.close_after_write;
+}
+
+fn writeSharedFrame(fd: posix.fd_t, frame: *model.SharedFrame, offset: usize) usize {
+    const hlen: usize = frame.header_len;
+    if (offset >= hlen) {
+        const payload_offset = offset - hlen;
+        return linux.write(fd, frame.payload.items[payload_offset..].ptr, frame.payload.items.len - payload_offset);
+    }
+    const vec = [2]posix.iovec_const{
+        .{ .base = frame.header[offset..hlen].ptr, .len = hlen - offset },
+        .{ .base = frame.payload.items.ptr, .len = frame.payload.items.len },
+    };
+    return linux.writev(fd, &vec, vec.len);
+}
+
+fn connPoisoned(c: *Conn) bool {
+    c.output_mutex.lockUncancelable(g_io);
+    defer c.output_mutex.unlock(g_io);
+    return c.poisoned;
+}
+
+fn connOutputDrained(c: *Conn) bool {
+    c.output_mutex.lockUncancelable(g_io);
+    defer c.output_mutex.unlock(g_io);
+    return c.output.items.len == 0;
 }
 
 // ------------------------------------------------------- room operations
 
 fn totalPlayersLocked() usize {
-    var n: usize = 0;
-    for (lobbies.values()) |l| n += l.players.count();
-    return n;
+    return total_players.load(.acquire);
 }
 
 fn broadcastLobby(l: *Lobby, frame: []const u8) void {
     for (l.players.values()) |p| connEnqueueText(p.conn, frame);
 }
 
+fn nextBackgroundSnapshot(now: i64) i64 {
+    const interval = BACKGROUND_SNAPSHOT_MS;
+    return now - @mod(now, interval) + interval;
+}
+
+fn recoverySnapshot(
+    l: *Lobby,
+    frame: *model.SharedFrame,
+    now: i64,
+    sequence: u16,
+    cached: *?*model.SharedFrame,
+) ?*model.SharedFrame {
+    if (frame.keyframe) return frame;
+    if (cached.*) |recovery| return recovery;
+
+    const recovery = acquireSharedFrame() orelse return null;
+    const result = binary_snapshot.buildIndependentKeyframeInto(&recovery.payload, l, now, sequence, galloc) catch {
+        releaseSharedFrame(recovery);
+        return null;
+    };
+    recovery.keyframe = true;
+    recovery.header_len = @intCast(wsHeader(&recovery.header, 0x2, result.bytes.len));
+    cached.* = recovery;
+    return recovery;
+}
+
+/// Foreground clients receive the dependent 15 Hz stream. Hidden clients get
+/// one complete keyframe per second, and a tab returning to the foreground
+/// gets a complete keyframe before dependent deltas resume. A single lazily
+/// built recovery frame is shared by every client that needs it on this tick.
+fn broadcastBinarySnapshot(l: *Lobby, frame: *model.SharedFrame, now: i64, sequence: u16) void {
+    var cached_recovery: ?*model.SharedFrame = null;
+    defer if (cached_recovery) |recovery| releaseSharedFrame(recovery);
+
+    for (l.players.values()) |player| {
+        const c = player.conn;
+        if (c.snapshot_hidden.load(.acquire)) {
+            if (c.next_background_snapshot_ms.load(.acquire) > now) continue;
+            const recovery = recoverySnapshot(l, frame, now, sequence, &cached_recovery) orelse continue;
+            connEnqueueSharedFrame(c, recovery);
+            c.next_background_snapshot_ms.store(nextBackgroundSnapshot(now), .release);
+            continue;
+        }
+
+        if (c.snapshot_needs_keyframe.swap(false, .acq_rel)) {
+            const recovery = recoverySnapshot(l, frame, now, sequence, &cached_recovery) orelse {
+                c.snapshot_needs_keyframe.store(true, .release);
+                continue;
+            };
+            connEnqueueSharedFrame(c, recovery);
+        } else {
+            connEnqueueSharedFrame(c, frame);
+        }
+    }
+}
+
 fn detachPlayer(l: *Lobby, p: *Player) void {
-    _ = l.players.orderedRemove(p.id);
+    if (!l.players.orderedRemove(p.id)) return;
     l.roster_dirty = true;
+    _ = total_players.fetchSub(1, .acq_rel);
+    p.conn.membership_mutex.lockUncancelable(g_io);
     p.conn.player = null; // allows same-socket rejoin (Retry without reload)
     p.conn.lobby = null;
+    p.conn.membership_mutex.unlock(g_io);
 }
 
 fn destroyPlayer(p: *Player) void {
@@ -443,11 +662,265 @@ fn destroyPlayer(p: *Player) void {
     galloc.destroy(p);
 }
 
+/// Detach and destroy the player, if any, while preserving the global lock
+/// order: lobby -> membership -> output. The reactor owns connection lifetime;
+/// the lobby worker owns all game-state mutation.
+fn removeConnPlayer(c: *Conn, aa: Allocator) void {
+    c.membership_mutex.lockUncancelable(g_io);
+    const lobby = c.lobby;
+    c.membership_mutex.unlock(g_io);
+    const l = lobby orelse return;
+
+    l.mutex.lockUncancelable(g_io);
+    defer l.mutex.unlock(g_io);
+    c.membership_mutex.lockUncancelable(g_io);
+    const player = if (c.lobby == l) c.player else null;
+    c.membership_mutex.unlock(g_io);
+    if (player) |p| {
+        feedDeath(l, p, aa);
+        detachPlayer(l, p);
+        destroyPlayer(p);
+    }
+}
+
+fn gameWorkerLoop(worker: *GameWorker) void {
+    var arena = std.heap.ArenaAllocator.init(galloc);
+    defer arena.deinit();
+    var next_tick = monoNanos() + @as(i64, @intCast(TICK_NS));
+    while (!worker.stop.load(.acquire)) {
+        sleepUntilMono(next_tick);
+        if (worker.stop.load(.acquire)) break;
+        _ = arena.reset(.retain_capacity);
+        worker.mutex.lockUncancelable(g_io);
+        for (worker.lobbies.items) |lobby| {
+            lobby.mutex.lockUncancelable(g_io);
+            if (lobby.players.count() > 0) tickLobby(lobby, unixMillis(), arena.allocator());
+            lobby.mutex.unlock(g_io);
+        }
+        worker.mutex.unlock(g_io);
+        const now = monoNanos();
+        next_tick += @as(i64, @intCast(TICK_NS));
+        if (next_tick <= now) next_tick = now + @as(i64, @intCast(TICK_NS));
+    }
+}
+
+fn createGameWorker() !*GameWorker {
+    const worker = try galloc.create(GameWorker);
+    worker.* = .{};
+    try game_workers.append(galloc, worker);
+    worker.thread = std.Thread.spawn(.{ .stack_size = GAME_WORKER_STACK }, gameWorkerLoop, .{worker}) catch |err| {
+        _ = game_workers.pop();
+        galloc.destroy(worker);
+        return err;
+    };
+    return worker;
+}
+
+/// Caller must hold the worker mutex. The owner thread is then outside every
+/// lobby tick, so these otherwise owner-only measurements are race-free.
+fn workerEstimatedCostLocked(worker: *GameWorker) u64 {
+    var total: u64 = 0;
+    for (worker.lobbies.items) |lobby| {
+        total +|= worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.count());
+    }
+    return total;
+}
+
+fn assignGameWorker(lobby: *Lobby) !void {
+    var best: ?*GameWorker = null;
+    var best_cost: u64 = std.math.maxInt(u64);
+    var best_count: usize = std.math.maxInt(usize);
+    for (game_workers.items) |worker| {
+        worker.mutex.lockUncancelable(g_io);
+        if (worker.lobbies.items.len < lobbies_per_worker) {
+            const cost = workerEstimatedCostLocked(worker);
+            const count = worker.lobbies.items.len;
+            if (cost < best_cost or (cost == best_cost and count < best_count)) {
+                best = worker;
+                best_cost = cost;
+                best_count = count;
+            }
+        }
+        worker.mutex.unlock(g_io);
+    }
+    if (best) |worker| {
+        worker.mutex.lockUncancelable(g_io);
+        defer worker.mutex.unlock(g_io);
+        return worker.lobbies.append(galloc, lobby);
+    }
+    const worker = try createGameWorker();
+    worker.mutex.lockUncancelable(g_io);
+    defer worker.mutex.unlock(g_io);
+    try worker.lobbies.append(galloc, lobby);
+}
+
+fn lockAllGameWorkers() void {
+    for (game_workers.items) |worker| worker.mutex.lockUncancelable(g_io);
+}
+
+fn unlockAllGameWorkers() void {
+    var i = game_workers.items.len;
+    while (i > 0) {
+        i -= 1;
+        game_workers.items[i].mutex.unlock(g_io);
+    }
+}
+
+/// Evacuate one lightly loaded worker while every worker is frozen between
+/// ticks. Appending to the destination happens before removal from the source,
+/// so allocation failure leaves ownership unchanged.
+fn retireLightestGameWorker(now_ms: i64, aa: Allocator) bool {
+    if (game_workers.items.len <= 1) return false;
+    const loads = aa.alloc(u64, game_workers.items.len) catch return false;
+    lockAllGameWorkers();
+
+    var source_index: usize = 0;
+    for (game_workers.items, 0..) |worker, index| {
+        loads[index] = workerEstimatedCostLocked(worker);
+        if (loads[index] < loads[source_index]) source_index = index;
+    }
+    const source = game_workers.items[source_index];
+    while (source.lobbies.items.len > 0) {
+        const lobby = source.lobbies.items[source.lobbies.items.len - 1];
+        const cost = worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.count());
+        var target_index: ?usize = null;
+        for (game_workers.items, 0..) |target, index| {
+            if (index == source_index or target.lobbies.items.len >= lobbies_per_worker) continue;
+            if (target_index == null or loads[index] < loads[target_index.?]) target_index = index;
+        }
+        const destination_index = target_index orelse break;
+        const destination = game_workers.items[destination_index];
+        destination.lobbies.append(galloc, lobby) catch break;
+        _ = source.lobbies.pop();
+        loads[source_index] -|= cost;
+        loads[destination_index] +|= cost;
+        lobby.last_migrated_ms = now_ms;
+        worker_migrations +%= 1;
+    }
+    const retired = source.lobbies.items.len == 0;
+    unlockAllGameWorkers();
+    if (!retired) return false;
+
+    const worker = game_workers.swapRemove(source_index);
+    std.debug.assert(worker == source);
+    worker.stop.store(true, .release);
+    if (worker.thread) |thread| thread.join();
+    worker.lobbies.deinit(galloc);
+    galloc.destroy(worker);
+    return true;
+}
+
+fn redistributeGameWorkers(now_ms: i64, aa: Allocator) void {
+    if (game_workers.items.len < 2) return;
+    const loads = aa.alloc(u64, game_workers.items.len) catch return;
+    lockAllGameWorkers();
+    var lobby_count: usize = 0;
+    for (game_workers.items, 0..) |worker, index| {
+        loads[index] = workerEstimatedCostLocked(worker);
+        lobby_count += worker.lobbies.items.len;
+    }
+
+    var moves_left = lobby_count;
+    while (moves_left > 0) : (moves_left -= 1) {
+        var heavy_index: usize = 0;
+        var light_index: ?usize = null;
+        for (game_workers.items, 0..) |worker, index| {
+            if (loads[index] > loads[heavy_index]) heavy_index = index;
+            if (worker.lobbies.items.len < lobbies_per_worker and
+                (light_index == null or loads[index] < loads[light_index.?])) light_index = index;
+        }
+        const destination_index = light_index orelse break;
+        if (destination_index == heavy_index) break;
+
+        const source = game_workers.items[heavy_index];
+        var best_lobby_index: ?usize = null;
+        var best_cost: u64 = 0;
+        var best_improvement: u64 = 0;
+        for (source.lobbies.items, 0..) |lobby, index| {
+            if (lobby.last_migrated_ms != 0 and now_ms - lobby.last_migrated_ms < worker_balance.migration_cooldown_ms) continue;
+            const cost = worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.count());
+            const improvement = worker_balance.moveImprovementNs(loads[heavy_index], loads[destination_index], cost);
+            if (improvement > best_improvement) {
+                best_lobby_index = index;
+                best_cost = cost;
+                best_improvement = improvement;
+            }
+        }
+        const lobby_index = best_lobby_index orelse break;
+        if (!worker_balance.worthwhileMove(loads[heavy_index], loads[destination_index], best_cost)) break;
+
+        const lobby = source.lobbies.items[lobby_index];
+        const destination = game_workers.items[destination_index];
+        destination.lobbies.append(galloc, lobby) catch break;
+        _ = source.lobbies.swapRemove(lobby_index);
+        loads[heavy_index] -|= best_cost;
+        loads[destination_index] +|= best_cost;
+        lobby.last_migrated_ms = now_ms;
+        worker_migrations +%= 1;
+    }
+    unlockAllGameWorkers();
+}
+
+/// Re-evaluate the pool once per reactor maintenance interval. Expansion is
+/// immediate; contraction is deliberately slower to avoid thread churn when a
+/// transient expensive tick nudges an EWMA across the budget boundary.
+fn rebalanceGameWorkers(now_ms: i64, aa: Allocator) void {
+    lockAllGameWorkers();
+    var total_cost_ns: u64 = 0;
+    var lobby_count: usize = 0;
+    for (game_workers.items) |worker| {
+        total_cost_ns +|= workerEstimatedCostLocked(worker);
+        lobby_count += worker.lobbies.items.len;
+    }
+    unlockAllGameWorkers();
+
+    const target_ns = worker_balance.targetTickBudgetNs(TICK_NS);
+    const desired = worker_balance.desiredWorkerCount(lobby_count, total_cost_ns, lobbies_per_worker, target_ns);
+    while (game_workers.items.len < desired) {
+        _ = createGameWorker() catch break;
+        last_worker_resize_ms = now_ms;
+    }
+    if (game_workers.items.len > desired and now_ms - last_worker_resize_ms >= worker_balance.pool_shrink_cooldown_ms) {
+        while (game_workers.items.len > desired) {
+            if (!retireLightestGameWorker(now_ms, aa)) break;
+            last_worker_resize_ms = now_ms;
+        }
+    }
+    redistributeGameWorkers(now_ms, aa);
+}
+
+fn unassignGameWorker(lobby: *Lobby) void {
+    var empty_index: ?usize = null;
+    for (game_workers.items, 0..) |worker, worker_index| {
+        worker.mutex.lockUncancelable(g_io);
+        for (worker.lobbies.items, 0..) |candidate, lobby_index| {
+            if (candidate == lobby) {
+                _ = worker.lobbies.swapRemove(lobby_index);
+                if (worker.lobbies.items.len == 0 and game_workers.items.len > 1) empty_index = worker_index;
+                worker.mutex.unlock(g_io);
+                break;
+            }
+        } else {
+            worker.mutex.unlock(g_io);
+            continue;
+        }
+        break;
+    }
+    if (empty_index) |index| {
+        const worker = game_workers.swapRemove(index);
+        worker.stop.store(true, .release);
+        if (worker.thread) |thread| thread.join();
+        worker.lobbies.deinit(galloc);
+        galloc.destroy(worker);
+    }
+}
+
 fn destroyLobby(l: *Lobby) void {
+    unassignGameWorker(l);
     for (l.drops.items) |d| galloc.free(d.id);
     l.drops.deinit(galloc);
     l.bonus.deinit(galloc);
-    l.wire.deinit(galloc);
+    l.roster_wire.deinit(galloc);
     l.players.deinit(galloc);
     galloc.free(l.id);
     galloc.destroy(l);
@@ -455,8 +928,16 @@ fn destroyLobby(l: *Lobby) void {
 
 fn createLobbyLocked(id: []u8) !*Lobby {
     const l = try galloc.create(Lobby);
-    l.* = .{ .id = id, .food = randomCell() };
+    const seed = rng_prng.random().int(u64);
+    l.* = .{ .id = id, .food = undefined };
+    l.rng = std.Random.DefaultPrng.init(seed);
+    l.food = randomCell(l);
     lobbies.put(galloc, id, l) catch |e| {
+        galloc.destroy(l);
+        return e;
+    };
+    assignGameWorker(l) catch |e| {
+        _ = lobbies.orderedRemove(id);
         galloc.destroy(l);
         return e;
     };
@@ -518,69 +999,14 @@ fn broadcastGoldenFeed(l: *Lobby, p: *Player, aa: Allocator) void {
 
 // ------------------------------------------------------------------ joining
 
-const UsernameCheck = struct {
-    ok: bool,
-    trimmed: []const u8,
-};
-
-fn isJsSpace(cp: u21) bool {
-    return cp == ' ' or cp == '\t' or cp == '\n' or cp == '\r' or cp == 0x0B or cp == 0x0C or
-        cp == 0x85 or cp == 0xA0 or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200A) or
-        cp == 0x2028 or cp == 0x2029 or cp == 0x202F or cp == 0x205F or cp == 0x3000 or cp == 0xFEFF;
-}
-
-/// Approximation of JS String.prototype.trim().
-fn jsTrim(s: []const u8) []const u8 {
-    var begin: usize = 0;
-    var end: usize = s.len;
-    while (begin < end) {
-        const len = std.unicode.utf8ByteSequenceLength(s[begin]) catch break;
-        if (begin + len > end) break;
-        const cp = std.unicode.utf8Decode(s[begin .. begin + len]) catch break;
-        if (!isJsSpace(cp)) break;
-        begin += len;
-    }
-    while (end > begin) {
-        var st = end - 1;
-        while (st > begin and (s[st] & 0xC0) == 0x80) st -= 1;
-        const len = std.unicode.utf8ByteSequenceLength(s[st]) catch break;
-        if (st + len != end) break;
-        const cp = std.unicode.utf8Decode(s[st..end]) catch break;
-        if (!isJsSpace(cp)) break;
-        end = st;
-    }
-    return s[begin..end];
-}
-
-/// ^[\p{L}\p{N}_\- ]+$ on the trimmed value, length 4..16 codepoints.
-/// Deviation (documented): any codepoint >= U+0080 counts as letter/number.
-fn checkUsername(raw: []const u8) UsernameCheck {
-    const t = jsTrim(raw);
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < t.len) {
-        const len = std.unicode.utf8ByteSequenceLength(t[i]) catch return .{ .ok = false, .trimmed = t };
-        if (i + len > t.len) return .{ .ok = false, .trimmed = t };
-        const cp = std.unicode.utf8Decode(t[i .. i + len]) catch return .{ .ok = false, .trimmed = t };
-        const allowed =
-            cp == '_' or cp == '-' or cp == ' ' or
-            (cp >= '0' and cp <= '9') or
-            (cp >= 'A' and cp <= 'Z') or
-            (cp >= 'a' and cp <= 'z') or
-            cp >= 0x80;
-        if (!allowed) return .{ .ok = false, .trimmed = t };
-        count += 1;
-        i += len;
-    }
-    return .{ .ok = count >= 4 and count <= 16, .trimmed = t };
-}
-
 fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_arg: ?[]const u8) void {
-
     // Already playing on this socket: silently ignore (rejoin guard).
-    if (c.player != null) return;
+    c.membership_mutex.lockUncancelable(g_io);
+    const already_playing = c.player != null;
+    c.membership_mutex.unlock(g_io);
+    if (already_playing) return;
 
-    const bad_user = UsernameCheck{ .ok = false, .trimmed = "" };
+    const bad_user = text.UsernameCheck{ .ok = false, .trimmed = "" };
     const chk = if (username_arg) |u| checkUsername(u) else bad_user;
     if (!chk.ok) {
         sendGameError(c, ERR_INVALID_USERNAME, aa);
@@ -591,15 +1017,24 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
         sendGameError(c, ERR_UNKNOWN_GAME, aa);
         return;
     }
-    if (totalPlayersLocked() >= MAX_PLAYERS_GLOBAL) {
+    const target = lobby.?;
+    target.mutex.lockUncancelable(g_io);
+    defer target.mutex.unlock(g_io);
+
+    // Recheck under the lobby ownership lock. This serializes joins with the
+    // lobby worker and with disconnect/death cleanup.
+    c.membership_mutex.lockUncancelable(g_io);
+    const joined_while_waiting = c.player != null;
+    c.membership_mutex.unlock(g_io);
+    if (joined_while_waiting) return;
+    if (totalPlayersLocked() >= max_players_global) {
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
     }
-    if (lobby.?.players.count() >= MAX_PLAYERS_PER_LOBBY) {
+    if (target.players.count() >= max_players_per_lobby) {
         sendGameError(c, ERR_LOBBY_FULL, aa);
         return;
     }
-    const target = lobby.?;
 
     // init goes to the joining socket only, before the join feed.
     {
@@ -641,15 +1076,17 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
         return;
     };
 
-    c.player = p;
-    c.lobby = target;
     target.players.put(galloc, p.id, p) catch {
-        c.player = null;
-        c.lobby = null;
         destroyPlayer(p);
         return;
     };
+    _ = total_players.fetchAdd(1, .acq_rel);
+    c.membership_mutex.lockUncancelable(g_io);
+    c.player = p;
+    c.lobby = target;
+    c.membership_mutex.unlock(g_io);
     target.roster_dirty = true;
+    target.last_empty_at = 0;
 
     // feed join to everyone in the room (including the joiner).
     var args: Buf = .empty;
@@ -663,7 +1100,34 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
 }
 
 fn handleKeyPress(c: *Conn, d: Direction) void {
-    if (c.player) |p| _ = p.pushTurn(d);
+    c.membership_mutex.lockUncancelable(g_io);
+    const lobby = c.lobby;
+    c.membership_mutex.unlock(g_io);
+    const l = lobby orelse return;
+
+    l.mutex.lockUncancelable(g_io);
+    defer l.mutex.unlock(g_io);
+    c.membership_mutex.lockUncancelable(g_io);
+    const player = if (c.lobby == l) c.player else null;
+    c.membership_mutex.unlock(g_io);
+    if (player) |p| _ = p.pushTurn(d);
+}
+
+fn handleVisibility(c: *Conn, visible: bool) void {
+    const was_hidden = c.snapshot_hidden.load(.acquire);
+    if (visible) {
+        // A background client deliberately misses dependent deltas. Mark it
+        // before publishing foreground visibility so the lobby worker cannot
+        // observe the foreground state without also seeing the resync flag.
+        if (was_hidden) c.snapshot_needs_keyframe.store(true, .release);
+        c.snapshot_hidden.store(false, .release);
+    } else {
+        // Make the first background keyframe immediate; subsequent delivery is
+        // bounded by BACKGROUND_SNAPSHOT_MS. Publish the deadline first so a
+        // lobby worker that sees the hidden state also sees the reset.
+        c.next_background_snapshot_ms.store(0, .release);
+        c.snapshot_hidden.store(true, .release);
+    }
 }
 
 // ------------------------------------------------------------------ tick helpers
@@ -671,7 +1135,7 @@ fn handleKeyPress(c: *Conn, d: Direction) void {
 fn respawnFood(l: *Lobby) void {
     var attempt: usize = 0;
     while (attempt < 100) : (attempt += 1) {
-        l.food = randomCell();
+        l.food = randomCell(l);
         if (!snakeOccupies(l, l.food)) return;
     }
 }
@@ -712,81 +1176,23 @@ fn openDropLocked(l: *Lobby, p: *Player, aa: Allocator) void {
     broadcastLobby(l, frame);
 }
 
-inline fn appendCellCoord(b: *Buf, value: i32) !void {
-    try jnum(b, galloc, @divTrunc(value, CELL));
-}
-
-/// Membership metadata is sent only when players join or leave. Player order
-/// is then stable and acts as the key for compact snapshots.
+/// Identity metadata is sent only when membership changes. Snapshot player
+/// rows retain this insertion order and therefore need no repeated ids.
 fn buildRoster(l: *Lobby) ![]const u8 {
-    l.wire.clearRetainingCapacity();
-    try l.wire.appendSlice(galloc, "42[\"r\",[");
-    for (l.players.values(), 0..) |p, i| {
-        if (i != 0) try l.wire.append(galloc, ',');
-        try l.wire.append(galloc, '[');
-        try jsString(&l.wire, galloc, p.id);
-        try l.wire.append(galloc, ',');
-        try jsString(&l.wire, galloc, p.name);
-        try l.wire.append(galloc, ',');
-        try jsString(&l.wire, galloc, p.color_hex);
-        try l.wire.append(galloc, ']');
+    l.roster_wire.clearRetainingCapacity();
+    try l.roster_wire.appendSlice(galloc, "[\"r\",[");
+    for (l.players.values(), 0..) |player, index| {
+        if (index != 0) try l.roster_wire.append(galloc, ',');
+        try l.roster_wire.append(galloc, '[');
+        try jsString(&l.roster_wire, galloc, player.id);
+        try l.roster_wire.append(galloc, ',');
+        try jsString(&l.roster_wire, galloc, player.name);
+        try l.roster_wire.append(galloc, ',');
+        try jsString(&l.roster_wire, galloc, player.color_hex);
+        try l.roster_wire.append(galloc, ']');
     }
-    try l.wire.appendSlice(galloc, "]]\n");
-    return l.wire.items[0 .. l.wire.items.len - 1];
-}
-
-/// Compact tick: [players, bonus, drops, golden]. Coordinates are grid-cell
-/// integers and the browser multiplies once by CELL while applying the tick.
-fn buildGameTick(l: *Lobby, now: i64) ![]const u8 {
-    l.wire.clearRetainingCapacity();
-    try l.wire.appendSlice(galloc, "42[\"tick\",[[");
-    for (l.players.values(), 0..) |p, pi| {
-        if (pi != 0) try l.wire.append(galloc, ',');
-        try l.wire.append(galloc, '[');
-        try jnum(&l.wire, galloc, p.score);
-        try l.wire.append(galloc, ',');
-        try jnum(&l.wire, galloc, p.body_length);
-        try l.wire.appendSlice(galloc, ",[");
-        for (p.snake.items, 0..) |cell, ci| {
-            if (ci != 0) try l.wire.append(galloc, ',');
-            try appendCellCoord(&l.wire, cell.x);
-            try l.wire.append(galloc, ',');
-            try appendCellCoord(&l.wire, cell.y);
-        }
-        try l.wire.appendSlice(galloc, "]]");
-    }
-    try l.wire.appendSlice(galloc, "],[");
-    for (l.bonus.items, 0..) |apple, i| {
-        if (i != 0) try l.wire.append(galloc, ',');
-        try appendCellCoord(&l.wire, apple.pos.x);
-        try l.wire.append(galloc, ',');
-        try appendCellCoord(&l.wire, apple.pos.y);
-    }
-    try l.wire.appendSlice(galloc, "],[");
-    for (l.drops.items, 0..) |drop, i| {
-        if (i != 0) try l.wire.append(galloc, ',');
-        try l.wire.append(galloc, '[');
-        try jsString(&l.wire, galloc, drop.id);
-        try l.wire.append(galloc, ',');
-        try appendCellCoord(&l.wire, drop.pos.x);
-        try l.wire.append(galloc, ',');
-        try appendCellCoord(&l.wire, drop.pos.y);
-        try l.wire.append(galloc, ',');
-        try jnum(&l.wire, galloc, @max(0, drop.expires_at - now));
-        try l.wire.append(galloc, ']');
-    }
-    try l.wire.appendSlice(galloc, "],");
-    if (l.golden) |golden| {
-        try l.wire.append(galloc, '[');
-        try appendCellCoord(&l.wire, golden.pos.x);
-        try l.wire.append(galloc, ',');
-        try appendCellCoord(&l.wire, golden.pos.y);
-        try l.wire.append(galloc, ',');
-        try jnum(&l.wire, galloc, @max(0, golden.expires_at - now));
-        try l.wire.append(galloc, ']');
-    } else try l.wire.appendSlice(galloc, "null");
-    try l.wire.appendSlice(galloc, "]]\n");
-    return l.wire.items[0 .. l.wire.items.len - 1];
+    try l.roster_wire.appendSlice(galloc, "]]\n");
+    return l.roster_wire.items[0 .. l.roster_wire.items.len - 1];
 }
 
 // ------------------------------------------------------------------ tick
@@ -813,50 +1219,65 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
     if (l.next_golden_at == 0) l.next_golden_at = now + 20000;
     if (now >= l.next_drop_at and l.drops.items.len < DROP_MAX) {
         spawnDropLocked(l, now, aa);
-        l.next_drop_at = now + 12000 + rng_prng.random().intRangeLessThan(i64, 0, 8000);
+        l.next_drop_at = now + 12000 + l.rng.random().intRangeLessThan(i64, 0, 8000);
     }
     if (now >= l.next_golden_at and l.golden == null) {
         spawnGoldenLocked(l, now);
-        l.next_golden_at = now + 25000 + rng_prng.random().intRangeLessThan(i64, 0, 15000);
+        l.next_golden_at = now + 25000 + l.rng.random().intRangeLessThan(i64, 0, 15000);
     }
 
     // 3. per-player simulation, insertion order. Deaths are tombstoned and
     //    destroyed after the broadcast (the snapshot keeps borrowing them).
-    var graveyard: std.ArrayListUnmanaged(*Player) = .empty;
-    defer {
-        for (graveyard.items) |p| destroyPlayer(p);
-        graveyard.deinit(galloc);
-    }
-
     var snapshot: std.ArrayListUnmanaged(*Player) = .empty;
     defer snapshot.deinit(aa);
     snapshot.appendSlice(aa, l.players.values()) catch return;
 
-    for (snapshot.items) |p| {
+    // Every player can enter the graveyard at most once per tick. Reserve the
+    // full capacity before mutating the lobby so allocation failure can never
+    // force us to destroy a player still borrowed by `snapshot`.
+    var graveyard: std.ArrayListUnmanaged(*Player) = .empty;
+    defer {
+        for (graveyard.items) |p| destroyPlayer(p);
+        graveyard.deinit(aa);
+    }
+    graveyard.ensureTotalCapacity(aa, snapshot.items.len) catch return;
+    var collision_index = collision.Index.build(snapshot.items);
+
+    for (snapshot.items, 0..) |p, slot| {
         // skip players killed earlier in this same tick
         if (l.players.get(p.id) == null) continue;
 
         const head = p.snake.items[0];
 
         // a. wall / self collision
-        if (collidedWall(head) or collidedSelf(p)) {
+        if (collidedWall(head) or collision_index.selfHit(slot, p)) {
             sendDeathEvent(p.conn, p.score, aa);
             feedDeath(l, p, aa);
+            collision_index.remove(slot, p);
             detachPlayer(l, p);
-            graveyard.append(galloc, p) catch destroyPlayer(p);
+            graveyard.appendAssumeCapacity(p);
             continue;
         }
 
         // b. head vs any segment of another snake: both die
-        if (findCollidedOther(l, p)) |other| {
+        const collision_hit: ?collision.Hit = if (collision_index.tracksPlayers())
+            collision_index.otherAt(slot, p)
+        else if (findCollidedOther(l, p)) |other|
+            .{ .player = other, .slot = 0 }
+        else
+            null;
+        if (collision_hit) |hit| {
+            const other = hit.player;
             sendDeathEvent(p.conn, p.score, aa);
             sendDeathEvent(other.conn, other.score, aa);
             feedDeath(l, p, aa);
             feedDeath(l, other, aa);
+            collision_index.remove(slot, p);
+            collision_index.remove(hit.slot, other);
             detachPlayer(l, p);
-            graveyard.append(galloc, p) catch destroyPlayer(p);
+            graveyard.appendAssumeCapacity(p);
             detachPlayer(l, other);
-            graveyard.append(galloc, other) catch destroyPlayer(other);
+            graveyard.appendAssumeCapacity(other);
             continue;
         }
 
@@ -904,28 +1325,55 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
         }
 
         // g. one queued turn, then move
+        const before_move = collision.BeforeMove.capture(p);
         p.applyMove(galloc);
+        collision_index.afterMove(slot, p, before_move);
     }
 
     // 5. broadcast membership metadata only when it changed, followed by the
     // compact world snapshot. Ordered websocket delivery keeps them aligned.
     const serialize_t0 = monoNanos();
+    l.stats.encode_ns = 0;
+    l.stats.fanout_ns = 0;
     if (l.roster_dirty) {
+        binary_snapshot.invalidate(l);
         if (buildRoster(l)) |frame| {
             broadcastLobby(l, frame);
             l.roster_dirty = false;
         } else |_| {}
     }
-    if (buildGameTick(l, now)) |frame| {
-        l.stats.wire_bytes = frame.len;
-        broadcastLobby(l, frame);
-    } else |_| {}
+    if (acquireSharedFrame()) |frame| {
+        const encode_t0 = if (debug_enabled) monoNanos() else 0;
+        if (binary_snapshot.buildInto(&frame.payload, l, now, galloc)) |result| {
+            frame.keyframe = result.kind == .keyframe;
+            frame.header_len = @intCast(wsHeader(&frame.header, 0x2, result.bytes.len));
+            l.stats.wire_bytes = result.bytes.len;
+            if (debug_enabled) {
+                const encode_ns: u64 = @intCast(@max(0, monoNanos() - encode_t0));
+                l.stats.encode_ns = encode_ns;
+                l.stats.encode_ns_total +%= encode_ns;
+            }
+            const fanout_t0 = if (debug_enabled) monoNanos() else 0;
+            broadcastBinarySnapshot(l, frame, now, result.sequence);
+            if (debug_enabled) {
+                const fanout_ns: u64 = @intCast(@max(0, monoNanos() - fanout_t0));
+                l.stats.fanout_ns = fanout_ns;
+                l.stats.fanout_ns_total +%= fanout_ns;
+            }
+        } else |_| {}
+        releaseSharedFrame(frame);
+    }
     const serialize_ns: u64 = @intCast(@max(0, monoNanos() - serialize_t0));
     l.stats.serialize_ns = serialize_ns;
     l.stats.serialize_ns_total +%= serialize_ns;
 
     // stats
-    const dur_ms = @as(f64, @floatFromInt(monoNanos() - t0)) / 1_000_000.0;
+    const dur_ns: u64 = @intCast(@max(0, monoNanos() - t0));
+    const dur_ms = @as(f64, @floatFromInt(dur_ns)) / 1_000_000.0;
+    l.balance_ewma_ns = if (l.balance_ewma_ns == 0)
+        dur_ns
+    else
+        (l.balance_ewma_ns *| 7 +| dur_ns) / 8;
     l.stats.last_tick_ms = dur_ms;
     l.stats.ticks += 1;
     const window: f64 = @floatFromInt(@min(l.stats.ticks, 200));
@@ -933,13 +1381,7 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
     l.stats.max_tick_ms = @max(l.stats.max_tick_ms, dur_ms);
 }
 
-fn tickAll() void {
-    _ = tick_arena.reset(.retain_capacity);
-    const aa = tick_arena.allocator();
-
-    const now = unixMillis();
-
-    // reap idle non-default lobbies (60s with zero players)
+fn reapIdleLobbies(now: i64) void {
     var doomed: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (doomed.items) |dz| galloc.free(dz);
@@ -947,10 +1389,14 @@ fn tickAll() void {
     }
     for (lobbies.values()) |l| {
         if (std.mem.eql(u8, l.id, DEFAULT_LOBBY_ID)) continue;
-        if (l.players.count() != 0) continue;
-        if (l.last_empty_at == 0) {
-            l.last_empty_at = now;
-        } else if (now - l.last_empty_at >= LOBBY_IDLE_DELETE_MS) {
+        l.mutex.lockUncancelable(g_io);
+        const empty = l.players.count() == 0;
+        if (!empty) {
+            l.last_empty_at = 0;
+        } else if (l.last_empty_at == 0) l.last_empty_at = now;
+        const expired = empty and now - l.last_empty_at >= lobby_idle_delete_ms;
+        l.mutex.unlock(g_io);
+        if (expired) {
             const dup = galloc.dupe(u8, l.id) catch continue;
             doomed.append(galloc, dup) catch galloc.free(dup);
         }
@@ -958,23 +1404,9 @@ fn tickAll() void {
     for (doomed.items) |dz| {
         if (lobbies.fetchOrderedRemove(dz)) |kv| destroyLobby(kv.value);
     }
-
-    for (lobbies.values()) |l| {
-        if (l.players.count() > 0) tickLobby(l, now, aa);
-    }
 }
 
 // ------------------------------------------------------------------ http plumbing
-
-fn pf(b: *Buf, aa: Allocator, comptime fmt: []const u8, args: anytype) !void {
-    var scratch: [256]u8 = undefined;
-    const rendered = std.fmt.bufPrint(&scratch, fmt, args) catch {
-        const allocated = try std.fmt.allocPrint(aa, fmt, args);
-        defer aa.free(allocated);
-        return b.appendSlice(aa, allocated);
-    };
-    try b.appendSlice(aa, rendered);
-}
 
 const SendOpts = struct {
     status: u16,
@@ -1048,128 +1480,7 @@ fn sendRedirect(c: *Conn, aa: Allocator, status: u16, loc: []const u8, keep_aliv
     });
 }
 
-// ------------------------------------------------------------------ url helpers
-
-fn hexVal(ch: u8) ?u8 {
-    return switch (ch) {
-        '0'...'9' => ch - '0',
-        'a'...'f' => ch - 'a' + 10,
-        'A'...'F' => ch - 'A' + 10,
-        else => null,
-    };
-}
-
-fn decodeInto(out: *Buf, aa: Allocator, s: []const u8, plus_as_space: bool) []const u8 {
-    var i: usize = 0;
-    while (i < s.len) {
-        const ch = s[i];
-        if (ch == '%' and i + 2 < s.len) {
-            const hi = hexVal(s[i + 1]);
-            const lo = hexVal(s[i + 2]);
-            if (hi != null and lo != null) {
-                out.append(aa, (hi.? << 4) | lo.?) catch return out.items;
-                i += 3;
-                continue;
-            }
-        }
-        if (plus_as_space and ch == '+') {
-            out.append(aa, ' ') catch return out.items;
-        } else {
-            out.append(aa, ch) catch return out.items;
-        }
-        i += 1;
-    }
-    return out.items;
-}
-
-fn percentDecode(aa: Allocator, s: []const u8) []const u8 {
-    var out: Buf = .empty;
-    return decodeInto(&out, aa, s, false);
-}
-
-fn formDecode(aa: Allocator, s: []const u8) []const u8 {
-    var out: Buf = .empty;
-    return decodeInto(&out, aa, s, true);
-}
-
-/// encodeURIComponent equivalent.
-fn uriEncodeComponent(aa: Allocator, s: []const u8) []const u8 {
-    var out: Buf = .empty;
-    for (s) |ch| {
-        const safe = (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or
-            ch == '-' or ch == '_' or ch == '.' or ch == '!' or ch == '~' or ch == '*' or
-            ch == '\'' or ch == '(' or ch == ')';
-        if (safe) {
-            out.append(aa, ch) catch return out.items;
-        } else {
-            var tmp: [4]u8 = undefined;
-            const t = std.fmt.bufPrint(&tmp, "%{X:0>2}", .{ch}) catch unreachable;
-            out.appendSlice(aa, t) catch return out.items;
-        }
-    }
-    return out.items;
-}
-
-fn queryHasParam(query: []const u8, name: []const u8, value: []const u8) bool {
-    var it = std.mem.splitScalar(u8, query, '&');
-    while (it.next()) |pair| {
-        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
-        if (std.mem.eql(u8, pair[0..eq], name) and std.mem.eql(u8, pair[eq + 1 ..], value)) return true;
-    }
-    return false;
-}
-
-fn extractFormField(aa: Allocator, body: []const u8, name: []const u8) ?[]const u8 {
-    var it = std.mem.splitScalar(u8, body, '&');
-    while (it.next()) |pair| {
-        if (pair.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, pair, '=');
-        const k_raw = if (eq) |e| pair[0..e] else pair;
-        const v_raw = if (eq) |e| pair[e + 1 ..] else "";
-        if (std.mem.eql(u8, formDecode(aa, k_raw), name)) return formDecode(aa, v_raw);
-    }
-    return null;
-}
-
-fn extractJsonField(aa: Allocator, body: []const u8, name: []const u8) ?[]const u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, aa, body, .{}) catch return null;
-    defer parsed.deinit();
-    switch (parsed.value) {
-        .object => |obj| {
-            const v = obj.get(name) orelse return null;
-            switch (v) {
-                .string => |st| return st,
-                else => return null,
-            }
-        },
-        else => return null,
-    }
-}
-
 // ------------------------------------------------------------------ lobby ids
-
-fn writeBase36(out: []u8, v_in: u64) usize {
-    const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
-    var v = v_in;
-    var tmp: [16]u8 = undefined;
-    var n: usize = 0;
-    if (v == 0) {
-        out[0] = '0';
-        return 1;
-    }
-    while (v > 0) : (v /= 36) {
-        tmp[n] = digits[@intCast(v % 36)];
-        n += 1;
-    }
-    const len = n;
-    var at: usize = 0;
-    while (n > 0) {
-        n -= 1;
-        out[at] = tmp[n];
-        at += 1;
-    }
-    return len;
-}
 
 /// Mirrors server/generateId.js: 'id-' + rand base36 (8 chars) + base36(now ms).
 fn genLobbyId(buf: *[48]u8) []const u8 {
@@ -1180,7 +1491,7 @@ fn genLobbyId(buf: *[48]u8) []const u8 {
         const r = rng_prng.random().uintLessThan(usize, alpha.len);
         buf[3 + i] = alpha[r];
     }
-    const suffix_len = writeBase36(buf[11..], @intCast(unixMillis()));
+    const suffix_len = text.writeBase36(buf[11..], @intCast(unixMillis()));
     return buf[0 .. 11 + suffix_len];
 }
 
@@ -1219,63 +1530,71 @@ fn readRssBytes() u64 {
 }
 
 fn buildStats(aa: Allocator) ![]u8 {
-    var b: Buf = .empty;
-    errdefer b.deinit(aa);
-    try b.appendSlice(aa, "{\"rss\":");
-    try jnum(&b, aa, readRssBytes());
-    try b.appendSlice(aa, ",\"uptime\":");
-    const uptime = @as(f64, @floatFromInt(unixMillis() - start_ms)) / 1000.0;
-    try pf(&b, aa, "{d:.3}", .{uptime});
-    try b.appendSlice(aa, ",\"totalPlayers\":");
-    try jnum(&b, aa, totalPlayersLocked());
-    try b.appendSlice(aa, ",\"connections\":");
-    try jnum(&b, aa, connections.count());
-    try b.appendSlice(aa, ",\"networkBytesSent\":");
-    try jnum(&b, aa, network_bytes_sent);
-    try b.appendSlice(aa, ",\"networkBytesReceived\":");
-    try jnum(&b, aa, network_bytes_received);
-    try b.appendSlice(aa, ",\"websocketFramesSent\":");
-    try jnum(&b, aa, websocket_frames_sent);
-    try b.appendSlice(aa, ",\"websocketFramesReceived\":");
-    try jnum(&b, aa, websocket_frames_received);
-    try b.appendSlice(aa, ",\"inputEvents\":");
-    try jnum(&b, aa, input_events);
-    try b.appendSlice(aa, ",\"avgInputEventUs\":");
-    const avg_input_ns = if (input_events == 0) 0.0 else @as(f64, @floatFromInt(input_event_ns_total)) / @as(f64, @floatFromInt(input_events));
-    try pf(&b, aa, "{d:.3}", .{avg_input_ns / 1000.0});
-    try b.appendSlice(aa, ",\"lobbies\":[");
-    var first = true;
-    for (lobbies.values()) |l| {
-        if (!first) try b.append(aa, ',');
-        first = false;
-        try b.appendSlice(aa, "{\"id\":");
-        try jsString(&b, aa, l.id);
-        try b.appendSlice(aa, ",\"players\":");
-        try jnum(&b, aa, l.players.count());
-        try b.appendSlice(aa, ",\"drops\":");
-        try jnum(&b, aa, l.drops.items.len);
-        try b.appendSlice(aa, ",\"bonus\":");
-        try jnum(&b, aa, l.bonus.items.len);
-        const gold: []const u8 = if (l.golden != null) "true" else "false";
-        try b.appendSlice(aa, ",\"golden\":");
-        try b.appendSlice(aa, gold);
-        try b.appendSlice(aa, ",\"lastTickMs\":");
-        try pf(&b, aa, "{d}", .{l.stats.last_tick_ms});
-        try b.appendSlice(aa, ",\"avgTickMs\":");
-        try pf(&b, aa, "{d:.1}", .{l.stats.avg_tick_ms});
-        try b.appendSlice(aa, ",\"maxTickMs\":");
-        try pf(&b, aa, "{d}", .{l.stats.max_tick_ms});
-        try b.appendSlice(aa, ",\"serializeUs\":");
-        try pf(&b, aa, "{d:.3}", .{@as(f64, @floatFromInt(l.stats.serialize_ns)) / 1000.0});
-        try b.appendSlice(aa, ",\"avgSerializeUs\":");
-        const avg_serialize_ns = if (l.stats.ticks == 0) 0.0 else @as(f64, @floatFromInt(l.stats.serialize_ns_total)) / @as(f64, @floatFromInt(l.stats.ticks));
-        try pf(&b, aa, "{d:.3}", .{avg_serialize_ns / 1000.0});
-        try b.appendSlice(aa, ",\"wireBytes\":");
-        try jnum(&b, aa, l.stats.wire_bytes);
-        try b.append(aa, '}');
+    const nsToUs = struct {
+        fn convert(value: u64) f64 {
+            return @as(f64, @floatFromInt(value)) / 1000.0;
+        }
+        fn average(total: u64, samples: u64) f64 {
+            return if (samples == 0) 0 else convert(total) / @as(f64, @floatFromInt(samples));
+        }
+    };
+
+    const worker_loads = try aa.alloc(stats_json.WorkerLoad, game_workers.items.len);
+    for (game_workers.items, 0..) |worker, index| {
+        worker.mutex.lockUncancelable(g_io);
+        defer worker.mutex.unlock(g_io);
+        worker_loads[index] = .{
+            .lobbies = worker.lobbies.items.len,
+            .estimatedTickUs = nsToUs.convert(workerEstimatedCostLocked(worker)),
+        };
     }
-    try b.appendSlice(aa, "]}");
-    return b.toOwnedSlice(aa);
+
+    const lobby_stats = try aa.alloc(stats_json.LobbyStats, lobbies.count());
+    var lobby_index: usize = 0;
+    for (lobbies.values()) |l| {
+        l.mutex.lockUncancelable(g_io);
+        defer l.mutex.unlock(g_io);
+        lobby_stats[lobby_index] = .{
+            .id = l.id,
+            .players = l.players.count(),
+            .drops = l.drops.items.len,
+            .bonus = l.bonus.items.len,
+            .golden = l.golden != null,
+            .lastTickMs = l.stats.last_tick_ms,
+            .avgTickMs = l.stats.avg_tick_ms,
+            .balanceEwmaUs = nsToUs.convert(l.balance_ewma_ns),
+            .maxTickMs = l.stats.max_tick_ms,
+            .serializeUs = nsToUs.convert(l.stats.serialize_ns),
+            .avgSerializeUs = nsToUs.average(l.stats.serialize_ns_total, l.stats.ticks),
+            .encodeUs = nsToUs.convert(l.stats.encode_ns),
+            .avgEncodeUs = nsToUs.average(l.stats.encode_ns_total, l.stats.ticks),
+            .fanoutUs = nsToUs.convert(l.stats.fanout_ns),
+            .avgFanoutUs = nsToUs.average(l.stats.fanout_ns_total, l.stats.ticks),
+            .wireBytes = l.stats.wire_bytes,
+        };
+        lobby_index += 1;
+    }
+
+    return stats_json.encode(aa, .{
+        .rss = readRssBytes(),
+        .uptime = @as(f64, @floatFromInt(unixMillis() - start_ms)) / 1000.0,
+        .totalPlayers = totalPlayersLocked(),
+        .maxPlayers = max_players_global,
+        .maxPlayersPerLobby = max_players_per_lobby,
+        .connections = connections.count(),
+        .lobbyWorkers = game_workers.items.len,
+        .lobbiesPerWorker = lobbies_per_worker,
+        .workerMigrations = worker_migrations,
+        .workerTargetTickUs = nsToUs.convert(worker_balance.targetTickBudgetNs(TICK_NS)),
+        .workerLoads = worker_loads,
+        .networkBytesSent = network_bytes_sent.load(.monotonic),
+        .networkBytesReceived = network_bytes_received.load(.monotonic),
+        .websocketFramesSent = websocket_frames_sent.load(.monotonic),
+        .websocketFramesReceived = websocket_frames_received.load(.monotonic),
+        .inputEvents = input_events,
+        .avgInputEventUs = nsToUs.average(input_event_ns_total, input_events),
+        .lobbies = lobby_stats[0..lobby_index],
+    });
 }
 
 fn sendStats(c: *Conn, aa: Allocator, keep_alive: bool, head_only: bool) void {
@@ -1302,7 +1621,6 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
 
     const qi = std.mem.indexOfScalar(u8, target, '?');
     const raw_path = if (qi) |i| target[0..i] else target;
-    const query = if (qi) |i| target[i + 1 ..] else "";
     const dec_path = percentDecode(aa, raw_path);
     const head_only = is_head;
 
@@ -1328,23 +1646,6 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
         }
         if (std.mem.eql(u8, dec_path, "/debug/stats")) {
             if (debug_enabled) return sendStats(c, aa, keep_alive, head_only);
-            return sendNotFound(c, aa, keep_alive, head_only);
-        }
-        if (std.mem.startsWith(u8, dec_path, "/socket.io/")) {
-            // embedded client bundle ships under the same prefix
-            if (assets.find(dec_path)) |a| {
-                return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = a.ctype, .body = a.body, .keep_alive = keep_alive, .head_only = head_only });
-            }
-            // engine.io request without a websocket upgrade: websocket-only here.
-            if (queryHasParam(query, "transport", "polling")) {
-                return sendResponse(c, aa, .{
-                    .status = 400,
-                    .reason = "Bad Request",
-                    .ctype = "text/plain; charset=utf-8",
-                    .body = "this server supports the websocket transport only",
-                    .keep_alive = false,
-                });
-            }
             return sendNotFound(c, aa, keep_alive, head_only);
         }
         if (assets.find(dec_path)) |a| {
@@ -1418,129 +1719,28 @@ fn doUpgrade(c: *Conn, aa: Allocator, key: []const u8) bool {
     var raw: [16]u8 = undefined;
     g_io.random(&raw);
     _ = std.base64.url_safe_no_pad.Encoder.encode(&c.sid, &raw);
-
-    // engine.io open packet followed immediately by the merged socket.io
-    // CONNECT ("40") -- exactly how the reference server handshakes.
-    const open = std.fmt.allocPrint(
-        aa,
-        "0{{\"sid\":\"{s}\",\"upgrades\":[],\"pingInterval\":{d},\"pingTimeout\":{d}}}",
-        .{ c.sidSlice(), PING_INTERVAL_MS, PING_TIMEOUT_MS },
-    ) catch return false;
-    defer aa.free(open);
-    connEnqueueText(c, open);
-    connEnqueueText(c, "40");
+    var args: Buf = .empty;
+    defer args.deinit(aa);
+    args.append(aa, ',') catch return false;
+    jsString(&args, aa, c.sidSlice()) catch return false;
+    const hello = eventFrame(aa, "id", args.items) catch return false;
+    defer aa.free(hello);
+    connEnqueueText(c, hello);
     return true;
 }
 
-fn plainStringArray(text: []const u8, out: *[3][]const u8) ?usize {
-    var at: usize = 0;
-    while (at < text.len and std.ascii.isWhitespace(text[at])) at += 1;
-    if (at >= text.len or text[at] != '[') return null;
-    at += 1;
-    var count: usize = 0;
-    while (true) {
-        while (at < text.len and std.ascii.isWhitespace(text[at])) at += 1;
-        if (at < text.len and text[at] == ']') {
-            at += 1;
-            while (at < text.len and std.ascii.isWhitespace(text[at])) at += 1;
-            return if (at == text.len) count else null;
-        }
-        if (count == out.len or at >= text.len or text[at] != '"') return null;
-        at += 1;
-        const start = at;
-        while (at < text.len and text[at] != '"') : (at += 1) {
-            if (text[at] == '\\' or text[at] < 0x20) return null;
-        }
-        if (at >= text.len) return null;
-        out[count] = text[start..at];
-        count += 1;
-        at += 1;
-        while (at < text.len and std.ascii.isWhitespace(text[at])) at += 1;
-        if (at >= text.len) return null;
-        if (text[at] == ',') {
-            at += 1;
-            continue;
-        }
-        if (text[at] != ']') return null;
-    }
-}
-
-fn handleParsedEvent(c: *Conn, aa: Allocator, ev: []const u8, uname: ?[]const u8, lid: ?[]const u8) void {
-    if (std.mem.eql(u8, ev, "clientReady")) {
-        handleClientReady(c, aa, uname, lid);
-    } else if (std.mem.eql(u8, ev, "keyPress")) {
-        const value = uname orelse return;
-        const d = model.directionFromString(value) orelse return;
-        handleKeyPress(c, d);
-    }
-}
-
-fn handleSioEvent(c: *Conn, aa: Allocator, json_text: []const u8) !void {
+fn handleRawBinary(c: *Conn, aa: Allocator, payload: []const u8) void {
     const parse_t0 = monoNanos();
     defer {
         input_event_ns_total +%= @intCast(@max(0, monoNanos() - parse_t0));
         input_events +%= 1;
     }
-    var strings: [3][]const u8 = undefined;
-    if (plainStringArray(json_text, &strings)) |count| {
-        if (count == 0) return;
-        return handleParsedEvent(c, aa, strings[0], if (count > 1) strings[1] else null, if (count > 2) strings[2] else null);
+    const packet = websocket.clientPacket(payload) orelse return;
+    switch (packet) {
+        .join => |join| handleClientReady(c, aa, join.username, join.lobby_id),
+        .direction => |direction| handleKeyPress(c, direction),
+        .visibility => |visible| handleVisibility(c, visible),
     }
-
-    // Escaped strings and non-string hostile payloads take the general parser;
-    // the overwhelmingly common input path above is allocation-free.
-    var parsed = std.json.parseFromSlice(std.json.Value, aa, json_text, .{}) catch return;
-    defer parsed.deinit();
-    const root = parsed.value;
-    if (root != .array) return;
-    const items = root.array.items;
-    if (items.len == 0) return;
-    if (items[0] != .string) return;
-    const ev = items[0].string;
-
-    if (std.mem.eql(u8, ev, "clientReady")) {
-        var uname: ?[]const u8 = null;
-        var lid: ?[]const u8 = null;
-        if (items.len >= 2) {
-            if (items[1] == .string) uname = items[1].string;
-        }
-        if (items.len >= 3) {
-            if (items[2] == .string) lid = items[2].string;
-        }
-        handleParsedEvent(c, aa, ev, uname, lid);
-    } else if (std.mem.eql(u8, ev, "keyPress")) {
-        if (items.len >= 2 and items[1] == .string) {
-            handleParsedEvent(c, aa, ev, items[1].string, null);
-        }
-    }
-}
-
-/// Returns true when the connection must close.
-fn handleEngineText(c: *Conn, aa: Allocator, payload: []const u8) !bool {
-    if (payload.len == 0) return false;
-    switch (payload[0]) {
-        '2' => connEnqueueText(c, "3"), // engine ping -> pong
-        '3' => {}, // pong: liveness tracked by the reader loop
-        '4' => {
-            if (payload.len < 2) return false;
-            switch (payload[1]) {
-                '0' => {}, // namespace connect: we auto-connect on upgrade
-                '1' => {
-                    if (c.player) |p| {
-                        const l = c.lobby.?;
-                        feedDeath(l, p, aa);
-                        detachPlayer(l, p);
-                        destroyPlayer(p);
-                    }
-                },
-                '2' => try handleSioEvent(c, aa, payload[2..]),
-                else => {},
-            }
-        },
-        '1' => return true, // engine close packet
-        else => {},
-    }
-    return false;
 }
 
 const WsResult = struct {
@@ -1548,7 +1748,7 @@ const WsResult = struct {
     closed: bool,
 };
 
-fn parseWsFrames(c: *Conn, aa: Allocator, data: []u8, frag: *Buf, frag_op: *u8) !WsResult {
+fn parseWsFrames(c: *Conn, aa: Allocator, data: []u8) !WsResult {
     var off: usize = 0;
     while (data.len - off >= 2) {
         const b0 = data[off];
@@ -1565,10 +1765,11 @@ fn parseWsFrames(c: *Conn, aa: Allocator, data: []u8, frag: *Buf, frag_op: *u8) 
         } else if (len == 127) {
             if (data.len - off < 10) break;
             const v = std.mem.readInt(u64, data[off + 2 ..][0..8], .big);
-            if (v > MAX_WS_FRAME) return error.FrameTooBig;
+            if (v > std.math.maxInt(usize)) return error.FrameTooBig;
             len = @intCast(v);
             hdr_len = 10;
         }
+        try websocket.validateClientFrame(fin, opcode, len);
         if (!masked) return error.UnmaskedClientFrame; // clients MUST mask
         if (data.len - off < hdr_len + 4 + len) break;
         const key = data[off + hdr_len ..][0..4].*;
@@ -1576,33 +1777,11 @@ fn parseWsFrames(c: *Conn, aa: Allocator, data: []u8, frag: *Buf, frag_op: *u8) 
         const payload = data[pstart .. pstart + len];
         for (payload, 0..) |*ch, i| ch.* ^= key[i & 3];
         off += hdr_len + 4 + len;
-        websocket_frames_received +%= 1;
+        _ = websocket_frames_received.fetchAdd(1, .monotonic);
 
         switch (opcode) {
-            0x1 => { // text
-                if (fin) {
-                    frag_op.* = 0;
-                    if (try handleEngineText(c, aa, payload)) return .{ .consumed = off, .closed = true };
-                } else {
-                    frag_op.* = 1;
-                    frag.clearRetainingCapacity();
-                    try frag.appendSlice(galloc, payload);
-                }
-            },
-            0x2 => {}, // binary: unused by engine.io v3 text sessions
-            0x0 => { // continuation
-                if (frag_op.* == 0) return error.UnexpectedContinuation;
-                try frag.appendSlice(galloc, payload);
-                if (frag.items.len > MAX_WS_FRAME) return error.FrameTooBig;
-                if (fin) {
-                    const was_text = frag_op.* == 1;
-                    frag_op.* = 0;
-                    if (was_text) {
-                        if (try handleEngineText(c, aa, frag.items)) return .{ .consumed = off, .closed = true };
-                    }
-                    frag.clearRetainingCapacity();
-                }
-            },
+            0x1 => {}, // text control packets are server-only
+            0x2 => handleRawBinary(c, aa, payload),
             0x8 => { // close
                 const echo: []const u8 = if (payload.len >= 2) payload[0..2] else "";
                 connEnqueueFrame(c, 0x8, echo);
@@ -1626,7 +1805,8 @@ fn consumeInput(c: *Conn, count: usize) void {
 }
 
 fn processWsInput(c: *Conn, aa: Allocator) bool {
-    const result = parseWsFrames(c, aa, c.input.items, &c.fragment, &c.fragment_opcode) catch return false;
+    if (c.input.items.len > MAX_WS_INPUT) return false;
+    const result = parseWsFrames(c, aa, c.input.items) catch return false;
     consumeInput(c, result.consumed);
     if (result.closed) c.close_after_write = true;
     return true;
@@ -1691,11 +1871,7 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
         if (upgrade_ws) {
             const qpos = std.mem.indexOfScalar(u8, target, '?');
             const path = if (qpos) |i| target[0..i] else target;
-            const query = if (qpos) |i| target[i + 1 ..] else "";
-            if (!std.mem.startsWith(u8, path, "/socket.io/") or
-                !queryHasParam(query, "transport", "websocket") or
-                ws_key.len == 0 or !ws_version_ok or !doUpgrade(c, aa, ws_key))
-            {
+            if (!std.mem.eql(u8, path, "/ws") or ws_key.len == 0 or !ws_version_ok or !doUpgrade(c, aa, ws_key)) {
                 sendResponse(c, aa, .{ .status = 400, .reason = "Bad Request", .ctype = "text/plain; charset=utf-8", .body = "websocket upgrade rejected", .keep_alive = false });
                 return true;
             }
@@ -1721,10 +1897,12 @@ fn readAvailable(c: *Conn, aa: Allocator) bool {
             .SUCCESS => {
                 const count: usize = @intCast(rc);
                 if (count == 0) return false;
-                network_bytes_received +%= count;
+                _ = network_bytes_received.fetchAdd(count, .monotonic);
+                c.last_activity_ms = unixMillis();
                 c.awaiting_pong_since = null;
                 c.input.appendSlice(galloc, scratch[0..count]) catch return false;
-                if (c.input.items.len > MAX_WS_INPUT) return false;
+                const max_input = if (c.mode == .http) MAX_HTTP_INPUT else MAX_WS_INPUT;
+                if (c.input.items.len > max_input) return false;
             },
             .INTR => continue,
             .AGAIN => break,
@@ -1738,24 +1916,22 @@ fn readAvailable(c: *Conn, aa: Allocator) bool {
 }
 
 fn teardownConn(c: *Conn) void {
-    if (c.closing) return;
-    c.closing = true;
     _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_DEL, c.fd, null);
     _ = connections.remove(c.fd);
-    closeFd(c.fd);
 
     var arena = std.heap.ArenaAllocator.init(galloc);
     defer arena.deinit();
-    if (c.player) |p| {
-        const l = c.lobby.?;
-        feedDeath(l, p, arena.allocator());
-        detachPlayer(l, p);
-        destroyPlayer(p);
-    }
+    removeConnPlayer(c, arena.allocator());
 
-    c.input.deinit(galloc);
+    // No lobby can enqueue after removal. Serialize the final close with any
+    // write already in progress on the owning lobby thread.
+    c.output_mutex.lockUncancelable(g_io);
+    c.closing = true;
+    closeFd(c.fd);
+    for (c.output.items) |output| releasePending(output);
     c.output.deinit(galloc);
-    c.fragment.deinit(galloc);
+    c.output_mutex.unlock(g_io);
+    c.input.deinit(galloc);
     galloc.destroy(c);
 }
 
@@ -1772,7 +1948,7 @@ fn registerConn(fd: posix.fd_t) void {
         closeFd(fd);
         return;
     };
-    c.* = .{ .fd = fd };
+    c.* = .{ .fd = fd, .last_activity_ms = unixMillis() };
     connections.put(galloc, fd, c) catch {
         closeFd(fd);
         galloc.destroy(c);
@@ -1805,7 +1981,11 @@ fn serviceHeartbeats(now: i64, arena: Allocator) void {
     var connection_it = connections.valueIterator();
     while (connection_it.next()) |connection_ptr| {
         const c = connection_ptr.*;
-        if (c.poisoned) {
+        if (connPoisoned(c)) {
+            doomed.append(arena, c) catch {};
+            continue;
+        }
+        if (c.mode == .http and now - c.last_activity_ms > HTTP_IDLE_MS) {
             doomed.append(arena, c) catch {};
             continue;
         }
@@ -1817,7 +1997,7 @@ fn serviceHeartbeats(now: i64, arena: Allocator) void {
             }
         }
         if (now >= c.next_ping_ms) {
-            connEnqueueText(c, "2");
+            connEnqueueFrame(c, 0x9, "");
             c.awaiting_pong_since = now;
             c.next_ping_ms = now + PING_INTERVAL_MS;
         }
@@ -1829,14 +2009,10 @@ fn reactorLoop() void {
     var events: [256]linux.epoll_event = undefined;
     var arena = std.heap.ArenaAllocator.init(galloc);
     defer arena.deinit();
-    var next_tick = monoNanos() + @as(i64, @intCast(TICK_NS));
-    var next_heartbeat = unixMillis() + 1000;
+    var next_maintenance = unixMillis() + 1000;
 
-    while (!shutting_down) {
-        const before_wait = monoNanos();
-        const wait_ns = @max(0, next_tick - before_wait);
-        const timeout_ms: i32 = @intCast(@min(1000, @divTrunc(wait_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
-        const rc = linux.epoll_wait(epoll_fd, &events, events.len, timeout_ms);
+    while (!shutting_down.load(.acquire)) {
+        const rc = linux.epoll_wait(epoll_fd, &events, events.len, 1000);
         const ready: usize = switch (linux.errno(rc)) {
             .SUCCESS => @intCast(rc),
             .INTR => 0,
@@ -1854,21 +2030,17 @@ fn reactorLoop() void {
             var alive = (event.events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) == 0;
             if (alive and (event.events & linux.EPOLL.IN) != 0) alive = readAvailable(c, aa);
             if (alive and (event.events & linux.EPOLL.OUT) != 0) alive = flushOutput(c);
-            if (alive and c.poisoned) alive = false;
-            if (alive and c.close_after_write and c.output.items.len == c.output_offset) alive = false;
+            if (alive and connPoisoned(c)) alive = false;
+            if (alive and c.close_after_write and connOutputDrained(c)) alive = false;
             if (!alive) teardownConn(c);
         }
 
-        const now_ns = monoNanos();
-        if (now_ns >= next_tick) {
-            tickAll();
-            next_tick += @as(i64, @intCast(TICK_NS));
-            if (next_tick <= now_ns) next_tick = now_ns + @as(i64, @intCast(TICK_NS));
-        }
         const now_ms = unixMillis();
-        if (now_ms >= next_heartbeat) {
+        if (now_ms >= next_maintenance) {
             serviceHeartbeats(now_ms, aa);
-            next_heartbeat = now_ms + 1000;
+            reapIdleLobbies(now_ms);
+            rebalanceGameWorkers(now_ms, aa);
+            next_maintenance = now_ms + 1000;
         }
     }
 }
@@ -1885,7 +2057,7 @@ fn setSockOpts(fd: posix.fd_t) void {
 // ------------------------------------------------------------------ signals / main
 
 fn onSignal(_: posix.SIG) callconv(.c) void {
-    shutting_down = true;
+    shutting_down.store(true, .release);
     if (listen_fd >= 0) {
         _ = linux.shutdown(listen_fd, linux.SHUT.RDWR);
     }
@@ -1908,12 +2080,22 @@ fn installSignalHandlers() void {
     posix.sigaction(posix.SIG.INT, &term, null);
 }
 
+fn envUsize(environ: std.process.Environ, name: []const u8, fallback: usize, ceiling: usize) usize {
+    const raw = environ.getPosix(name) orelse return fallback;
+    const parsed = std.fmt.parseInt(usize, raw, 10) catch return fallback;
+    return std.math.clamp(parsed, 1, ceiling);
+}
+
 pub fn main(init: std.process.Init) !void {
     g_io = init.io;
     galloc = init.gpa;
-    tick_arena = std.heap.ArenaAllocator.init(galloc);
     debug_enabled = if (init.minimal.environ.getPosix("SNEK_DEBUG")) |v| std.mem.eql(u8, v, "1") else false;
     const port: u16 = if (init.minimal.environ.getPosix("PORT")) |v| (std.fmt.parseInt(u16, v, 10) catch 3000) else 3000;
+    max_players_global = envUsize(init.minimal.environ, "SNEK_MAX_PLAYERS", DEFAULT_MAX_PLAYERS_GLOBAL, 100_000);
+    max_players_per_lobby = envUsize(init.minimal.environ, "SNEK_MAX_PLAYERS_PER_LOBBY", DEFAULT_MAX_PLAYERS_PER_LOBBY, binary_snapshot.MAX_PLAYERS);
+    max_players_per_lobby = @min(max_players_per_lobby, max_players_global);
+    lobbies_per_worker = envUsize(init.minimal.environ, "SNEK_LOBBIES_PER_WORKER", DEFAULT_LOBBIES_PER_WORKER, 10_000);
+    lobby_idle_delete_ms = @intCast(envUsize(init.minimal.environ, "SNEK_LOBBY_IDLE_MS", @intCast(DEFAULT_LOBBY_IDLE_DELETE_MS), 24 * 60 * 60 * 1000));
 
     start_ms = unixMillis();
     const seed: u64 = @bitCast(monoNanos());
@@ -1947,15 +2129,53 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(0);
 }
 
-test "plain input parser accepts hot-path events and rejects malformed JSON" {
-    var values: [3][]const u8 = undefined;
-    const count = plainStringArray(" [ \"clientReady\" , \"player-one\" , \"12345\" ] ", &values);
-    try std.testing.expectEqual(@as(?usize, 3), count);
-    try std.testing.expectEqualStrings("clientReady", values[0]);
-    try std.testing.expectEqualStrings("player-one", values[1]);
-    try std.testing.expect(plainStringArray("[\"keyPress\",\"ArrowUp\"] trailing", &values) == null);
-    try std.testing.expect(plainStringArray("[\"keyPress\",42]", &values) == null);
-    try std.testing.expect(plainStringArray("[\"unterminated]", &values) == null);
+test {
+    _ = stats_json;
+    _ = worker_balance;
+}
+
+test "websocket headers use minimal RFC lengths" {
+    var header: [10]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 2), wsHeader(&header, 2, 17));
+    try std.testing.expectEqualSlices(u8, &.{ 0x82, 17 }, header[0..2]);
+    try std.testing.expectEqual(@as(usize, 4), wsHeader(&header, 2, 126));
+    try std.testing.expectEqualSlices(u8, &.{ 0x82, 126, 0, 126 }, header[0..4]);
+}
+
+test "color conversion clamps floating point edge values" {
+    try std.testing.expectEqual(@as(u8, 0), colorByte(-0.000_001));
+    try std.testing.expectEqual(@as(u8, 127), colorByte(0.5));
+    try std.testing.expectEqual(@as(u8, 255), colorByte(1.000_001));
+}
+
+test "binary client packets reject malformed and partial input" {
+    try std.testing.expect(websocket.clientPacket(&.{}) == null);
+    try std.testing.expect(websocket.clientPacket(&.{ 1, 5, 4, '1' }) == null);
+    try std.testing.expect(websocket.clientPacket(&.{ 1, 0, 1, 'x' }) == null);
+    try std.testing.expect(websocket.clientPacket(&.{2}) == null);
+    try std.testing.expect(websocket.clientPacket(&.{ 2, 4 }) == null);
+    try std.testing.expect(websocket.clientPacket(&.{3}) == null);
+    try std.testing.expect(websocket.clientPacket(&.{ 3, 2 }) == null);
+    try std.testing.expect(websocket.clientPacket(&.{ 3, 1, 0 }) == null);
+    try std.testing.expect(websocket.clientPacket(&.{ 4, 0 }) == null);
+    const joined = websocket.clientPacket(&.{ 1, 5, 4, '1', '2', '3', '4', '5', 'n', 'a', 'm', 'e' }).?;
+    try std.testing.expectEqualStrings("12345", joined.join.lobby_id);
+    try std.testing.expectEqualStrings("name", joined.join.username);
+    try std.testing.expectEqual(Direction.left, websocket.clientPacket(&.{ 2, 2 }).?.direction);
+    try std.testing.expectEqual(false, websocket.clientPacket(&.{ 3, 0 }).?.visibility);
+    try std.testing.expectEqual(true, websocket.clientPacket(&.{ 3, 1 }).?.visibility);
+}
+
+test "visibility hint throttles delivery and requires foreground resync" {
+    var connection = Conn{ .fd = -1 };
+    handleVisibility(&connection, false);
+    try std.testing.expect(connection.snapshot_hidden.load(.acquire));
+    try std.testing.expectEqual(@as(i64, 0), connection.next_background_snapshot_ms.load(.acquire));
+    try std.testing.expect(!connection.snapshot_needs_keyframe.load(.acquire));
+
+    handleVisibility(&connection, true);
+    try std.testing.expect(!connection.snapshot_hidden.load(.acquire));
+    try std.testing.expect(connection.snapshot_needs_keyframe.load(.acquire));
 }
 
 test "compact roster and tick preserve world information" {
@@ -1971,9 +2191,56 @@ test "compact roster and tick preserve world information" {
     try player.snake.append(galloc, .{ .x = 32, .y = 48 });
     var lobby = Lobby{ .id = @constCast("test"), .food = .{ .x = 0, .y = 0 } };
     defer lobby.players.deinit(galloc);
-    defer lobby.wire.deinit(galloc);
+    defer lobby.roster_wire.deinit(galloc);
     try lobby.players.put(galloc, player.id, &player);
 
-    try std.testing.expectEqualStrings("42[\"r\",[[\"sid\",\"name\",\"#abcdef\"]]]", try buildRoster(&lobby));
-    try std.testing.expectEqualStrings("42[\"tick\",[[[0,1,[2,3]]],[],[],null]]", try buildGameTick(&lobby, 0));
+    try std.testing.expectEqualStrings("[\"r\",[[\"sid\",\"name\",\"#abcdef\"]]]", try buildRoster(&lobby));
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(galloc);
+    const result = try binary_snapshot.build(&wire, &lobby, 0, galloc);
+    try std.testing.expectEqual(binary_snapshot.Kind.keyframe, result.kind);
+    try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', 2, 0 }, result.bytes[0..4]);
+}
+
+test "shared keyframe coalescing preserves partial frames and controls" {
+    galloc = std.testing.allocator;
+    defer drainSnapshotPool();
+    var connection = Conn{ .fd = -1 };
+    defer connection.output.deinit(galloc);
+
+    const partial = acquireSharedFrame().?;
+    partial.keyframe = false;
+    try partial.payload.appendSlice(galloc, "delta-a");
+    partial.header_len = @intCast(wsHeader(&partial.header, 0x2, partial.payload.items.len));
+    const stale = acquireSharedFrame().?;
+    stale.keyframe = false;
+    try stale.payload.appendSlice(galloc, "delta-b");
+    stale.header_len = @intCast(wsHeader(&stale.header, 0x2, stale.payload.items.len));
+    const fresh = acquireSharedFrame().?;
+    fresh.keyframe = true;
+    try fresh.payload.appendSlice(galloc, "keyframe");
+    fresh.header_len = @intCast(wsHeader(&fresh.header, 0x2, fresh.payload.items.len));
+
+    try std.testing.expect(appendSharedOutput(&connection, partial, 3));
+    try std.testing.expect(appendSharedOutput(&connection, stale, 0));
+    try std.testing.expect(appendOwnedOutput(&connection, "control", ""));
+    try std.testing.expect(appendSharedOutput(&connection, fresh, 0));
+
+    try std.testing.expectEqual(@as(usize, 3), connection.output.items.len);
+    try std.testing.expectEqual(@as(usize, 3), connection.output_offset);
+    try std.testing.expect(connection.output.items[0].shared == partial);
+    try std.testing.expectEqualStrings("control", connection.output.items[1].owned);
+    try std.testing.expect(connection.output.items[2].shared == fresh);
+    try std.testing.expectEqual(partial.len() - 3 + "control".len + fresh.len(), connection.output_bytes);
+
+    for (connection.output.items) |output| releasePending(output);
+    connection.output.clearRetainingCapacity();
+    releaseSharedFrame(partial);
+    releaseSharedFrame(stale);
+    releaseSharedFrame(fresh);
+    try std.testing.expectEqual(@as(usize, 3), snapshot_pool.items.len);
+    const reused = acquireSharedFrame().?;
+    try std.testing.expectEqual(@as(usize, 2), snapshot_pool.items.len);
+    releaseSharedFrame(reused);
+    try std.testing.expectEqual(@as(usize, 3), snapshot_pool.items.len);
 }

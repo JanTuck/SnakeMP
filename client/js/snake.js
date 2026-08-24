@@ -1,47 +1,102 @@
 export default class Snake {
-    constructor(ctx, data, compact = false) {
+    constructor(ctx, meta) {
         this.scale = 16;
         this.ctx = ctx;
         this.canvas = ctx.canvas;
         this.snake = [];
         this.prevSnake = [];
-        if (compact) this.updateCompact(data[0], data[1]);
-        else this.update(data);
+        this.id = meta[0];
+        this.displayName = meta[1];
+        this.color = meta[2];
+        this.score = 0;
+        this.bodyLength = 0;
+        this.interpolate = false;
+        // New snakes are visually oriented right before their first move.
+        this.heading = "ArrowRight";
     }
 
-    // Refresh the mutable state of an already existing snake. The previous
-    // cell array is kept so the renderer can interpolate between ticks.
-    update(data) {
-        this.prevSnake = this.snake;
-        this.color = data.color;
-        this.snake = data.snake;
-        this.id = data.id;
-        this.displayName = data.displayName;
-        this.bodyLength = data.bodyLength;
-        this.score = data.score;
-    }
-
-    // Compact wire update. Reuse two cell-object buffers so a tick allocates
-    // only the arrays produced by JSON.parse; interpolation still has both
-    // the previous and current coordinates.
-    updateCompact(meta, row) {
+    // Commit a fully validated v2 absolute keyframe. Packed paths store the
+    // head followed by 2-bit directions toward the tail.
+    updateKeyframe(meta, view, player) {
         const next = this.prevSnake;
         this.prevSnake = this.snake;
         this.snake = next;
-        const coords = row[2];
-        const cells = coords.length >> 1;
-        this.snake.length = cells;
-        for (let i = 0, c = 0; c < cells; c++, i += 2) {
-            let cell = this.snake[c];
-            if (cell === undefined) cell = this.snake[c] = { x: 0, y: 0 };
-            cell.x = coords[i] * this.scale;
-            cell.y = coords[i + 1] * this.scale;
+        this.snake.length = player.cells;
+        let offset = player.bodyOffset;
+        let x = 0, y = 0;
+        if (player.packed) {
+            x = view.getUint8(offset++);
+            y = view.getUint8(offset++);
+        }
+        for (let index = 0; index < player.cells; index++) {
+            let cell = this.snake[index];
+            if (cell === undefined) cell = this.snake[index] = { x: 0, y: 0 };
+            if (player.packed) {
+                if (index !== 0) {
+                    const direction = (view.getUint8(offset + ((index - 1) >> 2)) >> (((index - 1) & 3) * 2)) & 3;
+                    if (direction === 0) y--; else if (direction === 1) y++;
+                    else if (direction === 2) x--; else x++;
+                }
+                cell.x = x * this.scale;
+                cell.y = y * this.scale;
+            } else {
+                cell.x = view.getUint8(offset++) * this.scale;
+                cell.y = view.getUint8(offset++) * this.scale;
+            }
+        }
+        const head = this.snake[0];
+        const previousHead = this.prevSnake[0];
+        let dx = previousHead === undefined || head === undefined ? 0 : head.x - previousHead.x;
+        let dy = previousHead === undefined || head === undefined ? 0 : head.y - previousHead.y;
+        // The neck also reveals heading when there is no previous moving frame.
+        if (dx === 0 && dy === 0 && player.cells > 1) {
+            dx = head.x - this.snake[1].x;
+            dy = head.y - this.snake[1].y;
+        }
+        if (Math.abs(dx) > Math.abs(dy)) this.heading = dx < 0 ? "ArrowLeft" : "ArrowRight";
+        else if (dy !== 0) this.heading = dy < 0 ? "ArrowUp" : "ArrowDown";
+        this.id = meta[0];
+        this.displayName = meta[1];
+        this.color = meta[2];
+        this.score = player.score;
+        this.bodyLength = player.cells;
+        // A recovery keyframe may jump several cells after dropped deltas;
+        // interpolate only an adjacent (or unchanged) authoritative update.
+        this.interpolate = Math.abs(dx) + Math.abs(dy) <= this.scale;
+    }
+
+    // Commit one validated delta. Body transitions are deterministic shifts,
+    // so only the new head crosses the wire even for very long snakes.
+    updateDelta(meta, player) {
+        if (player.mode !== 0) {
+            const old = this.snake;
+            const next = this.prevSnake;
+            this.prevSnake = old;
+            this.snake = next;
+            this.snake.length = player.cells;
+            let head = this.snake[0];
+            if (head === undefined) head = this.snake[0] = { x: 0, y: 0 };
+            head.x = player.headX * this.scale;
+            head.y = player.headY * this.scale;
+            for (let index = 1; index < player.cells; index++) {
+                let cell = this.snake[index];
+                if (cell === undefined) cell = this.snake[index] = { x: 0, y: 0 };
+                cell.x = old[index - 1].x;
+                cell.y = old[index - 1].y;
+            }
+            const dx = this.snake[0].x - old[0].x;
+            const dy = this.snake[0].y - old[0].y;
+            if (Math.abs(dx) > Math.abs(dy)) this.heading = dx < 0 ? "ArrowLeft" : "ArrowRight";
+            else if (dy !== 0) this.heading = dy < 0 ? "ArrowUp" : "ArrowDown";
+            this.interpolate = true;
+        } else {
+            this.interpolate = false;
         }
         this.id = meta[0];
         this.displayName = meta[1];
         this.color = meta[2];
-        this.score = row[0];
-        this.bodyLength = row[1];
+        this.score = player.score;
+        this.bodyLength = player.cells;
     }
     setDirection(direction) {
         // Direction is authoritative on the server; kept for future use.
@@ -63,7 +118,7 @@ export default class Snake {
     // t in [0, 1]: interpolation between the previous and current tick.
     draw(t) {
         const cur = this.snake;
-        const prev = this.prevSnake !== undefined && this.prevSnake.length > 0 ? this.prevSnake : cur;
+        const prev = this.interpolate && this.prevSnake !== undefined && this.prevSnake.length > 0 ? this.prevSnake : cur;
         const ctx = this.ctx;
         const s = this.scale;
 
