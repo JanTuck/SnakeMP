@@ -62,8 +62,9 @@ pub fn checkUsername(raw: []const u8) UsernameCheck {
 }
 
 test "username validation accepts long Unicode names within wire bounds" {
-    try std.testing.expect(checkUsername("x").ok);
-    try std.testing.expect(checkUsername("界").ok);
+    try std.testing.expect(!checkUsername("x").ok);
+    try std.testing.expect(!checkUsername("界界").ok);
+    try std.testing.expect(checkUsername("界界界").ok);
     try std.testing.expect(checkUsername("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-").ok);
     try std.testing.expect(!checkUsername("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-x").ok);
     try std.testing.expect(!checkUsername("😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀").ok);

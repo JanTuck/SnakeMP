@@ -243,7 +243,15 @@ function game(overrides = {}) {
   const page = game();
   page.elements.username.value = 'x';
   page.form.fire('submit', submitEvent());
-  assert.deepEqual(page.emitted, [['clientReady', 'x', 'room seven', '']], 'single-character names are valid');
+  assert.equal(page.emitted.length, 0, 'names below three characters never reach transport');
+  assert.equal(page.elements.username.validityReported, true);
+}
+
+{
+  const page = game();
+  page.elements.username.value = 'xyz';
+  page.form.fire('submit', submitEvent());
+  assert.deepEqual(page.emitted, [['clientReady', 'xyz', 'room seven', '']], 'three-character names are valid');
 }
 
 {
