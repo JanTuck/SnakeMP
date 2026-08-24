@@ -256,25 +256,47 @@ function game(overrides = {}) {
 
 {
   const page = game();
-  page.elements.username.value = 'x'.repeat(65);
+  page.elements.username.value = 'Player 1_-';
   page.form.fire('submit', submitEvent());
-  assert.equal(page.emitted.length, 0, 'names over 64 code points never reach transport');
+  assert.equal(page.emitted.length, 1, 'four non-letter characters are valid');
+}
+
+{
+  const page = game();
+  page.elements.username.value = 'Player 12_-';
+  page.form.fire('submit', submitEvent());
+  assert.equal(page.emitted.length, 0, 'a fifth non-letter character never reaches transport');
+  assert.equal(page.elements.username.validityReported, true);
+}
+
+{
+  const page = game();
+  page.elements.username.value = 'عربيّّّّّ';
+  page.form.fire('submit', submitEvent());
+  assert.equal(page.emitted.length, 0, 'combining-mark floods count toward the non-letter cap');
+}
+
+{
+  const page = game();
+  page.elements.username.value = 'x'.repeat(25);
+  page.form.fire('submit', submitEvent());
+  assert.equal(page.emitted.length, 0, 'names over 24 code points never reach transport');
   assert.equal(page.elements.username.validityReported, true);
   assert.equal(page.button.disabled, false);
 }
 
 {
   const page = game();
-  page.elements.username.value = '😀'.repeat(63);
+  page.elements.username.value = '界'.repeat(24);
   page.form.fire('submit', submitEvent());
-  assert.equal(page.emitted.length, 1, 'a 252-byte Unicode name fits the wire field');
+  assert.equal(page.emitted.length, 1, '24 Unicode letters fit the name limit');
 }
 
 {
   const page = game();
-  page.elements.username.value = '😀'.repeat(64);
+  page.elements.username.value = '界'.repeat(25);
   page.form.fire('submit', submitEvent());
-  assert.equal(page.emitted.length, 0, 'names over the one-byte UTF-8 wire limit never reach transport');
+  assert.equal(page.emitted.length, 0, '25 Unicode letters exceed the name limit');
   assert.equal(page.elements.username.validityReported, true);
 }
 

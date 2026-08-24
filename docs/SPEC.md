@@ -75,8 +75,10 @@ At 12,000 players the tested configuration used 750 lobbies of 16 players and
 ## Join and connection lifecycle
 
 The join fields are UTF-8 byte strings in client binary packet type 1. The
-username is trimmed, must be 3..64 Unicode code points and at most 255 UTF-8 bytes, accepts ASCII letters,
+username is trimmed, must be 3..24 Unicode code points and at most 255 UTF-8 bytes, accepts ASCII letters,
 digits, underscore, hyphen, and space, and permits valid non-ASCII code points.
+At most four code points may be anything other than a Unicode letter; this
+includes digits, spaces, combining marks, bidi controls, symbols, and emoji.
 Invalid data produces
 `["game_error","Invalid username"]`; an unknown lobby or failed password
 authentication produces the same generic

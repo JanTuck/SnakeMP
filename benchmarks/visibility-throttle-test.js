@@ -61,7 +61,7 @@ socket.on('message', (data, isBinary) => {
   });
   await waitUntil(() => identified, 1_000, 'server identity');
   socket.send(Buffer.from([3, 1]));
-  // Production usernames are capped at 64 code points. Keep the regression
+  // Production usernames are capped at 24 code points. Keep the regression
   // identity valid even on hosts with long process ids.
   socket.send(joinPacket(`v-${process.pid}`.slice(0, 16), '12345'));
   await waitUntil(() => frames.some((frame) => frame.kind === 0), 2_000, 'initial keyframe');

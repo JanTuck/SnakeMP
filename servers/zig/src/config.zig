@@ -28,8 +28,9 @@ pub const MAX_LOBBY_PASSWORD_BYTES: usize = 64;
 /// Display names are counted as Unicode code points, with the independent
 /// byte ceiling inherited from the one-byte WebSocket field length.
 pub const MIN_USERNAME_CODEPOINTS: usize = 3;
-pub const MAX_USERNAME_CODEPOINTS: usize = 64;
+pub const MAX_USERNAME_CODEPOINTS: usize = 24;
 pub const MAX_USERNAME_BYTES: usize = 255;
+pub const MAX_USERNAME_NON_LETTERS: usize = 4;
 
 pub const BONUS_CAP: usize = 12;
 pub const DROP_MAX: usize = 2;

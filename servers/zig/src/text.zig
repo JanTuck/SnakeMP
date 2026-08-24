@@ -4,6 +4,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const json = @import("json.zig");
+const unicode_letters = @import("unicode_letters.zig");
 
 const Allocator = std.mem.Allocator;
 const Buf = json.Buf;
@@ -43,6 +44,7 @@ pub fn checkUsername(raw: []const u8) UsernameCheck {
     const trimmed = jsTrim(raw);
     if (trimmed.len > config.MAX_USERNAME_BYTES) return .{ .ok = false, .trimmed = trimmed };
     var count: usize = 0;
+    var non_letters: usize = 0;
     var index: usize = 0;
     while (index < trimmed.len) {
         const len = std.unicode.utf8ByteSequenceLength(trimmed[index]) catch return .{ .ok = false, .trimmed = trimmed };
@@ -52,6 +54,10 @@ pub fn checkUsername(raw: []const u8) UsernameCheck {
             (cp >= '0' and cp <= '9') or (cp >= 'A' and cp <= 'Z') or
             (cp >= 'a' and cp <= 'z') or cp >= 0x80;
         if (!allowed) return .{ .ok = false, .trimmed = trimmed };
+        if (!unicode_letters.isLetter(cp)) {
+            non_letters += 1;
+            if (non_letters > config.MAX_USERNAME_NON_LETTERS) return .{ .ok = false, .trimmed = trimmed };
+        }
         count += 1;
         index += len;
     }
@@ -65,10 +71,16 @@ test "username validation accepts long Unicode names within wire bounds" {
     try std.testing.expect(!checkUsername("x").ok);
     try std.testing.expect(!checkUsername("界界").ok);
     try std.testing.expect(checkUsername("界界界").ok);
-    try std.testing.expect(checkUsername("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-").ok);
-    try std.testing.expect(!checkUsername("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-x").ok);
+    try std.testing.expect(checkUsername("abcdefghijklmnopqrstuvwx").ok);
+    try std.testing.expect(!checkUsername("abcdefghijklmnopqrstuvwxy").ok);
     try std.testing.expect(!checkUsername("😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀").ok);
     try std.testing.expect(!checkUsername("bad.name").ok);
+    try std.testing.expect(checkUsername("abc 1_-").ok);
+    try std.testing.expect(!checkUsername("abc 12_-").ok);
+    try std.testing.expect(checkUsername("abc😀😀😀😀").ok);
+    try std.testing.expect(!checkUsername("abc😀😀😀😀😀").ok);
+    try std.testing.expect(checkUsername("Καλημέρα").ok);
+    try std.testing.expect(!checkUsername("عربيّّّّّ").ok);
     try std.testing.expectEqualStrings("trimmed", checkUsername("  trimmed  ").trimmed);
 }
 
