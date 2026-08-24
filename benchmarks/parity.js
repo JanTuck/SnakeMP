@@ -1,8 +1,8 @@
 /* Parity harness: verifies any Snek server implementation against the spec.
- * Usage: PARITY_BASE=http://127.0.0.1:4100 node tools/parity.js
- * Exit code 0 = parity. Run against the reference (node app.js) first.
+ * Usage: PARITY_BASE=http://127.0.0.1:4100 node benchmarks/parity.js
+ * Exit code 0 = parity. Run against the Node reference first.
  */
-const io = require('/home/jantuck/Documents/Projects/SnakeMP/node_modules/socket.io-client');
+const io = require('socket.io-client');
 const http = require('http');
 
 // Node 22 ships a global WebSocket (undici) that engine.io-client prefers but
@@ -65,6 +65,14 @@ const moved = (samples, axis, sign) => {
   // ---- HTTP surface ----
   const home = await get('/');
   check('GET / serves index', home.status === 200 && home.body.includes('Snek'), 'status=' + home.status);
+  const lobbyPage = await get('/lobby.html');
+  check('GET /lobby.html serves shared client', lobbyPage.status === 200 && lobbyPage.body.includes('Lobby'), 'status=' + lobbyPage.status);
+  const clientScript = await get('/js/rendering.js');
+  check('GET /js/rendering.js serves shared client', clientScript.status === 200 && clientScript.body.length > 100, 'status=' + clientScript.status);
+  const socketClient = await get('/socket.io/socket.io.js');
+  check('GET /socket.io/socket.io.js serves embedded vendor bundle', socketClient.status === 200 && socketClient.body.length > 1000, 'status=' + socketClient.status);
+  const gsap = await get('/vendor/gsap.min.js');
+  check('GET /vendor/gsap.min.js serves embedded vendor bundle', gsap.status === 200 && gsap.body.length > 1000, 'status=' + gsap.status);
   const created = await post('/generateid');
   const loc = String(created.headers.location || '');
   check('POST /generateid -> 303 /game/<id>', created.status === 303 && /\/game\/.+/.test(loc), loc);

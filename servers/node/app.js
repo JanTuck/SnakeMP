@@ -1,15 +1,14 @@
 const createError = require('http-errors');
-const CONSTANTS = require("./server/constants");
+const CONSTANTS = require("./src/constants");
 const express = require('express');
 const path = require('path');
-const cookieParser = require('cookie-parser');
 const logger = require('morgan');
-const Player = require('./server/player');
-const uniqueId = require('./server/generateId');
+const Player = require('./src/player');
+const uniqueId = require('./src/generateId');
 const color = require('rcolor');
-const Environment = require("./server/environment");
-const Food = require("./server/food");
-const InputValidation = require("./server/inputvalidation");
+const Environment = require("./src/environment");
+const Food = require("./src/food");
+const InputValidation = require("./src/inputvalidation");
 
 const app = express();
 
@@ -36,12 +35,11 @@ app.use((req, res, next) => {
 app.use(logger('dev'));
 app.use(express.urlencoded({extended: false}));
 app.use(express.json());
-app.use(cookieParser());
 app.use(express.static(path.join(__dirname, "public")));
-app.use('/vendor', express.static(path.join(__dirname, 'node_modules', 'gsap', 'dist')));
+const sharedClient = path.join(__dirname, '..', '..', 'client');
 
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'client', 'index.html'));
+    res.sendFile(path.join(sharedClient, 'index.html'));
 });
 app.post('/generateid', (req, res) => {
     let gameId;
@@ -67,7 +65,7 @@ app.post('/joingame', (req, res) => {
 
 app.get('/game/:id', (req, res) => {
     if (lobbies.has(req.params.id))
-        res.sendFile(path.join(__dirname, 'client', 'game.html'));
+        res.sendFile(path.join(sharedClient, 'game.html'));
     else
         res.redirect('/');
 });
@@ -76,7 +74,7 @@ app.get('/game/:id', (req, res) => {
 app.get('/game.html', (req, res) => {
     res.redirect('/');
 });
-app.use(express.static(path.join(__dirname, 'client')));
+app.use(express.static(sharedClient));
 
 // Optional debug endpoint for benchmarking; never on in normal deployments.
 if (process.env.SNEK_DEBUG === '1') {

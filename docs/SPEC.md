@@ -1,13 +1,12 @@
 # Snek server specification (parity target)
 
-All language ports (server-rust, server-zig, server-go, server-bun) implement
-this spec. The reference implementation is the Node server in `server/` +
-`app.js`. When in doubt, match observable behaviour, not implementation.
+All implementations under `servers/` implement this spec. The reference is
+`servers/node/`. When in doubt, match observable behaviour, not implementation.
 
 ## Runtime model
 
 - Game tick: **every 66.67ms (15fps)**. One master timer iterates all lobbies.
-- Board: 1920x900 logical units; grid cell = **16px**; grid is **120 x 60** cells.
+- Board: 1920x960 logical units; grid cell = **16px**; grid is **120 x 60** cells.
 - Movement: 16px per tick in the current direction. A snake is an array of
   cells `{x, y}` (multiples of 16), index 0 = head.
 - A stationary snake (no input yet) does not move and cannot die.
@@ -120,7 +119,7 @@ Each tick: if pendingGrowth > 0, keep the tail (pendingGrowth--) else pop it.
 - `POST /generateid` -> 303 to /game/<new id> (creates lobby)
 - `POST /joingame` (form urlencoded gameId) -> 303 /game/<id> or 303 /?error=unknown-game
 - Static: /css/*, /js/*, /img/*, /vendor/gsap.min.js, /socket.io/socket.io.js
-  (all embedded from client/ + node_modules assets).
+  (all sourced from the canonical `client/` tree and embedded where applicable).
 - `GET /debug/stats` -> JSON: {"rss": bytes, "uptime": s, "totalPlayers": n,
   "lobbies": [{"id","players","drops","bonus","golden","lastTickMs","avgTickMs","maxTickMs"}...]}
 - Security headers on HTTP responses: X-Content-Type-Options: nosniff,

@@ -1,19 +1,30 @@
 /* Battle/benchmark harness for any Snek server implementation.
- * Usage: BENCH_BASE=http://127.0.0.1:PORT BENCH_NAME=rust node tools/bench.js
+ * Usage: BENCH_BASE=http://127.0.0.1:PORT BENCH_NAME=rust node benchmarks/bench.js
  * Requires the target to run with SNEK_DEBUG=1 (for /debug/stats).
  * Writes .scratch/bench-<name>.json with all collected metrics.
  */
-const io = require('/home/jantuck/Documents/Projects/SnakeMP/node_modules/socket.io-client');
+const path = require('path');
+const io = require('socket.io-client');
 const http = require('http');
 const fs = require('fs');
 
 const BASE = process.env.BENCH_BASE || 'http://127.0.0.1:4000';
 const NAME = process.env.BENCH_NAME || 'server';
+const REPETITIONS = Math.max(1, Number(process.env.BENCH_REPETITIONS || 3));
+const WARMUP_MS = Math.max(1000, Number(process.env.BENCH_WARMUP_MS || 5000));
+const SAMPLE_MS = Math.max(2000, Number(process.env.BENCH_SAMPLE_MS || 6000));
 const wait = (ms) => new Promise(r => setTimeout(r, ms));
 const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0; };
 const avg = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
 const max = (arr) => arr.length ? Math.max(...arr) : 0;
-const metrics = { name: NAME, base: BASE, phases: {} };
+const metrics = {
+  name: NAME,
+  base: BASE,
+  repetitions: REPETITIONS,
+  warmupMs: WARMUP_MS,
+  sampleMs: SAMPLE_MS,
+  phases: {},
+};
 
 try { delete globalThis.WebSocket; } catch (e) {}
 
@@ -59,11 +70,11 @@ async function cadence(obs, ms) {
   await wait(ms);
   return { deltas: obs.deltas.slice(d0), bytes: obs.bytes.slice(b0) };
 }
-function makeBot(i) {
-  const state = { alive: false };
+function makeBot(i, lobbyId) {
+  const state = { alive: false, packets: 0, bytes: 0 };
   const s = io(BASE, { transports: ['websocket'], forceNew: true });
   state.socket = s;
-  const joinOnce = () => { s.emit('clientReady', 'bot-' + i + '-' + (Date.now() % 100000), '12345'); state.alive = true; };
+  const joinOnce = () => { s.emit('clientReady', 'bot-' + i + '-' + (Date.now() % 100000), lobbyId || '12345'); state.alive = true; };
   const walk = setInterval(() => {
     if (!state.alive) return;
     const dirs = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
@@ -72,8 +83,48 @@ function makeBot(i) {
   s.on('connect', joinOnce);
   s.on('death', () => { state.alive = false; setTimeout(joinOnce, 400); });
   s.on('disconnect', () => { state.alive = false; });
+  s.on('gameTick', (world) => {
+    state.packets++;
+    state.bytes += Buffer.byteLength(JSON.stringify(world));
+  });
   state.close = () => { clearInterval(walk); s.close(); };
   return state;
+}
+
+async function connectionBench(total, concurrency) {
+  const latencies = [];
+  const sockets = [];
+  let next = 0;
+  const started = Date.now();
+  async function worker() {
+    while (next < total) {
+      next++;
+      const t0 = performance.now();
+      try {
+        const socket = await connect();
+        latencies.push(performance.now() - t0);
+        sockets.push(socket);
+      } catch {
+        latencies.push(-1);
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(concurrency, total) }, worker));
+  const elapsedMs = Date.now() - started;
+  for (const socket of sockets) socket.close();
+  return {
+    attempts: total,
+    connected: sockets.length,
+    failed: total - sockets.length,
+    elapsedMs,
+    connectionsPerSec: sockets.length / (elapsedMs / 1000),
+    latenciesMs: latencies.filter((value) => value >= 0),
+  };
+}
+
+function clientCpu(startUsage, elapsedMs) {
+  const used = process.cpuUsage(startUsage);
+  return (used.user + used.system) / (elapsedMs * 1000) * 100;
 }
 function httpBench(path, method, body, total, conc) {
   return new Promise((resolve) => {
@@ -97,29 +148,100 @@ function httpBench(path, method, body, total, conc) {
   });
 }
 
+async function ensureLobbies(nLobbies) {
+  const ids = ['12345'];
+  while (ids.length < nLobbies) {
+    const loc = await new Promise((resolve) => {
+      const req = http.request(BASE + '/generateid', { method: 'POST' }, (res) => {
+        res.resume(); res.on('end', () => resolve(String(res.headers.location || '')));
+      });
+      req.on('error', () => resolve(''));
+      req.end();
+    });
+    if (!loc) break;
+    ids.push(decodeURIComponent(loc.split('/').pop()));
+  }
+  return ids;
+}
+
 (async () => {
   metrics.rssStart = (await getStats())?.rss ?? null;
+  metrics.phases.idle = { stats: await getStats() };
   const obs = makeObserver();
   await new Promise((r, j) => { obs.socket.on('connect', r); obs.socket.on('connect_error', j); obs.socket.on('disconnect', () => {}); });
-  await wait(400);
+  await wait(WARMUP_MS); // identical runtime/JIT warm-up for every implementation
 
   // A: baseline cadence
-  const base = await cadence(obs, 5000);
-  metrics.phases.baseline = { deltas: base.deltas, bytes: base.bytes };
+  const baselineRuns = [];
+  for (let rep = 0; rep < REPETITIONS; rep++) {
+    baselineRuns.push(await cadence(obs, SAMPLE_MS));
+  }
+  const base = {
+    deltas: baselineRuns.flatMap((run) => run.deltas),
+    bytes: baselineRuns.flatMap((run) => run.bytes),
+    runs: baselineRuns,
+  };
+  metrics.phases.baseline = base;
   console.log('A baseline: ' + JSON.stringify({ avg: avg(base.deltas).toFixed(1), p95: pct(base.deltas, 0.95), max: max(base.deltas), n: base.deltas.length }));
+
+  // A2: connection establishment is intentionally separate from steady-state load.
+  const connectionRuns = [];
+  for (let rep = 0; rep < REPETITIONS; rep++) {
+    connectionRuns.push(await connectionBench(100, 25));
+    await wait(500);
+  }
+  metrics.phases.connections = {
+    runs: connectionRuns,
+    latenciesMs: connectionRuns.flatMap((run) => run.latenciesMs),
+    connectionRates: connectionRuns.map((run) => run.connectionsPerSec),
+    failed: connectionRuns.reduce((sum, run) => sum + run.failed, 0),
+  };
 
   // B: load ramp
   metrics.phases.ramp = {};
   for (const N of [5, 10, 20, 40, 80]) {
-    const bots = [];
-    for (let i = 0; i < N; i++) bots.push(makeBot(i + N * 1000));
-    await wait(6000); // join, walk, die, rejoin - reach rough steady state
-    const run = await cadence(obs, 6000);
-    const st = await getStats();
-    metrics.phases.ramp[N] = { deltas: run.deltas, bytes: run.bytes, players: st?.totalPlayers ?? null, rss: st?.rss ?? null, lobbies: st?.lobbies ?? null };
-    console.log('B ' + N + ' bots: ' + JSON.stringify({ avg: avg(run.deltas).toFixed(1), p95: pct(run.deltas, 0.95), max: max(run.deltas), payloadAvg: Math.round(avg(run.bytes)), payloadMax: max(run.bytes), players: st?.totalPlayers, rssKb: st ? Math.round(st.rss / 1024) : null }));
-    for (const b of bots) b.close();
-    await wait(800);
+    const runs = [];
+    for (let rep = 0; rep < REPETITIONS; rep++) {
+      const lobbies = await ensureLobbies(Math.ceil((N + 1) / 16));
+      const bots = [];
+      for (let i = 0; i < N; i++) bots.push(makeBot(i + N * 1000 + rep * 100000, lobbies[i % lobbies.length]));
+      await wait(WARMUP_MS);
+      const packetStart = bots.reduce((sum, bot) => sum + bot.packets, 0);
+      const byteStart = bots.reduce((sum, bot) => sum + bot.bytes, 0);
+      const cpuStart = process.cpuUsage();
+      const wallStart = Date.now();
+      const sample = await cadence(obs, SAMPLE_MS);
+      const elapsedMs = Date.now() - wallStart;
+      const packets = bots.reduce((sum, bot) => sum + bot.packets, 0) - packetStart;
+      const bytes = bots.reduce((sum, bot) => sum + bot.bytes, 0) - byteStart;
+      const st = await getStats();
+      runs.push({
+        ...sample,
+        elapsedMs,
+        packets,
+        messageRate: packets / (elapsedMs / 1000),
+        byteRate: bytes / (elapsedMs / 1000),
+        clientCpuPct: clientCpu(cpuStart, elapsedMs),
+        players: st?.totalPlayers ?? null,
+        rss: st?.rss ?? null,
+        lobbies: st?.lobbies ?? null,
+      });
+      for (const bot of bots) bot.close();
+      await wait(800);
+    }
+    metrics.phases.ramp[N] = {
+      runs,
+      deltas: runs.flatMap((run) => run.deltas),
+      bytes: runs.flatMap((run) => run.bytes),
+      players: Math.round(avg(runs.map((run) => run.players || 0))),
+      rss: Math.round(avg(runs.map((run) => run.rss || 0))),
+      messageRate: avg(runs.map((run) => run.messageRate)),
+      byteRate: avg(runs.map((run) => run.byteRate)),
+      clientCpuPct: max(runs.map((run) => run.clientCpuPct)),
+      lobbies: runs.at(-1)?.lobbies ?? null,
+    };
+    const run = metrics.phases.ramp[N];
+    console.log('B ' + N + ' bots: ' + JSON.stringify({ avg: avg(run.deltas).toFixed(1), p95: pct(run.deltas, 0.95), messagesPerSec: Math.round(run.messageRate), clientCpuPct: run.clientCpuPct.toFixed(1), players: run.players, rssKb: Math.round(run.rss / 1024) }));
   }
 
   // C: input latency
@@ -128,8 +250,9 @@ function httpBench(path, method, body, total, conc) {
   bot.on('death', () => setTimeout(() => bot.emit('clientReady', 'latency-bot', '12345'), 300));
   await wait(400);
   const latencies = [];
-  for (let i = 0; i < 20; i++) {
-    const dir = i % 2 === 0 ? 'ArrowRight' : 'ArrowLeft';
+  const latencyDirections = ['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp'];
+  for (let i = 0; i < 60 && latencies.length < 30; i++) {
+    const dir = latencyDirections[i % latencyDirections.length];
     const before = await new Promise((r) => {
       const h = (w) => { const me = (w.players || []).find(p => p.id === bot.id); if (me) { obs.socket.off('gameTick', h); r(me.snake[0]); } };
       obs.socket.on('gameTick', h);
@@ -183,10 +306,19 @@ function httpBench(path, method, body, total, conc) {
   h.close();
 
   // F: HTTP
-  const home = await httpBench('/', 'GET', null, 300, 50);
-  const joinB = await httpBench('/joingame', 'POST', 'gameId=12345', 300, 50);
-  metrics.phases.http = { home: { avgMs: avg(home.lat), p95Ms: pct(home.lat, 0.95), fails: home.fail }, join: { avgMs: avg(joinB.lat), p95Ms: pct(joinB.lat, 0.95), fails: joinB.fail } };
-  console.log('F http: ' + JSON.stringify(metrics.phases.http));
+  const httpRuns = { home: [], join: [] };
+  for (let rep = 0; rep < REPETITIONS; rep++) {
+    httpRuns.home.push(await httpBench('/', 'GET', null, 300, 50));
+    httpRuns.join.push(await httpBench('/joingame', 'POST', 'gameId=12345', 300, 50));
+  }
+  const homeLat = httpRuns.home.flatMap((run) => run.lat);
+  const joinLat = httpRuns.join.flatMap((run) => run.lat);
+  metrics.phases.http = {
+    runs: httpRuns,
+    home: { avgMs: avg(homeLat), p50Ms: pct(homeLat, 0.50), p95Ms: pct(homeLat, 0.95), p99Ms: pct(homeLat, 0.99), fails: httpRuns.home.reduce((n, run) => n + run.fail, 0) },
+    join: { avgMs: avg(joinLat), p50Ms: pct(joinLat, 0.50), p95Ms: pct(joinLat, 0.95), p99Ms: pct(joinLat, 0.99), fails: httpRuns.join.reduce((n, run) => n + run.fail, 0) },
+  };
+  console.log('F http: ' + JSON.stringify({ home: metrics.phases.http.home, join: metrics.phases.http.join }));
 
   metrics.rssEnd = (await getStats())?.rss ?? null;
   const alive = await get('/');
@@ -194,7 +326,7 @@ function httpBench(path, method, body, total, conc) {
   console.log('SERVER alive: ' + metrics.alive + ' | rss ' + metrics.rssStart + ' -> ' + metrics.rssEnd);
 
   obs.socket.close();
-  const dir = '/home/jantuck/Documents/Projects/SnakeMP/.scratch';
+  const dir = path.resolve(__dirname, '..', '.scratch');
   fs.writeFileSync(dir + '/bench-' + NAME + '.json', JSON.stringify(metrics, null, 1));
   console.log('metrics written to .scratch/bench-' + NAME + '.json');
   process.exit(0);
