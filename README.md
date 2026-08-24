@@ -21,9 +21,22 @@ active lobbies each by default. At 12,000 players in 750 lobbies this is six gam
 workers, not 750 threads.
 
 The hot path no longer uses Socket.IO, Engine.IO, or JSON snapshots. Browser
-inputs are two small binary packet types and each 15 Hz world update is a
-bounds-checked binary snapshot. JSON is reserved for infrequent control events
-such as initialization, roster changes, errors, and the activity feed.
+inputs use five small, bounds-checked binary packet types and each 15 Hz world
+update is a bounds-checked binary snapshot. JSON is reserved for infrequent
+control events such as initialization, roster changes, errors, the activity
+feed, and chat.
+
+Lobby creators choose one immutable ruleset. **Classical** is apples-only,
+**Arcade v1** preserves the established golden-apple and supply-drop game, and
+**Arcade v2** adds length-funded boost, collectible remains, feasts, leader
+bounties, kill streaks, danger cues, and a short wreckage focus. These are
+separate modes: Arcade v2 does not silently change Classical or Arcade v1.
+
+Chat uses each player's roster color. Unfocused play shows a Minecraft-like
+bottom-left stream that fades away without an opaque chat panel; focusing the
+input reveals the latest 100 messages of scrollable session history. The idle
+stream shows at most five messages. An eliminated player remains a lobby
+spectator and may keep chatting until retry or disconnect.
 
 The authoritative playfield is 2048 x 1152 logical pixels: 128 x 72 square
 cells at 16 pixels per cell. Its exact 16:9 shape maps directly to 720p,
@@ -57,6 +70,24 @@ source tree, or separate web assets.
 # http://127.0.0.1:9687/
 ```
 
+For a transactional, health-gated update, use `./refresh-docker.sh`. The current
+container stays online while the host builds the Zig binary and a uniquely
+tagged candidate image. At cutover, the current image is retained as
+`snakemp:rollback`; the candidate becomes `snakemp:local` only after its root
+HTTP check passes. A failed candidate is removed and the prior image is started
+and health-checked automatically.
+
+```bash
+./refresh-docker.sh
+./refresh-docker.sh rollback
+```
+
+Explicit rollback needs Docker and the retained image, not a Zig toolchain. It
+promotes `snakemp:rollback` only after the replacement container passes the same
+check; failure restores the displaced runtime. Successful and failed refreshes
+remove the exact temporary candidate tag and prune only dangling images carrying
+SnakeMP's runtime label. Unrelated Docker images are never pruned.
+
 The script replaces a running container with the configured name and leaves the
 new container running in the background. Its optional overrides are:
 
@@ -73,7 +104,8 @@ script's environment.
 
 Useful runtime overrides are:
 
-- `SNEK_MAX_PLAYERS` (default `100`)
+- `SNEK_MAX_PLAYERS` for retained lobby identities: active players plus
+  game-over chat members (default `100`)
 - `SNEK_MAX_PLAYERS_PER_LOBBY` (default and supported browser value `16`)
 - `SNEK_MAX_LOBBIES` (default `4096`, including the permanent default lobby)
 - `SNEK_LOBBIES_PER_WORKER` (default `128`)
@@ -82,6 +114,26 @@ Useful runtime overrides are:
 
 `POST /generateid` returns `503 Service Unavailable` while the configured lobby
 capacity is full; idle non-default lobbies free slots when they are reaped.
+
+## Discovery and invites
+
+Quick Join is an explicit `POST /quickjoin`. Open lobby creators may advertise
+a fill target from 2 through 16; target 0 is unlisted, and any password makes a
+lobby unlisted regardless of the submitted target. Redirect selection is
+read-only and intentionally race-tolerant: it reserves no seat, and the final
+WebSocket join authoritatively checks per-lobby and process-wide retained-member
+capacity.
+
+Every game join dialog exposes the canonical `/game/<encoded-lobby-id>` URL.
+Share uses the platform share sheet when available and otherwise copies the
+same link; Copy falls back from the Clipboard API to legacy copy and finally a
+selected URL for manual copying. Lobby passwords are deliberately shared
+separately and never placed in the invite URL.
+
+The landing header reads `GET /status` for live active-player and lobby totals.
+The cache-disabled JSON is refreshed every 15 seconds; the compact counters
+show loading, retrying, and last-known states instead of replacing a good value
+with an error.
 
 ## Development and verification
 

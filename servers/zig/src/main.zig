@@ -65,12 +65,21 @@ const DEFAULT_LOBBY_ID = config.DEFAULT_LOBBY_ID;
 const MAX_LOBBY_PASSWORD_BYTES = config.MAX_LOBBY_PASSWORD_BYTES;
 const BONUS_CAP = config.BONUS_CAP;
 const DROP_MAX = config.DROP_MAX;
+const KILL_STREAK_WINDOW_MS: i64 = 15_000;
 const DROP_TTL_MS = config.DROP_TTL_MS;
 const GOLDEN_TTL_MS = config.GOLDEN_TTL_MS;
 const GOLDEN_POINTS = config.GOLDEN_POINTS;
 const DROP_POINTS = config.DROP_POINTS;
 const DROP_GROWTH = config.DROP_GROWTH;
 const DROP_APPLES = config.DROP_APPLES;
+const REMAINS_TTL_MS = config.REMAINS_TTL_MS;
+const FEAST_REMAINS_TTL_MS = config.FEAST_REMAINS_TTL_MS;
+const FEAST_DURATION_MS = config.FEAST_DURATION_MS;
+const CORPSE_REMAINS_MAX = config.CORPSE_REMAINS_MAX;
+const BOOST_COST_TICKS = config.BOOST_COST_TICKS;
+const BOOST_MIN_CELLS = config.BOOST_MIN_CELLS;
+const SPECTATE_FOCUS_MS = config.SPECTATE_FOCUS_MS;
+const BOUNTY_MIN_SCORE = config.BOUNTY_MIN_SCORE;
 const PING_INTERVAL_MS = config.PING_INTERVAL_MS;
 const PING_TIMEOUT_MS = config.PING_TIMEOUT_MS;
 const ERR_INVALID_USERNAME = config.ERR_INVALID_USERNAME;
@@ -103,7 +112,11 @@ var max_players_per_lobby: usize = DEFAULT_MAX_PLAYERS_PER_LOBBY;
 var max_lobbies: usize = DEFAULT_MAX_LOBBIES;
 var lobbies_per_worker: usize = DEFAULT_LOBBIES_PER_WORKER;
 var lobby_idle_delete_ms: i64 = DEFAULT_LOBBY_IDLE_DELETE_MS;
+/// Active snakes only; exported by /debug/stats as the gameplay population.
 var total_players: std.atomic.Value(usize) = .init(0);
+/// Every retained lobby identity, including game-over chat spectators. This is
+/// the authoritative process-wide SNEK_MAX_PLAYERS capacity counter.
+var total_lobby_members: std.atomic.Value(usize) = .init(0);
 var start_ms: i64 = 0;
 var debug_enabled = false;
 var shutting_down: std.atomic.Value(bool) = .init(false);
@@ -236,6 +249,8 @@ const HUD_LEFT_COLS: i32 = COLS * 2 / 3;
 const HUD_LEFT_ROWS: i32 = ROWS / 2;
 const HUD_MUTE_COL: i32 = COLS * 5 / 6;
 const HUD_MUTE_ROW: i32 = ROWS * 5 / 6;
+const HUD_CHAT_COL: i32 = COLS * 2 / 5;
+const HUD_CHAT_ROW: i32 = ROWS * 3 / 5;
 
 /// Keep every mode's objectives comfortably inside the playable field and out
 /// of the responsive HUD's conservative footprint. A shallow full-width band
@@ -251,6 +266,7 @@ fn objectiveCellSafe(cell: CellPos) bool {
     }
     if (cy < HUD_TOP_ROWS) return false;
     if (cx < HUD_LEFT_COLS and cy < HUD_LEFT_ROWS) return false;
+    if (cx < HUD_CHAT_COL and cy >= HUD_CHAT_ROW) return false;
     if (cx >= HUD_MUTE_COL and cy >= HUD_MUTE_ROW) return false;
     return true;
 }
@@ -312,6 +328,14 @@ fn randomFreeCell(l: *Lobby) ?CellPos {
                 if (g.pos.x == c.x and g.pos.y == c.y) taken = true;
             }
         }
+        if (!taken) {
+            for (l.remains.items) |remain| {
+                if (remain.pos.x == c.x and remain.pos.y == c.y) {
+                    taken = true;
+                    break;
+                }
+            }
+        }
         if (!taken) return c;
     }
     return null;
@@ -332,37 +356,35 @@ fn pickSpawnCell(l: *Lobby) CellPos {
     return pos;
 }
 
-/// rcolor-style random hex colour (#rrggbb).
-fn randomColorHex(aa: Allocator) []const u8 {
-    const hue = rng_prng.random().float(f64) * 360.0;
-    const sat = 0.5 + rng_prng.random().float(f64) * 0.25;
-    const lig = 0.4 + rng_prng.random().float(f64) * 0.2;
-    const q = lig + sat - (lig * sat);
-    if (q == 0) return "#808080";
-    const p = 2.0 * lig - q;
-    const hk = @mod(hue, 360.0) / 360.0;
-    const tr = hueToRgb(p, q, hk + (1.0 / 3.0));
-    const tg = hueToRgb(p, q, hk);
-    const tb = hueToRgb(p, q, hk - (1.0 / 3.0));
-    return std.fmt.allocPrint(aa, "#{x:0>2}{x:0>2}{x:0>2}", .{
-        colorByte(tr),
-        colorByte(tg),
-        colorByte(tb),
-    }) catch "#808080";
+// Thirty-two visually separated colors cover the complete live+spectator cap.
+// Selection probes from a random offset but never reuses an exact color while
+// its identity is still present in the lobby chat history membership.
+const PLAYER_COLORS = [_][]const u8{
+    "#ff6b6b", "#ff8787", "#f06595", "#f783ac", "#cc5de8", "#da77f2", "#845ef7", "#9775fa",
+    "#5c7cfa", "#748ffc", "#339af0", "#4dabf7", "#22b8cf", "#3bc9db", "#20c997", "#38d9a9",
+    "#51cf66", "#69db7c", "#94d82d", "#a9e34b", "#fcc419", "#ffd43b", "#ff922b", "#ffa94d",
+    "#ffb4a2", "#f7b2d9", "#e5a9ff", "#b8c0ff", "#a5d8ff", "#99e9f2", "#96f2d7", "#c0eb75",
+};
+
+fn playerColorInUse(l: *const Lobby, color: []const u8) bool {
+    for (l.players.items) |player| {
+        if (std.mem.eql(u8, player.color_hex, color)) return true;
+    }
+    for (l.spectators.items) |connection| {
+        if (connection.player) |player| {
+            if (std.mem.eql(u8, player.color_hex, color)) return true;
+        }
+    }
+    return false;
 }
 
-fn colorByte(unit: f64) u8 {
-    return @intFromFloat(std.math.clamp(unit, 0.0, 1.0) * 255.0);
-}
-
-fn hueToRgb(p: f64, q: f64, t_in: f64) f64 {
-    var t = t_in;
-    if (t < 0) t += 1;
-    if (t > 1) t -= 1;
-    if (t < 1.0 / 6.0) return p + ((q - p) * 6.0 * t);
-    if (t < 1.0 / 2.0) return q;
-    if (t < 2.0 / 3.0) return p + ((q - p) * (2.0 / 3.0 - t) * 6.0);
-    return p;
+fn choosePlayerColor(l: *Lobby) []const u8 {
+    const start = l.rng.random().uintLessThan(usize, PLAYER_COLORS.len);
+    for (0..PLAYER_COLORS.len) |offset| {
+        const color = PLAYER_COLORS[(start + offset) % PLAYER_COLORS.len];
+        if (!playerColorInUse(l, color)) return color;
+    }
+    return PLAYER_COLORS[start];
 }
 
 // ------------------------------------------------------------------ collisions
@@ -836,13 +858,34 @@ fn totalPlayersLocked() usize {
     return total_players.load(.acquire);
 }
 
+fn totalLobbyMembersLocked() usize {
+    return total_lobby_members.load(.acquire);
+}
+
+fn serverHasRetainedCapacity() bool {
+    return totalLobbyMembersLocked() < max_players_global;
+}
+
 fn broadcastLobby(l: *Lobby, frame: []const u8) void {
     for (l.players.items) |p| connEnqueueText(p.conn, frame);
+    for (l.spectators.items) |c| connEnqueueText(c, frame);
 }
 
 fn nextBackgroundSnapshot(now: i64) i64 {
     const interval = BACKGROUND_SNAPSHOT_MS;
     return now - @mod(now, interval) + interval;
+}
+
+fn spectatorReceivesSnapshot(c: *const Conn, now: i64) bool {
+    return c.spectating_until > now;
+}
+
+fn lobbyNeedsGameWorkerLocked(l: *const Lobby, now: i64) bool {
+    if (l.players.items.len != 0) return true;
+    for (l.spectators.items) |c| {
+        if (spectatorReceivesSnapshot(c, now)) return true;
+    }
+    return false;
 }
 
 fn recoverySnapshot(
@@ -905,6 +948,34 @@ fn broadcastBinarySnapshot(l: *Lobby, frame: *model.SharedFrame, now: i64, seque
             accounting.frames_sent += sent.frames_sent;
         }
     }
+    for (l.spectators.items) |c| {
+        // The death camera is intentionally short-lived. The connection stays
+        // in the lobby for text chat, but receives no more world snapshots
+        // once the advertised wreckage/spectate interval has elapsed.
+        if (!spectatorReceivesSnapshot(c, now)) continue;
+        if (c.snapshot_hidden.load(.acquire)) {
+            if (c.next_background_snapshot_ms.load(.acquire) > now) continue;
+            const recovery = recoverySnapshot(l, frame, now, sequence, &cached_recovery) orelse continue;
+            const sent = connEnqueueSharedFrame(c, recovery);
+            accounting.bytes_sent += sent.bytes_sent;
+            accounting.frames_sent += sent.frames_sent;
+            c.next_background_snapshot_ms.store(nextBackgroundSnapshot(now), .release);
+            continue;
+        }
+        if (c.snapshot_needs_keyframe.swap(false, .acq_rel)) {
+            const recovery = recoverySnapshot(l, frame, now, sequence, &cached_recovery) orelse {
+                c.snapshot_needs_keyframe.store(true, .release);
+                continue;
+            };
+            const sent = connEnqueueSharedFrame(c, recovery);
+            accounting.bytes_sent += sent.bytes_sent;
+            accounting.frames_sent += sent.frames_sent;
+        } else {
+            const sent = connEnqueueSharedFrame(c, frame);
+            accounting.bytes_sent += sent.bytes_sent;
+            accounting.frames_sent += sent.frames_sent;
+        }
+    }
 }
 
 fn detachPlayer(l: *Lobby, p: *Player) void {
@@ -914,9 +985,71 @@ fn detachPlayer(l: *Lobby, p: *Player) void {
     _ = l.players.orderedRemove(index);
     l.roster_dirty = true;
     _ = total_players.fetchSub(1, .acq_rel);
+    _ = total_lobby_members.fetchSub(1, .acq_rel);
     p.conn.membership_mutex.lockUncancelable(g_io);
     p.conn.player = null; // allows same-socket rejoin (Retry without reload)
     p.conn.lobby = null;
+    p.conn.membership_mutex.unlock(g_io);
+}
+
+fn spectatorIndex(l: *const Lobby, c: *const Conn) ?usize {
+    for (l.spectators.items, 0..) |candidate, index| {
+        if (candidate == c) return index;
+    }
+    return null;
+}
+
+/// Eviction is membership eviction, not a socket close. The connection can
+/// immediately join again, while the bounded lobby releases the retained
+/// identity and never keeps a stale connection pointer.
+fn evictSpectatorLocked(l: *Lobby, index: usize) void {
+    const c = l.spectators.orderedRemove(index);
+    c.membership_mutex.lockUncancelable(g_io);
+    const retained = if (c.lobby == l) c.player else null;
+    if (c.lobby == l) {
+        c.player = null;
+        c.lobby = null;
+        c.spectating_until = 0;
+        c.spectate_focus = null;
+        c.spectate_score = 0;
+    }
+    c.membership_mutex.unlock(g_io);
+    if (retained) |player| {
+        _ = total_lobby_members.fetchSub(1, .acq_rel);
+        destroyPlayer(player);
+    }
+}
+
+/// Remove an active snake but retain its bounded identity on the connection.
+/// Its body is released after corpse mass is sampled; snapshots end after the
+/// death replay, while chat remains until Retry, disconnect, or cap eviction.
+fn movePlayerToSpectatorsLocked(l: *Lobby, p: *Player, focus: CellPos, score: i64, now: i64) void {
+    const active_index = for (l.players.items, 0..) |candidate, index| {
+        if (candidate == p) break index;
+    } else return;
+    _ = l.players.orderedRemove(active_index);
+    l.roster_dirty = true;
+    _ = total_players.fetchSub(1, .acq_rel);
+
+    if (l.spectators.items.len >= model.MAX_SPECTATORS) evictSpectatorLocked(l, 0);
+    l.spectators.append(galloc, p.conn) catch {
+        p.conn.membership_mutex.lockUncancelable(g_io);
+        p.conn.player = null;
+        p.conn.lobby = null;
+        p.conn.membership_mutex.unlock(g_io);
+        _ = total_lobby_members.fetchSub(1, .acq_rel);
+        destroyPlayer(p);
+        return;
+    };
+    p.snake.deinit(galloc);
+    p.snake = .empty;
+    p.boosting = false;
+    p.conn.membership_mutex.lockUncancelable(g_io);
+    p.conn.player = p;
+    p.conn.lobby = l;
+    p.conn.spectating_until = now + SPECTATE_FOCUS_MS;
+    p.conn.spectate_focus = focus;
+    p.conn.spectate_score = score;
     p.conn.membership_mutex.unlock(g_io);
 }
 
@@ -941,11 +1074,23 @@ fn removeConnPlayer(c: *Conn, aa: Allocator) void {
     c.membership_mutex.lockUncancelable(g_io);
     const player = if (c.lobby == l) c.player else null;
     c.membership_mutex.unlock(g_io);
-    if (player) |p| {
-        feedDeath(l, p, aa);
-        detachPlayer(l, p);
+    const p = player orelse return;
+    if (spectatorIndex(l, c)) |index| {
+        _ = l.spectators.orderedRemove(index);
+        c.membership_mutex.lockUncancelable(g_io);
+        c.player = null;
+        c.lobby = null;
+        c.spectating_until = 0;
+        c.spectate_focus = null;
+        c.membership_mutex.unlock(g_io);
+        _ = total_lobby_members.fetchSub(1, .acq_rel);
         destroyPlayer(p);
+        return;
     }
+    feedDeath(l, p, null, 0, aa);
+    if (l.mode.isArcadeV2()) spawnCorpseRemainsLocked(l, p, unixMillis());
+    detachPlayer(l, p);
+    destroyPlayer(p);
 }
 
 fn gameWorkerLoop(worker: *GameWorker) void {
@@ -960,7 +1105,8 @@ fn gameWorkerLoop(worker: *GameWorker) void {
         const tick_now = unixMillis();
         for (worker.lobbies.items) |lobby| {
             lobby.mutex.lockUncancelable(g_io);
-            if (lobby.players.items.len > 0) tickLobby(lobby, tick_now, arena.allocator());
+            if (lobby.players.items.len > 0 or lobby.spectators.items.len > 0)
+                tickLobby(lobby, tick_now, arena.allocator());
             lobby.mutex.unlock(g_io);
         }
         worker.mutex.unlock(g_io);
@@ -1187,9 +1333,11 @@ fn unassignGameWorker(lobby: *Lobby) void {
 }
 
 /// Freeze each worker between ticks and detach lobbies that no longer contain
-/// players. Their ids remain joinable until the normal idle TTL expires; a
-/// later join assigns a worker again before publishing the player.
+/// active players or an unfinished death replay. Expired spectators retain
+/// text chat membership without spending simulation or binary fan-out work.
+/// A later Retry/join assigns a worker again before publishing the player.
 fn deactivateEmptyLobbies() void {
+    const now = unixMillis();
     var worker_index: usize = 0;
     while (worker_index < game_workers.items.len) {
         const worker = game_workers.items[worker_index];
@@ -1198,10 +1346,10 @@ fn deactivateEmptyLobbies() void {
         while (lobby_index < worker.lobbies.items.len) {
             const lobby = worker.lobbies.items[lobby_index];
             lobby.mutex.lockUncancelable(g_io);
-            const empty = lobby.players.items.len == 0;
-            if (empty) lobby.worker_assigned = false;
+            const inactive = !lobbyNeedsGameWorkerLocked(lobby, now);
+            if (inactive) lobby.worker_assigned = false;
             lobby.mutex.unlock(g_io);
-            if (empty) {
+            if (inactive) {
                 _ = worker.lobbies.swapRemove(lobby_index);
             } else {
                 lobby_index += 1;
@@ -1225,8 +1373,11 @@ fn deactivateEmptyLobbies() void {
 
 fn destroyLobby(l: *Lobby) void {
     unassignGameWorker(l);
+    while (l.spectators.items.len > 0) evictSpectatorLocked(l, l.spectators.items.len - 1);
     l.drops.deinit(galloc);
     l.bonus.deinit(galloc);
+    l.remains.deinit(galloc);
+    l.spectators.deinit(galloc);
     l.roster_wire.deinit(galloc);
     l.players.deinit(galloc);
     galloc.free(l.id);
@@ -1270,8 +1421,25 @@ fn lobbyAcceptsPassword(l: *const Lobby, supplied: []const u8) bool {
     } else |_| return false;
 }
 
-fn createLobbyLocked(id: []u8, password: []const u8, classical: bool) !*Lobby {
+fn parseGameMode(raw: ?[]const u8, legacy_classical: bool) ?model.GameMode {
+    if (raw) |value| {
+        if (std.mem.eql(u8, value, "classical")) return .classical;
+        if (std.mem.eql(u8, value, "arcade-v1") or std.mem.eql(u8, value, "arcade_v1")) return .arcade_v1;
+        if (std.mem.eql(u8, value, "arcade-v2") or std.mem.eql(u8, value, "arcade_v2")) return .arcade_v2;
+    }
+    return if (raw == null) (if (legacy_classical) .classical else .arcade_v1) else null;
+}
+
+fn parsePublicTarget(raw: ?[]const u8) ?u8 {
+    const value = raw orelse return 0;
+    const parsed = std.fmt.parseInt(u8, value, 10) catch return null;
+    if (parsed == 0 or (parsed >= 2 and parsed <= binary_snapshot.MAX_PLAYERS)) return parsed;
+    return null;
+}
+
+fn createLobbyLocked(id: []u8, password: []const u8, mode: model.GameMode, public_target: u8) !*Lobby {
     const l = try galloc.create(Lobby);
+    errdefer galloc.destroy(l);
     const seed = rng_prng.random().int(u64);
     var password_salt: [16]u8 = undefined;
     rng_prng.random().bytes(&password_salt);
@@ -1280,36 +1448,85 @@ fn createLobbyLocked(id: []u8, password: []const u8, classical: bool) !*Lobby {
         .password_salt = password_salt,
         .password_hash = if (password.len == 0) @splat(0) else hashPassword(&password_salt, password),
         .password_protected = password.len != 0,
-        .classical = classical,
+        .public_target = if (password.len == 0) public_target else 0,
+        .mode = mode,
         .food = undefined,
     };
     l.rng = std.Random.DefaultPrng.init(seed);
+    errdefer l.remains.deinit(galloc);
+    errdefer l.spectators.deinit(galloc);
+    // These are hard protocol/lifecycle caps. Reserving once keeps death,
+    // boost shedding, and spectator retention allocation-free in game ticks.
+    try l.remains.ensureTotalCapacityPrecise(galloc, model.MAX_REMAINS);
+    try l.spectators.ensureTotalCapacityPrecise(galloc, model.MAX_SPECTATORS);
     l.food = randomObjectiveCell(l);
-    lobbies.put(galloc, id, l) catch |e| {
-        galloc.destroy(l);
-        return e;
-    };
+    try lobbies.put(galloc, id, l);
     return l;
 }
 
-fn feedDeath(l: *Lobby, p: *Player, aa: Allocator) void {
+fn quickJoinEligibleLocked(l: *const Lobby) bool {
+    if (l.password_protected or l.public_target < 2) return false;
+    const target = @min(@as(usize, l.public_target), max_players_per_lobby);
+    return l.players.items.len < target;
+}
+
+/// Reactor-owned, race-tolerant matchmaking hint. No unauthenticated HTTP
+/// request reserves a seat: WebSocket join validation and the retained-member
+/// hard cap remain authoritative.
+fn selectQuickJoinLobby() ?*Lobby {
+    if (!serverHasRetainedCapacity()) return null;
+    var best: ?*Lobby = null;
+    var best_players: usize = 0;
+    for (lobbies.values()) |l| {
+        l.mutex.lockUncancelable(g_io);
+        const players = l.players.items.len;
+        const eligible = quickJoinEligibleLocked(l);
+        l.mutex.unlock(g_io);
+        if (!eligible) continue;
+        if (best == null or players > best_players) {
+            best = l;
+            best_players = players;
+        }
+    }
+    const chosen = best orelse return null;
+    chosen.mutex.lockUncancelable(g_io);
+    defer chosen.mutex.unlock(g_io);
+    if (!quickJoinEligibleLocked(chosen)) return null;
+    chosen.last_empty_at = 0;
+    return chosen;
+}
+
+fn feedDeath(l: *Lobby, p: *Player, killer: ?*Player, bounty_points: i64, aa: Allocator) void {
     var args: Buf = .empty;
     defer args.deinit(aa);
-    args.appendSlice(aa, ",{\"type\":\"death\",\"who\":") catch return;
+    args.appendSlice(aa, ",{\"type\":\"death\",\"id\":") catch return;
+    jsString(&args, aa, p.id) catch return;
+    args.appendSlice(aa, ",\"who\":") catch return;
     jsString(&args, aa, p.name) catch return;
     args.appendSlice(aa, ",\"score\":") catch return;
     jnum(&args, aa, p.score) catch return;
+    if (killer) |credited| {
+        args.appendSlice(aa, ",\"killerId\":") catch return;
+        jsString(&args, aa, credited.id) catch return;
+        args.appendSlice(aa, ",\"killer\":") catch return;
+        jsString(&args, aa, credited.name) catch return;
+        pf(&args, aa, ",\"streak\":{d},\"bounty\":{d}", .{ credited.streak, bounty_points }) catch return;
+    }
     args.appendSlice(aa, "}") catch return;
     const frame = eventFrame(aa, "feed", args.items) catch return;
     defer aa.free(frame);
     broadcastLobby(l, frame);
 }
 
-fn sendDeathEvent(c: *Conn, score: i64, aa: Allocator) void {
+fn sendDeathEvent(c: *Conn, score: i64, focus: CellPos, aa: Allocator) void {
     var args: Buf = .empty;
     defer args.deinit(aa);
-    args.append(aa, ',') catch return;
-    jnum(&args, aa, score) catch return;
+    pf(&args, aa, ",{{\"score\":{d},\"focus\":{{\"x\":{d},\"y\":{d}}},\"spectateMs\":{d}}}", .{
+        score,
+        focus.x,
+        focus.y,
+        SPECTATE_FOCUS_MS,
+    }) catch return;
     const frame = eventFrame(aa, "death", args.items) catch return;
     defer aa.free(frame);
     connEnqueueText(c, frame);
@@ -1337,7 +1554,9 @@ fn broadcastUpdateFood(l: *Lobby, aa: Allocator) void {
 fn broadcastGoldenFeed(l: *Lobby, p: *Player, aa: Allocator) void {
     var args: Buf = .empty;
     defer args.deinit(aa);
-    args.appendSlice(aa, ",{\"type\":\"golden\",\"who\":") catch return;
+    args.appendSlice(aa, ",{\"type\":\"golden\",\"id\":") catch return;
+    jsString(&args, aa, p.id) catch return;
+    args.appendSlice(aa, ",\"who\":") catch return;
     jsString(&args, aa, p.name) catch return;
     pf(&args, aa, ",\"points\":{d}}}", .{GOLDEN_POINTS}) catch return;
     const frame = eventFrame(aa, "feed", args.items) catch return;
@@ -1360,10 +1579,73 @@ fn createPlayerLocked(c: *Conn, target: *Lobby, username: []const u8, aa: Alloca
     };
     p.name = try galloc.dupe(u8, username);
     errdefer galloc.free(p.name);
-    p.color_hex = try galloc.dupe(u8, randomColorHex(aa));
+    _ = aa;
+    p.color_hex = try galloc.dupe(u8, choosePlayerColor(target));
     errdefer galloc.free(p.color_hex);
     try p.snake.append(galloc, pickSpawnCell(target));
     return p;
+}
+
+/// Return the retained identity only while the connection is still a spectator
+/// in this lobby. The caller holds the lobby mutex before taking membership,
+/// preserving the global lobby -> membership lock order.
+fn retainedSpectatorLocked(target: *const Lobby, c: *Conn) ?*Player {
+    if (spectatorIndex(target, c) == null) return null;
+    c.membership_mutex.lockUncancelable(g_io);
+    defer c.membership_mutex.unlock(g_io);
+    if (c.lobby != target or c.spectate_focus == null) return null;
+    return c.player;
+}
+
+/// Publish an already prepared player without exposing a half-converted Retry.
+/// Appending can fail, but it happens before the old spectator is removed. Once
+/// append succeeds, every remaining operation is allocation-free.
+fn publishPreparedPlayerLocked(target: *Lobby, c: *Conn, player: *Player, retained: ?*Player) !bool {
+    const spectator_index = if (retained) |old_player| blk: {
+        const index = spectatorIndex(target, c) orelse return false;
+        c.membership_mutex.lockUncancelable(g_io);
+        const matches = c.lobby == target and c.player == old_player and c.spectate_focus != null;
+        c.membership_mutex.unlock(g_io);
+        if (!matches) return false;
+        break :blk index;
+    } else blk: {
+        c.membership_mutex.lockUncancelable(g_io);
+        const empty = c.player == null and c.lobby == null;
+        c.membership_mutex.unlock(g_io);
+        if (!empty) return false;
+        break :blk null;
+    };
+
+    // This is the only remaining fallible operation. Membership is untouched
+    // if it fails, so the caller can destroy the unpublished replacement.
+    try target.players.append(galloc, player);
+
+    if (retained) |old_player| {
+        c.membership_mutex.lockUncancelable(g_io);
+        std.debug.assert(c.lobby == target and c.player == old_player and c.spectate_focus != null);
+        const index = spectator_index.?;
+        _ = target.spectators.orderedRemove(index);
+        c.player = player;
+        c.lobby = target;
+        c.spectating_until = 0;
+        c.spectate_focus = null;
+        c.spectate_score = 0;
+        c.membership_mutex.unlock(g_io);
+        destroyPlayer(old_player);
+        // A Retry converts one retained identity in place. It consumes active
+        // capacity, but not another slot in the authoritative global member cap.
+        _ = total_players.fetchAdd(1, .acq_rel);
+        return true;
+    }
+
+    c.membership_mutex.lockUncancelable(g_io);
+    std.debug.assert(c.player == null and c.lobby == null);
+    c.player = player;
+    c.lobby = target;
+    c.membership_mutex.unlock(g_io);
+    _ = total_players.fetchAdd(1, .acq_rel);
+    _ = total_lobby_members.fetchAdd(1, .acq_rel);
+    return true;
 }
 
 /// Caller holds the lobby mutex. A worker acquired only for this unpublished
@@ -1377,11 +1659,15 @@ fn discardPreparedPlayerLocked(target: *Lobby, player: *Player, activated_worker
 }
 
 fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_arg: ?[]const u8, password: []const u8) void {
-    // Already playing on this socket: silently ignore (rejoin guard).
+    // Active players cannot use another join packet to teleport or duplicate
+    // membership. A spectator is retained until the replacement is completely
+    // prepared, so validation or resource failures never throw them out of chat.
     c.membership_mutex.lockUncancelable(g_io);
-    const already_playing = c.player != null;
+    const existing_player = c.player;
+    const existing_lobby = c.lobby;
+    const active_membership = existing_player != null and c.spectate_focus == null;
     c.membership_mutex.unlock(g_io);
-    if (already_playing) return;
+    if (active_membership) return;
 
     const bad_user = text.UsernameCheck{ .ok = false, .trimmed = "" };
     const chk = if (username_arg) |u| checkUsername(u) else bad_user;
@@ -1397,7 +1683,15 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
         return;
     }
     const target = lobby.?;
-    if (totalPlayersLocked() >= max_players_global) {
+    // Retry is an in-place conversion, not a cross-lobby move. Keeping this
+    // invariant means one lobby mutex is sufficient for the atomic replacement
+    // and a malformed join cannot strand the dead user's chat membership.
+    const retrying = existing_player != null;
+    if (retrying and existing_lobby != target) {
+        sendGameError(c, ERR_UNKNOWN_GAME, aa);
+        return;
+    }
+    if (!retrying and !serverHasRetainedCapacity()) {
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
     }
@@ -1406,13 +1700,19 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
     // Recheck under the lobby ownership lock. This serializes joins with the
     // lobby worker and with disconnect/death cleanup.
     c.membership_mutex.lockUncancelable(g_io);
-    const joined_while_waiting = c.player != null;
+    const current_player = c.player;
+    const current_lobby = c.lobby;
+    const currently_spectating = c.spectate_focus != null;
     c.membership_mutex.unlock(g_io);
-    if (joined_while_waiting) {
+    const retained = if (retrying and current_player == existing_player and current_lobby == target and currently_spectating)
+        retainedSpectatorLocked(target, c)
+    else
+        null;
+    if ((retrying and retained == null) or (!retrying and current_player != null)) {
         target.mutex.unlock(g_io);
         return;
     }
-    if (totalPlayersLocked() >= max_players_global) {
+    if (!retrying and !serverHasRetainedCapacity()) {
         target.mutex.unlock(g_io);
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
@@ -1446,7 +1746,22 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
 
     var init_args: Buf = .empty;
     defer init_args.deinit(aa);
-    pf(&init_args, aa, ",{{\"scale\":16,\"food\":{{\"x\":{d},\"y\":{d}}},\"classical\":{}}}", .{ target.food.x, target.food.y, target.classical }) catch {
+    init_args.appendSlice(aa, ",{\"scale\":16,\"food\":{") catch {
+        discardPreparedPlayerLocked(target, p, activated_worker);
+        sendGameError(c, ERR_SERVER_FULL, aa);
+        return;
+    };
+    pf(&init_args, aa, "\"x\":{d},\"y\":{d}}},\"mode\":", .{ target.food.x, target.food.y }) catch {
+        discardPreparedPlayerLocked(target, p, activated_worker);
+        sendGameError(c, ERR_SERVER_FULL, aa);
+        return;
+    };
+    jsString(&init_args, aa, target.mode.wireName()) catch {
+        discardPreparedPlayerLocked(target, p, activated_worker);
+        sendGameError(c, ERR_SERVER_FULL, aa);
+        return;
+    };
+    pf(&init_args, aa, ",\"classical\":{}}}", .{target.mode.isClassical()}) catch {
         discardPreparedPlayerLocked(target, p, activated_worker);
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
@@ -1458,16 +1773,15 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
     };
     defer aa.free(init_frame);
 
-    target.players.append(galloc, p) catch {
+    const published = publishPreparedPlayerLocked(target, c, p, retained) catch {
         discardPreparedPlayerLocked(target, p, activated_worker);
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
     };
-    _ = total_players.fetchAdd(1, .acq_rel);
-    c.membership_mutex.lockUncancelable(g_io);
-    c.player = p;
-    c.lobby = target;
-    c.membership_mutex.unlock(g_io);
+    if (!published) {
+        discardPreparedPlayerLocked(target, p, activated_worker);
+        return;
+    }
     target.roster_dirty = true;
     target.last_empty_at = 0;
 
@@ -1478,7 +1792,9 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
     // feed join to everyone in the room (including the joiner).
     var args: Buf = .empty;
     defer args.deinit(aa);
-    args.appendSlice(aa, ",{\"type\":\"join\",\"who\":") catch return;
+    args.appendSlice(aa, ",{\"type\":\"join\",\"id\":") catch return;
+    jsString(&args, aa, p.id) catch return;
+    args.appendSlice(aa, ",\"who\":") catch return;
     jsString(&args, aa, p.name) catch return;
     args.appendSlice(aa, "}") catch return;
     const frame = eventFrame(aa, "feed", args.items) catch return;
@@ -1494,6 +1810,7 @@ fn handleKeyPress(c: *Conn, d: Direction) void {
 
     l.mutex.lockUncancelable(g_io);
     defer l.mutex.unlock(g_io);
+    if (spectatorIndex(l, c) != null) return;
     // Every cross-thread membership write also holds this lobby mutex. Joins
     // run only on this reactor thread, so no other writer can move the
     // connection to a different lobby while this handler is running.
@@ -1515,7 +1832,80 @@ fn handleVisibility(c: *Conn, visible: bool) void {
         // lobby worker that sees the hidden state also sees the reset.
         if (!was_hidden) c.next_background_snapshot_ms.store(0, .release);
         c.snapshot_hidden.store(true, .release);
+        // Treat a hidden document like key release. The server does not trust
+        // the browser to send a later Space-up packet before simulation runs.
+        handleBoost(c, false);
     }
+}
+
+fn handleBoost(c: *Conn, held: bool) void {
+    c.membership_mutex.lockUncancelable(g_io);
+    const lobby = c.lobby;
+    c.membership_mutex.unlock(g_io);
+    const l = lobby orelse return;
+    l.mutex.lockUncancelable(g_io);
+    defer l.mutex.unlock(g_io);
+    if (!l.mode.isArcadeV2() or spectatorIndex(l, c) != null) return;
+    const player = if (c.lobby == l) c.player else null;
+    if (player) |p| {
+        p.boosting = held;
+        if (!held) p.boost_substep = false;
+    }
+}
+
+fn refillChatBucket(tokens: *u8, last_refill_ms: *i64, now: i64, capacity: u8, refill_ms: i64) void {
+    if (last_refill_ms.* == 0) {
+        last_refill_ms.* = now;
+        return;
+    }
+    if (now <= last_refill_ms.*) return;
+    const periods = @divTrunc(now - last_refill_ms.*, refill_ms);
+    if (periods == 0) return;
+    const refill: u8 = @intCast(@min(@as(i64, capacity), periods));
+    tokens.* = @min(capacity, tokens.* +| refill);
+    // Advance across every elapsed period, not merely the capacity-capped
+    // refill. Otherwise repeated packets at one timestamp could spend the
+    // same long idle interval more than once.
+    last_refill_ms.* += periods * refill_ms;
+}
+
+/// Both buckets are refilled and checked before either is consumed. A message
+/// denied by the room ceiling therefore does not silently spend the sender's
+/// personal allowance. The caller holds the lobby mutex.
+fn consumeChatToken(c: *Conn, l: *Lobby, now: i64) bool {
+    refillChatBucket(&c.chat_tokens, &c.chat_last_refill_ms, now, model.CHAT_TOKEN_CAPACITY, model.CHAT_REFILL_MS);
+    refillChatBucket(&l.chat_tokens, &l.chat_last_refill_ms, now, model.LOBBY_CHAT_TOKEN_CAPACITY, model.LOBBY_CHAT_REFILL_MS);
+    if (c.chat_tokens == 0 or l.chat_tokens == 0) return false;
+    c.chat_tokens -= 1;
+    l.chat_tokens -= 1;
+    return true;
+}
+
+fn handleChat(c: *Conn, message: []const u8, aa: Allocator) void {
+    c.membership_mutex.lockUncancelable(g_io);
+    const lobby = c.lobby;
+    c.membership_mutex.unlock(g_io);
+    const l = lobby orelse return;
+    l.mutex.lockUncancelable(g_io);
+    defer l.mutex.unlock(g_io);
+    const player = if (c.lobby == l) c.player else null;
+    const p = player orelse return;
+    if (!consumeChatToken(c, l, unixMillis())) return;
+
+    var args: Buf = .empty;
+    defer args.deinit(aa);
+    args.appendSlice(aa, ",{\"id\":") catch return;
+    jsString(&args, aa, p.id) catch return;
+    args.appendSlice(aa, ",\"who\":") catch return;
+    jsString(&args, aa, p.name) catch return;
+    args.appendSlice(aa, ",\"color\":") catch return;
+    jsString(&args, aa, p.color_hex) catch return;
+    args.appendSlice(aa, ",\"text\":") catch return;
+    jsString(&args, aa, message) catch return;
+    args.append(aa, '}') catch return;
+    const frame = eventFrame(aa, "chat", args.items) catch return;
+    defer aa.free(frame);
+    broadcastLobby(l, frame);
 }
 
 // ------------------------------------------------------------------ tick helpers
@@ -1551,7 +1941,9 @@ fn openDropLocked(l: *Lobby, p: *Player, aa: Allocator) void {
     }
     var args: Buf = .empty;
     defer args.deinit(aa);
-    args.appendSlice(aa, ",{\"type\":\"drop-open\",\"who\":") catch return;
+    args.appendSlice(aa, ",{\"type\":\"drop-open\",\"id\":") catch return;
+    jsString(&args, aa, p.id) catch return;
+    args.appendSlice(aa, ",\"who\":") catch return;
     jsString(&args, aa, p.name) catch return;
     pf(&args, aa, ",\"apples\":{d}}}", .{spawned}) catch return;
     const frame = eventFrame(aa, "feed", args.items) catch return;
@@ -1601,6 +1993,279 @@ fn startingCollisionDeaths(players: []const *Player, collision_index: *const col
     return deaths;
 }
 
+inline fn sameCell(left: CellPos, right: CellPos) bool {
+    return left.x == right.x and left.y == right.y;
+}
+
+fn remnantCellAvailable(l: *const Lobby, cell: CellPos) bool {
+    if (!objectiveCellSafe(cell) or sameCell(l.food, cell)) return false;
+    for (l.bonus.items) |bonus| if (sameCell(bonus.pos, cell)) return false;
+    for (l.drops.items) |drop| if (sameCell(drop.pos, cell)) return false;
+    if (l.golden) |golden| if (sameCell(golden.pos, cell)) return false;
+    for (l.remains.items) |remain| if (sameCell(remain.pos, cell)) return false;
+    return true;
+}
+
+fn appendRemnantLocked(l: *Lobby, cell: CellPos, now: i64) void {
+    if (l.remains.items.len >= model.MAX_REMAINS or !remnantCellAvailable(l, cell)) return;
+    const ttl = if (l.feast_until > now) FEAST_REMAINS_TTL_MS else REMAINS_TTL_MS;
+    l.remains.append(galloc, .{ .pos = cell, .expires_at = now + ttl }) catch {};
+}
+
+fn spawnCorpseRemainsLocked(l: *Lobby, p: *const Player, now: i64) void {
+    if (!l.mode.isArcadeV2() or p.snake.items.len <= 1 or l.remains.items.len >= model.MAX_REMAINS) return;
+    const body_len = p.snake.items.len - 1;
+    const adaptive = body_len / CORPSE_REMAINS_MAX;
+    const stride = @max(@as(usize, 3), adaptive);
+    var emitted: usize = 0;
+    var index: usize = 1;
+    while (index < p.snake.items.len and emitted < CORPSE_REMAINS_MAX and l.remains.items.len < model.MAX_REMAINS) : (index += stride) {
+        const before = l.remains.items.len;
+        appendRemnantLocked(l, p.snake.items[index], now);
+        if (l.remains.items.len != before) emitted += 1;
+    }
+}
+
+fn expireArcadeV2Locked(l: *Lobby, now: i64) void {
+    var index: usize = 0;
+    while (index < l.remains.items.len) {
+        if (l.remains.items[index].expires_at <= now) {
+            _ = l.remains.swapRemove(index);
+        } else index += 1;
+    }
+}
+
+fn broadcastFeastLocked(l: *Lobby, aa: Allocator) void {
+    const frame = eventFrame(aa, "feed", ",{\"type\":\"feast\"}") catch return;
+    defer aa.free(frame);
+    broadcastLobby(l, frame);
+}
+
+fn scheduleFeastLocked(l: *Lobby, now: i64, aa: Allocator) void {
+    if (l.next_feast_at == 0) {
+        l.next_feast_at = now + 60_000 + l.rng.random().intRangeLessThan(i64, 0, 30_001);
+        return;
+    }
+    if (now < l.next_feast_at) return;
+    l.feast_until = now + FEAST_DURATION_MS;
+    l.next_feast_at = l.feast_until + 75_000 + l.rng.random().intRangeLessThan(i64, 0, 30_001);
+    const cap = now + FEAST_REMAINS_TTL_MS;
+    for (l.remains.items) |*remain|
+        remain.expires_at = @min(cap, remain.expires_at + 10_000);
+    broadcastFeastLocked(l, aa);
+}
+
+fn collectAtHeadLocked(l: *Lobby, p: *Player, aa: Allocator) void {
+    const head = p.snake.items[0];
+    if (sameCell(head, l.food)) {
+        p.eat(1, 1);
+        respawnFood(l);
+        broadcastUpdateFood(l, aa);
+    }
+
+    var bi = l.bonus.items.len;
+    while (bi > 0) {
+        bi -= 1;
+        if (sameCell(head, l.bonus.items[bi].pos)) {
+            _ = l.bonus.swapRemove(bi);
+            p.eat(1, 1);
+        }
+    }
+    if (l.golden) |golden| {
+        if (sameCell(head, golden.pos)) {
+            l.golden = null;
+            p.eat(GOLDEN_POINTS, 1);
+            broadcastGoldenFeed(l, p, aa);
+        }
+    }
+    var di = l.drops.items.len;
+    while (di > 0) {
+        di -= 1;
+        if (sameCell(head, l.drops.items[di].pos)) {
+            _ = l.drops.swapRemove(di);
+            openDropLocked(l, p, aa);
+        }
+    }
+
+    var ri = l.remains.items.len;
+    while (ri > 0) {
+        ri -= 1;
+        if (!sameCell(head, l.remains.items[ri].pos)) continue;
+        _ = l.remains.swapRemove(ri);
+        if (p.mass_progress == config.REMAINS_PER_GROWTH - 1) {
+            p.mass_progress = 0;
+            p.eat(1, 1);
+        } else {
+            p.mass_progress += 1;
+        }
+    }
+}
+
+fn currentBounty(l: *Lobby) ?*Player {
+    if (l.players.items.len < 2) return null;
+    var best: ?*Player = null;
+    var tied = false;
+    for (l.players.items) |player| {
+        if (player.score < BOUNTY_MIN_SCORE) continue;
+        if (best == null or player.score > best.?.score) {
+            best = player;
+            tied = false;
+        } else if (player.score == best.?.score) tied = true;
+    }
+    return if (tied) null else best;
+}
+
+fn updateBountySlot(l: *Lobby) void {
+    l.bounty_slot = null;
+    const target = currentBounty(l) orelse return;
+    for (l.players.items, 0..) |player, slot| {
+        if (player == target) {
+            l.bounty_slot = @intCast(slot);
+            return;
+        }
+    }
+}
+
+const DeathResolution = struct {
+    dead: bool = false,
+    killer_slot: ?usize = null,
+};
+
+/// Attribution is deliberately stricter than collision death. Only one
+/// opponent's non-head body can earn credit; head overlap, self collision,
+/// walls, and multiple body owners all produce an unattributed death.
+fn classifyDeaths(players: []const *Player) [binary_snapshot.MAX_PLAYERS]DeathResolution {
+    var result = [_]DeathResolution{.{}} ** binary_snapshot.MAX_PLAYERS;
+    for (players, 0..) |player, slot| {
+        const head = player.snake.items[0];
+        const wall = collidedWall(head);
+        const self = collision.scanSelf(player);
+        var opposing_head = false;
+        var ambiguous = false;
+        var body_owner: ?usize = null;
+        var hit_other = false;
+        for (players, 0..) |other, other_slot| {
+            if (slot == other_slot) continue;
+            if (sameCell(head, other.snake.items[0])) {
+                hit_other = true;
+                opposing_head = true;
+            }
+            for (other.snake.items[1..]) |segment| {
+                if (!sameCell(head, segment)) continue;
+                hit_other = true;
+                if (body_owner) |known| {
+                    if (known != other_slot) ambiguous = true;
+                } else body_owner = other_slot;
+                break;
+            }
+        }
+        result[slot].dead = wall or self or hit_other;
+        if (!wall and !self and !opposing_head and !ambiguous and body_owner != null)
+            result[slot].killer_slot = body_owner;
+    }
+    return result;
+}
+
+fn bountyPayout(victim: *const Player, killer: *const Player) i64 {
+    const gap = @max(@as(i64, 0), victim.score - killer.score);
+    return std.math.clamp(@as(i64, 1) + @divTrunc(gap, 5), 1, 5);
+}
+
+fn recordCreditedKill(killer: *Player, now: i64) void {
+    killer.kills +|= 1;
+    if (killer.last_kill_at == 0 or now - killer.last_kill_at > KILL_STREAK_WINDOW_MS)
+        killer.streak = 0;
+    killer.streak +|= 1;
+    killer.last_kill_at = now;
+}
+
+fn eliminateResolvedLocked(l: *Lobby, players: []const *Player, deaths: *const [binary_snapshot.MAX_PLAYERS]DeathResolution, bounty: ?*Player, now: i64, aa: Allocator) bool {
+    var any = false;
+    var bounty_awards = [_]i64{0} ** binary_snapshot.MAX_PLAYERS;
+    for (players, 0..) |victim, slot| {
+        if (!deaths[slot].dead) continue;
+        any = true;
+        if (deaths[slot].killer_slot) |killer_slot| {
+            const killer = players[killer_slot];
+            recordCreditedKill(killer, now);
+            if (bounty == victim) {
+                bounty_awards[slot] = bountyPayout(victim, killer);
+                killer.score +|= bounty_awards[slot];
+            }
+        }
+    }
+    if (!any) return false;
+
+    for (players, 0..) |victim, slot| {
+        if (!deaths[slot].dead) continue;
+        const focus = victim.snake.items[0];
+        const score = victim.score;
+        const killer = if (deaths[slot].killer_slot) |killer_slot| players[killer_slot] else null;
+        spawnCorpseRemainsLocked(l, victim, now);
+        sendDeathEvent(victim.conn, score, focus, aa);
+        feedDeath(l, victim, killer, bounty_awards[slot], aa);
+        movePlayerToSpectatorsLocked(l, victim, focus, score, now);
+    }
+    return true;
+}
+
+fn resolveCurrentArcadeV2DeathsLocked(l: *Lobby, bounty: ?*Player, now: i64, aa: Allocator) bool {
+    if (l.players.items.len == 0) return false;
+    var storage: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
+    const count = l.players.items.len;
+    @memcpy(storage[0..count], l.players.items);
+    const players = storage[0..count];
+    const deaths = classifyDeaths(players);
+    return eliminateResolvedLocked(l, players, &deaths, bounty, now, aa);
+}
+
+fn arcadeV2BoostEligibleLocked(l: *Lobby, p: *Player, now: i64) bool {
+    if (!p.boosting) {
+        p.boost_substep = false;
+        return false;
+    }
+    p.boost_cost_ticks +|= 1;
+    if (p.boost_cost_ticks >= BOOST_COST_TICKS) {
+        if (p.pending_growth > 0) {
+            p.pending_growth -= 1;
+        } else if (p.shedTail(BOOST_MIN_CELLS)) |tail| {
+            appendRemnantLocked(l, tail, now);
+        } else {
+            p.boost_cost_ticks = BOOST_COST_TICKS - 1;
+            return false;
+        }
+        p.boost_cost_ticks = 0;
+    }
+    p.boost_substep = !p.boost_substep;
+    return !p.boost_substep;
+}
+
+fn simulateArcadeV2Locked(l: *Lobby, now: i64, aa: Allocator) void {
+    const bounty = currentBounty(l);
+    _ = resolveCurrentArcadeV2DeathsLocked(l, bounty, now, aa);
+
+    for (l.players.items) |player| collectAtHeadLocked(l, player, aa);
+    for (l.players.items) |player| player.applyMove(galloc);
+    _ = resolveCurrentArcadeV2DeathsLocked(l, bounty, now, aa);
+
+    var extra: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
+    var extra_len: usize = 0;
+    for (l.players.items) |player| {
+        if (arcadeV2BoostEligibleLocked(l, player, now)) {
+            extra[extra_len] = player;
+            extra_len += 1;
+        }
+    }
+    for (extra[0..extra_len]) |player| {
+        // A simultaneous normal-step collision may have removed this player.
+        if (player.snake.items.len == 0) continue;
+        collectAtHeadLocked(l, player, aa);
+        player.applyMove(galloc);
+    }
+    _ = resolveCurrentArcadeV2DeathsLocked(l, bounty, now, aa);
+    updateBountySlot(l);
+}
+
 // ------------------------------------------------------------------ tick
 
 fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
@@ -1608,7 +2273,7 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
 
     // Classical lobbies contain only main food, so their hot path skips all
     // special-pickup expiry and scheduling work as well as their game rules.
-    if (!l.classical) {
+    if (l.mode.hasArcadeObjectives()) {
         // 1. expire pickups past their TTL
         var di: usize = 0;
         while (di < l.drops.items.len) {
@@ -1632,95 +2297,73 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
         }
     }
 
-    // 3. per-player simulation, insertion order. Deaths are tombstoned and
-    //    destroyed after the broadcast (the snapshot keeps borrowing them).
-    const player_count = l.players.items.len;
-    if (player_count > binary_snapshot.MAX_PLAYERS) return;
-    var snapshot_storage: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
-    @memcpy(snapshot_storage[0..player_count], l.players.items);
-    const snapshot = snapshot_storage[0..player_count];
+    if (l.mode.isArcadeV2()) {
+        expireArcadeV2Locked(l, now);
+        scheduleFeastLocked(l, now, aa);
+        simulateArcadeV2Locked(l, now, aa);
+    } else {
+        // Classical and Arcade v1 retain their established single-step order:
+        // collision at tick start, pickup at the current head, then movement.
+        // The only lifecycle change is retaining the eliminated connection as
+        // a spectator so Game Over can keep receiving snapshots and chat.
+        const player_count = l.players.items.len;
+        if (player_count > binary_snapshot.MAX_PLAYERS) return;
+        var snapshot_storage: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
+        @memcpy(snapshot_storage[0..player_count], l.players.items);
+        const snapshot = snapshot_storage[0..player_count];
+        var collision_index = collision.Index.build(snapshot);
+        const starting_deaths = startingCollisionDeaths(snapshot, &collision_index);
 
-    // Death processing mutates the ordered player list, so retain the initial
-    // insertion order on the worker stack and destroy tombstones after fanout.
-    var graveyard_storage: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
-    var graveyard_len: usize = 0;
-    defer {
-        for (graveyard_storage[0..graveyard_len]) |p| destroyPlayer(p);
-    }
-    var collision_index = collision.Index.build(snapshot);
-    const starting_deaths = startingCollisionDeaths(snapshot, &collision_index);
-
-    for (snapshot, 0..) |p, slot| {
-        // skip players killed earlier in this same tick
-        if (!collision_index.isActive(slot)) continue;
-
-        // Resolve the complete tick-start collision set before movement. A
-        // body owner survives being rammed; head-to-head still marks both
-        // heads, and mutual collisions are independent of insertion order.
-        if (starting_deaths[slot]) {
-            sendDeathEvent(p.conn, p.score, aa);
-            feedDeath(l, p, aa);
-            collision_index.remove(slot, p);
-            detachPlayer(l, p);
-            graveyard_storage[graveyard_len] = p;
-            graveyard_len += 1;
-            continue;
-        }
-
-        const head = p.snake.items[0];
-
-        // a. main food
-        if (head.x == l.food.x and head.y == l.food.y) {
-            p.eat(1, 1);
-            respawnFood(l);
-            broadcastUpdateFood(l, aa);
-        }
-
-        // b-d. Special pickups do not exist in classical mode.
-        if (!l.classical) {
-            // bonus apples (every apple matching the head)
-            var bi = l.bonus.items.len;
-            while (bi > 0) {
-                bi -= 1;
-                const bp = l.bonus.items[bi].pos;
-                if (head.x == bp.x and head.y == bp.y) {
-                    _ = l.bonus.swapRemove(bi);
-                    p.eat(1, 1);
-                }
+        for (snapshot, 0..) |p, slot| {
+            if (!collision_index.isActive(slot)) continue;
+            if (starting_deaths[slot]) {
+                const focus = p.snake.items[0];
+                sendDeathEvent(p.conn, p.score, focus, aa);
+                feedDeath(l, p, null, 0, aa);
+                collision_index.remove(slot, p);
+                movePlayerToSpectatorsLocked(l, p, focus, p.score, now);
+                continue;
             }
-            // golden apple
-            if (l.golden) |g| {
-                if (head.x == g.pos.x and head.y == g.pos.y) {
-                    l.golden = null;
-                    p.eat(GOLDEN_POINTS, 1);
-                    broadcastGoldenFeed(l, p, aa);
+
+            const head = p.snake.items[0];
+            if (sameCell(head, l.food)) {
+                p.eat(1, 1);
+                respawnFood(l);
+                broadcastUpdateFood(l, aa);
+            }
+            if (l.mode.hasArcadeObjectives()) {
+                var bi = l.bonus.items.len;
+                while (bi > 0) {
+                    bi -= 1;
+                    if (sameCell(head, l.bonus.items[bi].pos)) {
+                        _ = l.bonus.swapRemove(bi);
+                        p.eat(1, 1);
+                    }
+                }
+                if (l.golden) |golden| {
+                    if (sameCell(head, golden.pos)) {
+                        l.golden = null;
+                        p.eat(GOLDEN_POINTS, 1);
+                        broadcastGoldenFeed(l, p, aa);
+                    }
+                }
+                var di = l.drops.items.len;
+                while (di > 0) {
+                    di -= 1;
+                    if (sameCell(head, l.drops.items[di].pos)) {
+                        _ = l.drops.swapRemove(di);
+                        openDropLocked(l, p, aa);
+                    }
                 }
             }
 
-            // supply crates
-            var di = l.drops.items.len;
-            while (di > 0) {
-                di -= 1;
-                const dp = l.drops.items[di].pos;
-                if (head.x == dp.x and head.y == dp.y) {
-                    _ = l.drops.swapRemove(di);
-                    openDropLocked(l, p, aa);
-                }
+            if (applyMoveAndCheckWall(p, slot, &collision_index)) {
+                const focus = p.snake.items[0];
+                sendDeathEvent(p.conn, p.score, focus, aa);
+                feedDeath(l, p, null, 0, aa);
+                collision_index.remove(slot, p);
+                movePlayerToSpectatorsLocked(l, p, focus, p.score, now);
             }
-        }
-
-        // e. one queued turn, then move
-        const crossed_wall = applyMoveAndCheckWall(p, slot, &collision_index);
-        // Never publish an out-of-board head. The decoder deliberately rejects
-        // invalid coordinates, so wall death must happen in the movement tick
-        // rather than one snapshot later.
-        if (crossed_wall) {
-            sendDeathEvent(p.conn, p.score, aa);
-            feedDeath(l, p, aa);
-            collision_index.remove(slot, p);
-            detachPlayer(l, p);
-            graveyard_storage[graveyard_len] = p;
-            graveyard_len += 1;
         }
     }
 
@@ -1784,7 +2427,7 @@ fn reapIdleLobbies(now: i64) void {
             continue;
         }
         l.mutex.lockUncancelable(g_io);
-        const empty = l.players.items.len == 0;
+        const empty = l.players.items.len == 0 and l.spectators.items.len == 0;
         if (!empty) {
             l.last_empty_at = 0;
         } else if (l.last_empty_at == 0) l.last_empty_at = now;
@@ -1808,6 +2451,7 @@ const SendOpts = struct {
     body: []const u8 = "",
     body_static: bool = false,
     location: ?[]const u8 = null,
+    cache_control: ?[]const u8 = null,
     keep_alive: bool,
     head_only: bool = false,
 };
@@ -1831,6 +2475,11 @@ fn sendResponse(c: *Conn, aa: Allocator, o: SendOpts) void {
     if (o.ctype) |ct| {
         b.appendSlice(header_allocator, "Content-Type: ") catch return;
         b.appendSlice(header_allocator, ct) catch return;
+        b.appendSlice(header_allocator, CRLF) catch return;
+    }
+    if (o.cache_control) |value| {
+        b.appendSlice(header_allocator, "Cache-Control: ") catch return;
+        b.appendSlice(header_allocator, value) catch return;
         b.appendSlice(header_allocator, CRLF) catch return;
     }
     pf(&b, header_allocator, "Content-Length: {d}" ++ CRLF, .{o.body.len}) catch return;
@@ -2033,6 +2682,28 @@ fn sendStats(c: *Conn, aa: Allocator, keep_alive: bool, head_only: bool) void {
     });
 }
 
+fn writePublicStatus(out: []u8, players: usize, lobby_count: usize) ![]const u8 {
+    return std.fmt.bufPrint(out, "{{\"players\":{d},\"lobbies\":{d}}}", .{ players, lobby_count });
+}
+
+/// The landing page only needs two bounded counters. Keep this separate from
+/// the allocation-heavy debug payload and explicitly prevent intermediary or
+/// browser caches from presenting stale population figures.
+fn sendPublicStatus(c: *Conn, aa: Allocator, keep_alive: bool, head_only: bool) void {
+    var storage: [96]u8 = undefined;
+    const body = writePublicStatus(&storage, totalPlayersLocked(), lobbies.count()) catch
+        return sendServerError(c, aa);
+    sendResponse(c, aa, .{
+        .status = 200,
+        .reason = "OK",
+        .ctype = "application/json; charset=utf-8",
+        .body = body,
+        .cache_control = "no-store",
+        .keep_alive = keep_alive,
+        .head_only = head_only,
+    });
+}
+
 // ------------------------------------------------------------------ routing
 
 fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const u8, body: []const u8, body_is_json: bool, keep_alive: bool) void {
@@ -2069,6 +2740,9 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
             if (debug_enabled) return sendStats(c, aa, keep_alive, head_only);
             return sendNotFound(c, aa, keep_alive, head_only);
         }
+        if (std.mem.eql(u8, dec_path, "/status")) {
+            return sendPublicStatus(c, aa, keep_alive, head_only);
+        }
         if (assets.find(dec_path)) |a| {
             return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = a.ctype, .body = a.body, .body_static = true, .keep_alive = keep_alive, .head_only = head_only });
         }
@@ -2076,6 +2750,13 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
     }
 
     if (is_post) {
+        if (std.mem.eql(u8, dec_path, "/quickjoin")) {
+            const lobby = selectQuickJoinLobby() orelse
+                return sendRedirect(c, aa, 303, "/?error=no-open-lobby", keep_alive, false);
+            const enc = uriEncodeComponent(aa, lobby.id);
+            const loc = std.fmt.allocPrint(aa, "/game/{s}", .{enc}) catch "/?error=no-open-lobby";
+            return sendRedirect(c, aa, 303, loc, keep_alive, false);
+        }
         if (std.mem.eql(u8, dec_path, "/generateid")) {
             const raw_password = if (body.len > 0) extractFormField(aa, body, "password") else null;
             const password = checkedPassword(raw_password) catch {
@@ -2092,6 +2773,26 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
                 std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "on") or std.ascii.eqlIgnoreCase(value, "true")
             else
                 false;
+            const mode_value = if (body.len > 0) extractFormField(aa, body, "mode") else null;
+            const mode = parseGameMode(mode_value, classical) orelse {
+                return sendResponse(c, aa, .{
+                    .status = 400,
+                    .reason = "Bad Request",
+                    .ctype = "text/plain; charset=utf-8",
+                    .body = "Unknown game mode",
+                    .keep_alive = keep_alive,
+                });
+            };
+            const target_value = if (body.len > 0) extractFormField(aa, body, "publicTarget") else null;
+            const public_target = parsePublicTarget(target_value) orelse {
+                return sendResponse(c, aa, .{
+                    .status = 400,
+                    .reason = "Bad Request",
+                    .ctype = "text/plain; charset=utf-8",
+                    .body = "Quick Join target must be 0 or 2 through 16",
+                    .keep_alive = keep_alive,
+                });
+            };
             if (lobbies.count() >= max_lobbies) {
                 return sendResponse(c, aa, .{
                     .status = 503,
@@ -2110,7 +2811,7 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
             const owned = galloc.dupe(u8, new_id) catch {
                 return sendServerError(c, aa);
             };
-            _ = createLobbyLocked(owned, password, classical) catch {
+            _ = createLobbyLocked(owned, password, mode, public_target) catch {
                 galloc.free(owned);
                 return sendServerError(c, aa);
             };
@@ -2191,6 +2892,8 @@ fn handleRawBinary(c: *Conn, aa: Allocator, payload: []const u8) void {
         .join => |join| handleClientReady(c, aa, join.username, join.lobby_id, join.password),
         .direction => |direction| handleKeyPress(c, direction),
         .visibility => |visible| handleVisibility(c, visible),
+        .boost => |held| handleBoost(c, held),
+        .chat => |message| handleChat(c, message, aa),
     }
 }
 
@@ -2651,7 +3354,7 @@ pub fn main(init: std.process.Init) !void {
     {
         const def_id = try galloc.dupe(u8, DEFAULT_LOBBY_ID);
         errdefer galloc.free(def_id);
-        _ = try createLobbyLocked(def_id, "", false);
+        _ = try createLobbyLocked(def_id, "", .arcade_v1, @intCast(binary_snapshot.MAX_PLAYERS));
     }
 
     const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
@@ -2829,12 +3532,6 @@ test "websocket sent counter excludes rejected queue publications" {
     try std.testing.expect(connection.poisoned);
 }
 
-test "color conversion clamps floating point edge values" {
-    try std.testing.expectEqual(@as(u8, 0), colorByte(-0.000_001));
-    try std.testing.expectEqual(@as(u8, 127), colorByte(0.5));
-    try std.testing.expectEqual(@as(u8, 255), colorByte(1.000_001));
-}
-
 test "binary client packets reject malformed and partial input" {
     try std.testing.expect(websocket.clientPacket(&.{}) == null);
     try std.testing.expect(websocket.clientPacket(&.{ 1, 5, 4, 0, '1' }) == null);
@@ -2844,7 +3541,7 @@ test "binary client packets reject malformed and partial input" {
     try std.testing.expect(websocket.clientPacket(&.{3}) == null);
     try std.testing.expect(websocket.clientPacket(&.{ 3, 2 }) == null);
     try std.testing.expect(websocket.clientPacket(&.{ 3, 1, 0 }) == null);
-    try std.testing.expect(websocket.clientPacket(&.{ 4, 0 }) == null);
+    try std.testing.expect(websocket.clientPacket(&.{ 6, 0 }) == null);
     const joined = websocket.clientPacket(&.{ 1, 5, 4, 2, '1', '2', '3', '4', '5', 'n', 'a', 'm', 'e', 'p', 'w' }).?;
     try std.testing.expectEqualStrings("12345", joined.join.lobby_id);
     try std.testing.expectEqualStrings("name", joined.join.username);
@@ -2852,6 +3549,7 @@ test "binary client packets reject malformed and partial input" {
     try std.testing.expectEqual(Direction.left, websocket.clientPacket(&.{ 2, 2 }).?.direction);
     try std.testing.expectEqual(false, websocket.clientPacket(&.{ 3, 0 }).?.visibility);
     try std.testing.expectEqual(true, websocket.clientPacket(&.{ 3, 1 }).?.visibility);
+    try std.testing.expectEqual(true, websocket.clientPacket(&.{ 4, 1 }).?.boost);
 }
 
 test "lobby passwords are bounded, validated, and authenticated exactly" {
@@ -2895,6 +3593,10 @@ test "all mode objectives avoid arena edges and the responsive HUD footprint" {
         .x = HUD_MUTE_COL * CELL,
         .y = HUD_MUTE_ROW * CELL,
     }));
+    try std.testing.expect(!objectiveCellSafe(.{
+        .x = (HUD_CHAT_COL - 1) * CELL,
+        .y = HUD_CHAT_ROW * CELL,
+    }));
     try std.testing.expect(objectiveCellSafe(.{
         .x = (COLS * 3 / 4) * CELL,
         .y = (ROWS / 3) * CELL,
@@ -2903,7 +3605,7 @@ test "all mode objectives avoid arena edges and the responsive HUD footprint" {
     for ([_]bool{ false, true }) |classical| {
         var lobby = Lobby{
             .id = @constCast("objective-test"),
-            .classical = classical,
+            .mode = if (classical) .classical else .arcade_v1,
             .food = .{ .x = (COLS / 2) * CELL, .y = (ROWS / 2) * CELL },
         };
         lobby.rng = std.Random.DefaultPrng.init(if (classical) 0xc1a551c else 0xa4cade);
@@ -2921,7 +3623,7 @@ test "classical lobby ticks never schedule special pickups" {
 
     var lobby = Lobby{
         .id = @constCast("classical"),
-        .classical = true,
+        .mode = .classical,
         .food = .{ .x = 0, .y = 0 },
         // These would cause immediate spawns in a standard lobby.
         .next_drop_at = 1,
@@ -2932,6 +3634,8 @@ test "classical lobby ticks never schedule special pickups" {
     defer lobby.bonus.deinit(galloc);
     defer lobby.roster_wire.deinit(galloc);
     defer lobby.players.deinit(galloc);
+    defer lobby.spectators.deinit(galloc);
+    defer lobby.remains.deinit(galloc);
 
     for (0..8) |index| tickLobby(&lobby, 100_000 + @as(i64, @intCast(index)), std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 0), lobby.drops.items.len);
@@ -3131,6 +3835,320 @@ test "head-to-head and mutual body collisions kill every attacker simultaneously
     index = collision.Index.buildForced(&players);
     deaths = startingCollisionDeaths(&players, &index);
     try std.testing.expect(deaths[0] and deaths[1]);
+}
+
+test "mode parsing preserves legacy fallback and rejects explicit unknown values" {
+    try std.testing.expectEqual(model.GameMode.arcade_v1, parseGameMode(null, false).?);
+    try std.testing.expectEqual(model.GameMode.classical, parseGameMode(null, true).?);
+    try std.testing.expectEqual(model.GameMode.classical, parseGameMode("classical", false).?);
+    try std.testing.expectEqual(model.GameMode.arcade_v1, parseGameMode("arcade-v1", true).?);
+    try std.testing.expectEqual(model.GameMode.arcade_v2, parseGameMode("arcade_v2", false).?);
+    try std.testing.expect(parseGameMode("future-mode", false) == null);
+}
+
+test "public Quick Join target is private by default and strictly bounded" {
+    try std.testing.expectEqual(@as(?u8, 0), parsePublicTarget(null));
+    try std.testing.expectEqual(@as(?u8, 0), parsePublicTarget("0"));
+    try std.testing.expectEqual(@as(?u8, 2), parsePublicTarget("2"));
+    try std.testing.expectEqual(@as(?u8, 16), parsePublicTarget("16"));
+    try std.testing.expect(parsePublicTarget("1") == null);
+    try std.testing.expect(parsePublicTarget("17") == null);
+    try std.testing.expect(parsePublicTarget("many") == null);
+}
+
+test "public landing status JSON is compact exact and bounded" {
+    var storage: [96]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "{\"players\":0,\"lobbies\":1}",
+        try writePublicStatus(&storage, 0, 1),
+    );
+    const maximum = try writePublicStatus(&storage, std.math.maxInt(usize), std.math.maxInt(usize));
+    try std.testing.expect(maximum.len <= storage.len);
+    try std.testing.expect(std.mem.startsWith(u8, maximum, "{\"players\":"));
+    try std.testing.expect(std.mem.endsWith(u8, maximum, "}"));
+}
+
+test "Arcade v2 collision credit requires one non-head body owner" {
+    var connection = Conn{ .fd = -1 };
+    var owner_cells = [_]CellPos{
+        .{ .x = 10 * CELL, .y = 10 * CELL },
+        .{ .x = 9 * CELL, .y = 10 * CELL },
+    };
+    var attacker_cells = [_]CellPos{.{ .x = 9 * CELL, .y = 10 * CELL }};
+    var owner = Player{
+        .id = @constCast("owner"),
+        .name = @constCast("owner"),
+        .color_hex = @constCast("#fff"),
+        .snake = .{ .items = &owner_cells, .capacity = owner_cells.len },
+        .conn = &connection,
+    };
+    var attacker = Player{
+        .id = @constCast("attacker"),
+        .name = @constCast("attacker"),
+        .color_hex = @constCast("#000"),
+        .snake = .{ .items = &attacker_cells, .capacity = attacker_cells.len },
+        .conn = &connection,
+    };
+    const body_players = [_]*Player{ &owner, &attacker };
+    var deaths = classifyDeaths(&body_players);
+    try std.testing.expect(!deaths[0].dead);
+    try std.testing.expect(deaths[1].dead);
+    try std.testing.expectEqual(@as(?usize, 0), deaths[1].killer_slot);
+
+    attacker_cells[0] = owner_cells[0];
+    deaths = classifyDeaths(&body_players);
+    try std.testing.expect(deaths[0].dead and deaths[1].dead);
+    try std.testing.expectEqual(@as(?usize, null), deaths[0].killer_slot);
+    try std.testing.expectEqual(@as(?usize, null), deaths[1].killer_slot);
+}
+
+test "credited kill streak resets after fifteen seconds" {
+    var connection = Conn{ .fd = -1 };
+    var player = Player{
+        .id = @constCast("id"),
+        .name = @constCast("name"),
+        .color_hex = @constCast("#fff"),
+        .conn = &connection,
+    };
+    recordCreditedKill(&player, 1_000);
+    recordCreditedKill(&player, 16_000);
+    try std.testing.expectEqual(@as(u16, 2), player.streak);
+    recordCreditedKill(&player, 31_001);
+    try std.testing.expectEqual(@as(u16, 3), player.kills);
+    try std.testing.expectEqual(@as(u16, 1), player.streak);
+}
+
+test "corpse remains are adaptively sampled capped and HUD safe" {
+    galloc = std.testing.allocator;
+    var connection = Conn{ .fd = -1 };
+    var player = Player{
+        .id = @constCast("id"),
+        .name = @constCast("name"),
+        .color_hex = @constCast("#fff"),
+        .conn = &connection,
+    };
+    defer player.snake.deinit(galloc);
+    for (0..64) |index| try player.snake.append(galloc, .{
+        .x = @as(i32, @intCast(7 + index)) * CELL,
+        .y = 40 * CELL,
+    });
+    var lobby = Lobby{
+        .id = @constCast("v2"),
+        .mode = .arcade_v2,
+        .food = .{ .x = 120 * CELL, .y = 60 * CELL },
+    };
+    defer lobby.remains.deinit(galloc);
+    spawnCorpseRemainsLocked(&lobby, &player, 1000);
+    try std.testing.expectEqual(@as(usize, CORPSE_REMAINS_MAX), lobby.remains.items.len);
+    for (lobby.remains.items) |remain| {
+        try std.testing.expect(objectiveCellSafe(remain.pos));
+        try std.testing.expectEqual(@as(i64, 1000 + REMAINS_TTL_MS), remain.expires_at);
+    }
+}
+
+test "three remains convert once and boost is one extra step every other held tick" {
+    galloc = std.testing.allocator;
+    var connection = Conn{ .fd = -1 };
+    var player = Player{
+        .id = @constCast("id"),
+        .name = @constCast("name"),
+        .color_hex = @constCast("#fff"),
+        .boosting = true,
+        .conn = &connection,
+    };
+    defer player.snake.deinit(galloc);
+    for (0..6) |index| try player.snake.append(galloc, .{
+        .x = @as(i32, @intCast(30 - index)) * CELL,
+        .y = 40 * CELL,
+    });
+    var lobby = Lobby{
+        .id = @constCast("v2"),
+        .mode = .arcade_v2,
+        .food = .{ .x = 100 * CELL, .y = 50 * CELL },
+    };
+    defer lobby.remains.deinit(galloc);
+    for (0..3) |_| try lobby.remains.append(galloc, .{
+        .pos = player.snake.items[0],
+        .expires_at = 20_000,
+    });
+    collectAtHeadLocked(&lobby, &player, std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 1), player.score);
+    try std.testing.expectEqual(@as(i64, 1), player.pending_growth);
+    try std.testing.expectEqual(@as(u2, 0), player.mass_progress);
+
+    // Spend the pending growth first at the fifteenth held tick.
+    var extra_steps: usize = 0;
+    for (0..BOOST_COST_TICKS) |_| {
+        if (arcadeV2BoostEligibleLocked(&lobby, &player, 1000)) extra_steps += 1;
+    }
+    try std.testing.expectEqual(@as(usize, BOOST_COST_TICKS / 2), extra_steps);
+    try std.testing.expectEqual(@as(i64, 0), player.pending_growth);
+    try std.testing.expectEqual(@as(usize, 6), player.snake.items.len);
+    try std.testing.expectEqual(@as(usize, 0), lobby.remains.items.len);
+
+    // The next complete cost window sheds exactly one real tail cell.
+    for (0..BOOST_COST_TICKS) |_| _ = arcadeV2BoostEligibleLocked(&lobby, &player, 2000);
+    try std.testing.expectEqual(@as(usize, BOOST_MIN_CELLS), player.snake.items.len);
+    try std.testing.expectEqual(@as(usize, 1), lobby.remains.items.len);
+}
+
+test "death spectator releases active capacity but retains global lobby capacity" {
+    galloc = std.testing.allocator;
+    g_io = std.testing.io;
+    total_players.store(1, .release);
+    total_lobby_members.store(1, .release);
+    defer total_players.store(0, .release);
+    defer total_lobby_members.store(0, .release);
+    var connection = Conn{ .fd = -1 };
+    const player = try galloc.create(Player);
+    player.* = .{
+        .id = "retained-id",
+        .name = try galloc.dupe(u8, "retained-name"),
+        .color_hex = try galloc.dupe(u8, "#e53935"),
+        .conn = &connection,
+    };
+    try player.snake.append(galloc, .{ .x = 20 * CELL, .y = 20 * CELL });
+    var lobby = Lobby{ .id = @constCast("spectate"), .food = .{ .x = 0, .y = 0 } };
+    defer lobby.players.deinit(galloc);
+    defer lobby.spectators.deinit(galloc);
+    try lobby.players.append(galloc, player);
+    connection.player = player;
+    connection.lobby = &lobby;
+
+    movePlayerToSpectatorsLocked(&lobby, player, .{ .x = 20 * CELL, .y = 20 * CELL }, 7, 1000);
+    try std.testing.expectEqual(@as(usize, 0), lobby.players.items.len);
+    try std.testing.expectEqual(@as(usize, 1), lobby.spectators.items.len);
+    try std.testing.expect(connection.player == player and connection.lobby == &lobby);
+    try std.testing.expectEqual(@as(usize, 0), player.snake.items.len);
+    try std.testing.expectEqual(@as(i64, 1000 + SPECTATE_FOCUS_MS), connection.spectating_until);
+    try std.testing.expectEqual(@as(usize, 0), total_players.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), total_lobby_members.load(.acquire));
+    evictSpectatorLocked(&lobby, 0);
+    try std.testing.expect(connection.player == null and connection.lobby == null);
+    try std.testing.expectEqual(@as(usize, 0), total_lobby_members.load(.acquire));
+}
+
+test "retry publication failure preserves game-over chat membership" {
+    galloc = std.testing.allocator;
+    g_io = std.testing.io;
+    var connection = Conn{ .fd = -1 };
+    var retained = Player{
+        .id = "retained-id",
+        .name = @constCast("retained-name"),
+        .color_hex = @constCast("#ff6b6b"),
+        .conn = &connection,
+    };
+    var replacement = Player{
+        .id = "retained-id",
+        .name = @constCast("replacement-name"),
+        .color_hex = @constCast("#4dabf7"),
+        .conn = &connection,
+    };
+    var lobby = Lobby{ .id = @constCast("retry"), .food = .{ .x = 0, .y = 0 } };
+    defer lobby.players.deinit(std.testing.allocator);
+    defer lobby.spectators.deinit(std.testing.allocator);
+    try lobby.spectators.append(std.testing.allocator, &connection);
+    connection.player = &retained;
+    connection.lobby = &lobby;
+    connection.spectate_focus = .{ .x = 10 * CELL, .y = 10 * CELL };
+    connection.spectate_score = 9;
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    galloc = failing.allocator();
+    const result = publishPreparedPlayerLocked(&lobby, &connection, &replacement, &retained);
+    galloc = std.testing.allocator;
+    try std.testing.expectError(error.OutOfMemory, result);
+
+    try std.testing.expectEqual(@as(usize, 0), lobby.players.items.len);
+    try std.testing.expectEqual(@as(usize, 1), lobby.spectators.items.len);
+    try std.testing.expect(connection.player == &retained and connection.lobby == &lobby);
+    try std.testing.expect(connection.spectate_focus != null);
+    try std.testing.expectEqual(@as(i64, 9), connection.spectate_score);
+}
+
+test "retained lobby members enforce the global capacity" {
+    const previous_max = max_players_global;
+    defer max_players_global = previous_max;
+    defer total_lobby_members.store(0, .release);
+    max_players_global = 2;
+    total_lobby_members.store(1, .release);
+    try std.testing.expect(serverHasRetainedCapacity());
+    total_lobby_members.store(2, .release);
+    try std.testing.expect(!serverHasRetainedCapacity());
+}
+
+test "quick join target counts active snakes and ignores chat spectators" {
+    galloc = std.testing.allocator;
+    const previous_per_lobby = max_players_per_lobby;
+    defer max_players_per_lobby = previous_per_lobby;
+    max_players_per_lobby = binary_snapshot.MAX_PLAYERS;
+
+    var connection = Conn{ .fd = -1 };
+    var first = Player{ .id = "one", .name = @constCast("one"), .color_hex = @constCast("#fff"), .conn = &connection };
+    var second = Player{ .id = "two", .name = @constCast("two"), .color_hex = @constCast("#eee"), .conn = &connection };
+    var lobby = Lobby{
+        .id = @constCast("public"),
+        .public_target = 2,
+        .food = .{ .x = 0, .y = 0 },
+    };
+    defer lobby.players.deinit(galloc);
+    defer lobby.spectators.deinit(galloc);
+    try lobby.players.append(galloc, &first);
+    try lobby.spectators.append(galloc, &connection);
+    try std.testing.expect(quickJoinEligibleLocked(&lobby));
+    try lobby.players.append(galloc, &second);
+    try std.testing.expect(!quickJoinEligibleLocked(&lobby));
+}
+
+test "dead members stop receiving snapshots at the advertised cutoff" {
+    var connection = Conn{ .fd = -1, .spectating_until = 12_000 };
+    try std.testing.expect(spectatorReceivesSnapshot(&connection, 11_999));
+    try std.testing.expect(!spectatorReceivesSnapshot(&connection, 12_000));
+    try std.testing.expect(!spectatorReceivesSnapshot(&connection, 12_001));
+
+    var lobby = Lobby{ .id = @constCast("worker-cutoff"), .food = .{ .x = 0, .y = 0 } };
+    defer lobby.spectators.deinit(std.testing.allocator);
+    try lobby.spectators.append(std.testing.allocator, &connection);
+    try std.testing.expect(lobbyNeedsGameWorkerLocked(&lobby, 11_999));
+    try std.testing.expect(!lobbyNeedsGameWorkerLocked(&lobby, 12_000));
+}
+
+test "chat token bucket is bounded and refills lazily" {
+    var connection = Conn{ .fd = -1, .chat_last_refill_ms = 1000 };
+    var lobby = Lobby{ .id = @constCast("chat-rate"), .food = .{ .x = 0, .y = 0 }, .chat_last_refill_ms = 1000 };
+    for (0..model.CHAT_TOKEN_CAPACITY) |_| try std.testing.expect(consumeChatToken(&connection, &lobby, 1000));
+    try std.testing.expect(!consumeChatToken(&connection, &lobby, 1000));
+    try std.testing.expect(!consumeChatToken(&connection, &lobby, 1000 + model.CHAT_REFILL_MS - 1));
+    try std.testing.expect(consumeChatToken(&connection, &lobby, 1000 + model.CHAT_REFILL_MS));
+    try std.testing.expect(!consumeChatToken(&connection, &lobby, 1000 + model.CHAT_REFILL_MS));
+}
+
+test "lobby chat bucket bounds reconnect amplification and refill boundaries" {
+    var lobby = Lobby{ .id = @constCast("shared-chat-rate"), .food = .{ .x = 0, .y = 0 }, .chat_last_refill_ms = 1000 };
+    var participants: [4]Conn = undefined;
+    for (&participants) |*connection| connection.* = .{ .fd = -1, .chat_last_refill_ms = 1000 };
+
+    // Three fresh connections can spend the shared burst, but a fourth fresh
+    // identity cannot reset it by reconnecting.
+    for (participants[0..3]) |*connection| {
+        for (0..model.CHAT_TOKEN_CAPACITY) |_| try std.testing.expect(consumeChatToken(connection, &lobby, 1000));
+    }
+    try std.testing.expectEqual(@as(u8, 0), lobby.chat_tokens);
+    try std.testing.expect(!consumeChatToken(&participants[3], &lobby, 1000));
+    try std.testing.expectEqual(model.CHAT_TOKEN_CAPACITY, participants[3].chat_tokens);
+
+    try std.testing.expect(!consumeChatToken(&participants[3], &lobby, 1000 + model.LOBBY_CHAT_REFILL_MS - 1));
+    try std.testing.expect(consumeChatToken(&participants[3], &lobby, 1000 + model.LOBBY_CHAT_REFILL_MS));
+    try std.testing.expect(!consumeChatToken(&participants[3], &lobby, 1000 + model.LOBBY_CHAT_REFILL_MS));
+
+    // A long idle interval fills once and is fully accounted; it cannot be
+    // replayed by multiple calls carrying the same timestamp.
+    const later = 1000 + 100 * model.LOBBY_CHAT_REFILL_MS;
+    refillChatBucket(&lobby.chat_tokens, &lobby.chat_last_refill_ms, later, model.LOBBY_CHAT_TOKEN_CAPACITY, model.LOBBY_CHAT_REFILL_MS);
+    try std.testing.expectEqual(model.LOBBY_CHAT_TOKEN_CAPACITY, lobby.chat_tokens);
+    lobby.chat_tokens = 0;
+    refillChatBucket(&lobby.chat_tokens, &lobby.chat_last_refill_ms, later, model.LOBBY_CHAT_TOKEN_CAPACITY, model.LOBBY_CHAT_REFILL_MS);
+    try std.testing.expectEqual(@as(u8, 0), lobby.chat_tokens);
 }
 
 test "shared keyframe coalescing preserves partial frames and controls" {

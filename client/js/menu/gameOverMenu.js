@@ -18,11 +18,14 @@ function roundedRect(ctx, x, y, width, height, radius) {
 }
 
 export default class GameOverMenu extends Menu {
-    constructor(ctx) {
+    constructor(ctx, options = {}) {
         super(ctx);
         this.score = 0;
         this.overlay = null;
         this.scoreOutput = null;
+        this.context = null;
+        this.retry = null;
+        this.compact = options.compact === true;
         this.previousFocus = typeof document === "undefined" ? null : document.activeElement;
 
         const scale = Math.min(ctx.canvas.width / 1920, ctx.canvas.height / 1080);
@@ -41,10 +44,10 @@ export default class GameOverMenu extends Menu {
         document.querySelector(OVERLAY_SELECTOR)?.remove();
 
         const overlay = document.createElement("section");
-        overlay.className = "game-over-overlay";
+        overlay.className = `game-over-overlay${this.compact ? " is-spectating is-replay" : ""}`;
         overlay.dataset.gameOverOverlay = "";
-        overlay.setAttribute("role", "dialog");
-        overlay.setAttribute("aria-modal", "true");
+        overlay.setAttribute("role", this.compact ? "region" : "dialog");
+        if (!this.compact) overlay.setAttribute("aria-modal", "true");
         overlay.setAttribute("aria-labelledby", "game_over_title");
         overlay.setAttribute("aria-describedby", "game_over_context");
 
@@ -53,12 +56,15 @@ export default class GameOverMenu extends Menu {
 
         const heading = document.createElement("h1");
         heading.id = "game_over_title";
-        heading.textContent = "Game over";
+        heading.textContent = this.compact ? "Run over" : "Game over";
 
         const context = document.createElement("p");
         context.id = "game_over_context";
         context.className = "game-over-context";
-        context.textContent = "The run is finished. Your place in this lobby is still here.";
+        context.setAttribute("aria-live", "polite");
+        context.textContent = this.compact
+            ? "Wreckage replay · 4s"
+            : "The run is finished. Your place in this lobby is still here.";
 
         const scoreRow = document.createElement("div");
         scoreRow.className = "game-over-score";
@@ -74,11 +80,14 @@ export default class GameOverMenu extends Menu {
         retry.type = "button";
         retry.className = "game-over-action";
         retry.textContent = "Retry";
+        retry.hidden = this.compact;
         retry.addEventListener("click", () => window.location.reload());
 
         const hint = document.createElement("p");
         hint.className = "game-over-hint";
-        hint.textContent = "Retry reloads the arena and returns you to this lobby.";
+        hint.textContent = this.compact
+            ? "The full arena stays live while you watch."
+            : "Retry reloads the arena and returns you to this lobby.";
 
         panel.append(heading, context, scoreRow, retry, hint);
         overlay.append(panel);
@@ -86,6 +95,9 @@ export default class GameOverMenu extends Menu {
 
         this.overlay = overlay;
         this.scoreOutput = scoreOutput;
+        this.context = context;
+        this.retry = retry;
+        if (this.compact) return;
         const focusRetry = () => retry.focus({ preventScroll: true });
         if (typeof requestAnimationFrame === "function") requestAnimationFrame(focusRetry);
         else focusRetry();
@@ -94,6 +106,19 @@ export default class GameOverMenu extends Menu {
     setScore(score) {
         this.score = Number.isFinite(score) ? score : 0;
         if (this.scoreOutput !== null) this.scoreOutput.textContent = String(this.score);
+    }
+
+    setReplay(remainingMs) {
+        if (!this.compact || this.context === null || remainingMs <= 0) return;
+        const text = `Wreckage replay · ${Math.max(1, Math.ceil(remainingMs / 1000))}s`;
+        if (this.context.textContent !== text) this.context.textContent = text;
+    }
+
+    finishReplay() {
+        if (!this.compact || this.overlay === null || !this.overlay.classList.contains("is-replay")) return;
+        this.overlay.classList.remove("is-replay");
+        if (this.context !== null) this.context.textContent = "Watching the arena. Retry when ready.";
+        if (this.retry !== null) this.retry.hidden = false;
     }
 
     drawCanvasFallback() {
@@ -148,6 +173,8 @@ export default class GameOverMenu extends Menu {
         this.overlay?.remove();
         this.overlay = null;
         this.scoreOutput = null;
+        this.context = null;
+        this.retry = null;
         if (typeof HTMLElement !== "undefined" && this.previousFocus instanceof HTMLElement) {
             this.previousFocus.focus({ preventScroll: true });
         }

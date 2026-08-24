@@ -11,6 +11,19 @@ const Buf = json.Buf;
 
 pub const UsernameCheck = struct { ok: bool, trimmed: []const u8 };
 
+/// Code points that can alter visual order, hide content, or create a second
+/// logical line without contributing visible text. Keep this predicate shared
+/// by usernames and chat so a name cannot spoof the layout beside an otherwise
+/// safe message. ZWJ (U+200D) is deliberately allowed for emoji sequences, and
+/// ordinary RTL letters remain valid.
+pub fn isForbiddenDisplayCodepoint(cp: u21) bool {
+    return cp < 0x20 or (cp >= 0x7f and cp <= 0x9f) or
+        cp == 0x061c or cp == 0x200b or cp == 0x200e or cp == 0x200f or
+        cp == 0x2028 or cp == 0x2029 or
+        (cp >= 0x202a and cp <= 0x202e) or
+        cp == 0x2060 or (cp >= 0x2066 and cp <= 0x2069) or cp == 0xfeff;
+}
+
 fn isJsSpace(cp: u21) bool {
     return cp == ' ' or cp == '\t' or cp == '\n' or cp == '\r' or cp == 0x0B or cp == 0x0C or
         cp == 0x85 or cp == 0xA0 or cp == 0x1680 or (cp >= 0x2000 and cp <= 0x200A) or
@@ -50,6 +63,7 @@ pub fn checkUsername(raw: []const u8) UsernameCheck {
         const len = std.unicode.utf8ByteSequenceLength(trimmed[index]) catch return .{ .ok = false, .trimmed = trimmed };
         if (index + len > trimmed.len) return .{ .ok = false, .trimmed = trimmed };
         const cp = std.unicode.utf8Decode(trimmed[index .. index + len]) catch return .{ .ok = false, .trimmed = trimmed };
+        if (isForbiddenDisplayCodepoint(cp)) return .{ .ok = false, .trimmed = trimmed };
         const allowed = cp == '_' or cp == '-' or cp == ' ' or
             (cp >= '0' and cp <= '9') or (cp >= 'A' and cp <= 'Z') or
             (cp >= 'a' and cp <= 'z') or cp >= 0x80;
@@ -84,6 +98,16 @@ test "username validation accepts long Unicode names within wire bounds" {
     try std.testing.expectEqualStrings("trimmed", checkUsername("  trimmed  ").trimmed);
 }
 
+test "username validation rejects controls and directional layout spoofing" {
+    try std.testing.expect(!checkUsername("ab\x01cd").ok);
+    try std.testing.expect(!checkUsername("ab\xc2\x85cd").ok); // C1 NEL
+    try std.testing.expect(!checkUsername("abc\xe2\x80\x8bdef").ok); // zero-width space
+    try std.testing.expect(!checkUsername("abc\xe2\x80\x8edef").ok); // LRM
+    try std.testing.expect(!checkUsername("abc\xe2\x80\xaedef").ok); // RLO
+    try std.testing.expect(!checkUsername("abc\xe2\x81\xa6def").ok); // LRI
+    try std.testing.expect(checkUsername("مرحبا").ok);
+    try std.testing.expect(checkUsername("abc👩‍💻").ok);
+}
 fn hexValue(ch: u8) ?u8 {
     return switch (ch) {
         '0'...'9' => ch - '0',

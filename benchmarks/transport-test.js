@@ -160,4 +160,27 @@ transport.emit('clientReady', 'Alice', 'room', '🔐'.repeat(17));
 transport.emit('clientReady', 'Alice', 'room', 'x'.repeat(65));
 assert.equal(second.sent.length, beforePasswordBounds + 2, 'oversize passwords are rejected before send');
 
+// Boost state is a fixed two-byte held/released packet and is never queued.
+const beforeBoost = second.sent.length;
+assert.equal(transport.emit('boost', true), true);
+assert.equal(transport.emit('boost', false), true);
+assert.deepEqual(Array.from(second.sent[beforeBoost]), [4, 1]);
+assert.deepEqual(Array.from(second.sent[beforeBoost + 1]), [4, 0]);
+
+// Chat is a raw type-5 UTF-8 payload. The transport trims it, enforces both
+// scalar and byte ceilings, and reports whether it actually reached a live WS.
+const beforeChat = second.sent.length;
+assert.equal(transport.emit('chat', '  hello 🐍  '), true);
+assert.deepEqual(Array.from(second.sent[beforeChat]), [5, ...Buffer.from('hello 🐍')]);
+assert.equal(transport.emit('chat', 'x'.repeat(96)), true);
+assert.equal(transport.emit('chat', '🐍'.repeat(40)), true, '40 four-byte code points fit 160 bytes');
+assert.equal(transport.emit('chat', 'x'.repeat(97)), false, '97 Unicode scalars are rejected');
+assert.equal(transport.emit('chat', '🐍'.repeat(41)), false, '164 UTF-8 bytes are rejected');
+assert.equal(transport.emit('chat', '   '), false, 'empty trimmed chat is rejected');
+assert.equal(second.sent.length, beforeChat + 3);
+
+second.close();
+assert.equal(transport.emit('chat', 'offline'), false, 'chat is never queued while disconnected');
+assert.equal(transport.emit('boost', true), false, 'boost state is never queued while disconnected');
+
 console.log('transport protocol tests: PASS');

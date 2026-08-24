@@ -6,9 +6,11 @@ up to 4.67 GHz) and Zig 0.16.0 `-O ReleaseFast -fstrip`.
 ## Outcome
 
 The production result is a Zig-only server using raw RFC 6455 WebSockets,
-binary input, binary snapshot v4, one epoll I/O reactor, and game workers that
+binary input, binary snapshot v5, one epoll I/O reactor, and game workers that
 expand at 128 lobbies per worker. The measured 12,000-player configuration used
-750 lobbies, six game workers, and seven process threads in total.
+snapshot v4, 750 lobbies, six game workers, and seven process threads in total;
+the later bounded Arcade v2 extension has not been rerun through that scaling
+trial, so the numbers below must not be attributed to v5.
 
 At the top stage it sustained:
 
@@ -129,9 +131,9 @@ fill 3.49x faster, and makes ordered removal/refill 5.88x faster. Across 750
 full lobbies the requested backing-memory reduction is about 432,000 bytes;
 actual RSS depends on allocator size classes.
 
-## Snapshot v4 production-encoder benchmark
+## Snapshot v4 core encoder benchmark
 
-The current encoder was measured directly in Zig with 16 players, a retained
+The v4 encoder was measured directly in Zig with 16 players, a retained
 output buffer, periodic keyframes, and stationary and moving delta streams. The
 harness reports the median of five samples and is reproducible with
 `cd servers/zig && zig run -O ReleaseFast bench_snapshot.zig`.
@@ -153,6 +155,13 @@ where periodic keyframes dominate more bytes), while encode time fell by
 20-26% for the representative short bodies. Stationary v3 streams also encoded
 14-19% faster at one and 18 cells because player transition state is computed
 once per frame.
+
+Production snapshot v5 retains this keyframe/delta core and uses the former
+world-header bit 7 to select an Arcade v2 suffix. Classical and Arcade v1 do
+not carry that suffix. The suffix is capped at 63 remains plus bounded feast
+and bounty metadata. No v5 encoder or end-to-end scaling result has yet been
+recorded here; the v4 table remains historical measured evidence, not a v5
+performance claim.
 
 A separate preceding 1,000-client v3 loopback run held all 1,000 clients with
 zero join failures or sampled disconnects, a 0.9992 configured-tick ratio, and

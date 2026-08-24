@@ -6,6 +6,47 @@ const posix = std.posix;
 
 pub const CELL: i32 = 16;
 pub const SID_LEN = 22;
+pub const MAX_REMAINS: usize = 63;
+pub const MAX_SPECTATORS: usize = 16;
+
+pub const CHAT_TOKEN_CAPACITY: u8 = 4;
+pub const CHAT_REFILL_MS: i64 = 750;
+/// A room-wide ceiling prevents reconnecting peers from multiplying the
+/// per-connection burst allowance. Four messages per second remains usable
+/// for a full lobby while bounding fan-out work independently of joins.
+pub const LOBBY_CHAT_TOKEN_CAPACITY: u8 = 12;
+pub const LOBBY_CHAT_REFILL_MS: i64 = 250;
+
+/// Lobby rules are fixed when the lobby is created. Arcade v1 deliberately
+/// remains a first-class mode so Arcade v2 can evolve without silently
+/// changing the established game.
+pub const GameMode = enum(u8) {
+    classical = 0,
+    arcade_v1 = 1,
+    arcade_v2 = 2,
+
+    pub fn wireName(mode: GameMode) []const u8 {
+        return switch (mode) {
+            .classical => "classical",
+            .arcade_v1 => "arcade_v1",
+            .arcade_v2 => "arcade_v2",
+        };
+    }
+
+    pub fn isClassical(mode: GameMode) bool {
+        return mode == .classical;
+    }
+
+    /// Both Arcade generations retain the original drops, bonus apples, and
+    /// golden apples. Only Arcade v2 enables remains and its related systems.
+    pub fn hasArcadeObjectives(mode: GameMode) bool {
+        return mode != .classical;
+    }
+
+    pub fn isArcadeV2(mode: GameMode) bool {
+        return mode == .arcade_v2;
+    }
+};
 
 pub const Direction = enum { up, down, left, right };
 
@@ -31,6 +72,18 @@ pub const Player = struct {
     queue: [2]Direction = undefined,
     queue_len: usize = 0,
     pending_growth: i64 = 0,
+    /// Three remains convert into one growth/score award. A two-bit counter
+    /// represents the complete 0...2 accumulation range without padding the
+    /// gameplay contract with an unbounded resource balance.
+    mass_progress: u2 = 0,
+    boosting: bool = false,
+    /// Alternates the bounded extra movement substep while boost is held.
+    boost_substep: bool = false,
+    /// Counts boosted substeps until the next tail-cost/remnant shed.
+    boost_cost_ticks: u8 = 0,
+    kills: u16 = 0,
+    streak: u16 = 0,
+    last_kill_at: i64 = 0,
     conn: *Conn,
 
     pub fn pushTurn(player: *Player, direction: Direction) bool {
@@ -76,6 +129,14 @@ pub const Player = struct {
         while (i > 0) : (i -= 1) player.snake.items[i] = player.snake.items[i - 1];
         player.snake.items[0] = head;
     }
+
+    /// Removes and returns one real body cell while preserving a playable
+    /// minimum length. The caller owns any remnant created from the returned
+    /// cell; this type intentionally performs no lobby allocation.
+    pub fn shedTail(player: *Player, min_cells: usize) ?CellPos {
+        if (player.snake.items.len <= min_cells) return null;
+        return player.snake.pop();
+    }
 };
 
 test "growth allocation failure leaves movement state unchanged" {
@@ -105,9 +166,42 @@ test "growth allocation failure leaves movement state unchanged" {
     try std.testing.expectEqualSlices(CellPos, &.{.{ .x = CELL, .y = CELL }}, player.snake.items);
 }
 
+test "game modes keep established objectives isolated from arcade v2" {
+    try std.testing.expect(GameMode.classical.isClassical());
+    try std.testing.expect(!GameMode.classical.hasArcadeObjectives());
+    try std.testing.expect(!GameMode.arcade_v1.isArcadeV2());
+    try std.testing.expect(GameMode.arcade_v1.hasArcadeObjectives());
+    try std.testing.expect(GameMode.arcade_v2.hasArcadeObjectives());
+    try std.testing.expect(GameMode.arcade_v2.isArcadeV2());
+    try std.testing.expectEqualStrings("arcade_v1", GameMode.arcade_v1.wireName());
+}
+
+test "tail shedding preserves the configured minimum length" {
+    const allocator = std.testing.allocator;
+    var connection: Conn = .{ .fd = -1 };
+    var player: Player = .{
+        .id = "id",
+        .name = @constCast("name"),
+        .color_hex = @constCast("#fff"),
+        .conn = &connection,
+    };
+    defer player.snake.deinit(allocator);
+    try player.snake.appendSlice(allocator, &.{
+        .{ .x = 3 * CELL, .y = CELL },
+        .{ .x = 2 * CELL, .y = CELL },
+        .{ .x = CELL, .y = CELL },
+    });
+
+    try std.testing.expectEqual(CellPos{ .x = CELL, .y = CELL }, player.shedTail(2).?);
+    try std.testing.expectEqual(@as(usize, 2), player.snake.items.len);
+    try std.testing.expectEqual(@as(?CellPos, null), player.shedTail(2));
+    try std.testing.expectEqual(@as(usize, 2), player.snake.items.len);
+}
+
 pub const BonusApple = struct { pos: CellPos };
 pub const Drop = struct { pos: CellPos, expires_at: i64 };
 pub const Golden = struct { pos: CellPos, expires_at: i64 };
+pub const Remnant = struct { pos: CellPos, expires_at: i64 };
 pub const TickStats = struct {
     last_tick_ms: f64 = 0,
     avg_tick_ms: f64 = 0,
@@ -173,9 +267,17 @@ pub const Lobby = struct {
     password_salt: [16]u8 = @splat(0),
     password_hash: [32]u8 = @splat(0),
     password_protected: bool = false,
-    /// The creator fixes this for the lobby lifetime. Classical mode contains
-    /// only the main food pickup: no drops, bonus apples, or golden apples.
-    classical: bool = false,
+    /// Zero keeps a room invite-only. Values 2...16 make a passwordless room
+    /// discoverable by Quick Join until its active snakes reach this soft
+    /// target; retained game-over chat members do not make a room look full.
+    public_target: u8 = 0,
+    /// Shared, allocation-free chat token bucket. Access is serialized by the
+    /// lobby mutex alongside membership and broadcast fan-out.
+    chat_tokens: u8 = LOBBY_CHAT_TOKEN_CAPACITY,
+    chat_last_refill_ms: i64 = 0,
+    /// The creator fixes this for the lobby lifetime. Arcade v1 remains the
+    /// compatibility default; Classical and Arcade v2 are always explicit.
+    mode: GameMode = .arcade_v1,
     /// Reactor-owned. Generated lobbies do not acquire a simulation thread
     /// until their first successful player join.
     worker_assigned: bool = false,
@@ -184,12 +286,21 @@ pub const Lobby = struct {
     /// Stable insertion order is protocol-significant; membership is capped at
     /// 16, so a pointer list is smaller and cheaper than a string hash map.
     players: std.ArrayListUnmanaged(*Player) = .empty,
+    /// Eliminated connections remain attached for game-over chat, while their
+    /// binary death replay ends at Conn.spectating_until. Callers enforce
+    /// MAX_SPECTATORS and the process-wide retained-member cap before append;
+    /// pointers never outlive their reactor-owned connections.
+    spectators: std.ArrayListUnmanaged(*Conn) = .empty,
     food: CellPos,
     bonus: std.ArrayListUnmanaged(BonusApple) = .empty,
     drops: std.ArrayListUnmanaged(Drop) = .empty,
     golden: ?Golden = null,
     next_drop_at: i64 = 0,
     next_golden_at: i64 = 0,
+    remains: std.ArrayListUnmanaged(Remnant) = .empty,
+    feast_until: i64 = 0,
+    next_feast_at: i64 = 0,
+    bounty_slot: ?u8 = null,
     last_empty_at: i64 = 0,
     roster_wire: std.ArrayListUnmanaged(u8) = .empty,
     roster_dirty: bool = true,
@@ -226,6 +337,13 @@ pub const Conn = struct {
     next_ping_ms: i64 = 0,
     awaiting_pong_since: ?i64 = null,
     last_activity_ms: i64 = 0,
+    /// Per-connection token bucket for live lobby chat. New connections start
+    /// full; main.zig refills lazily from `chat_last_refill_ms`.
+    chat_tokens: u8 = CHAT_TOKEN_CAPACITY,
+    chat_last_refill_ms: i64 = 0,
+    spectating_until: i64 = 0,
+    spectate_focus: ?CellPos = null,
+    spectate_score: i64 = 0,
     /// Visibility affects snapshot delivery only. The lobby worker continues
     /// to simulate this player's snake at the normal authoritative tick rate.
     snapshot_hidden: std.atomic.Value(bool) = .init(false),

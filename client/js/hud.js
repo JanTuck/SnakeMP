@@ -8,6 +8,7 @@ const rowState = Array.from({ length: MAX_LEADERS }, () => ({
     name: '',
     score: 0,
     isMe: false,
+    isBounty: false,
     visible: false,
 }));
 const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
@@ -56,7 +57,7 @@ export const Motion = Object.freeze({
 });
 
 let els = null;
-let classicalMode = false;
+let gameMode = 'arcade_v1';
 const lastMe = { id: null, name: '', score: 0, length: 0 };
 let scoreVisible = false;
 let boardVisible = false;
@@ -66,11 +67,24 @@ function setText(element, value) {
     if (element.textContent !== text) element.textContent = text;
 }
 
+function modeLabel() {
+    if (gameMode === 'classical') return 'Classical';
+    if (gameMode === 'arcade_v2') return 'Arcade v2';
+    return 'Arcade v1';
+}
+
 function feedContent(item) {
     switch (item.type) {
         case 'join':
             return { asset: '/img/snek.png', className: '', text: `${item.who} slithered in` };
+        case 'kill':
+            return { asset: '/img/snek.png', className: 'is-kill', text: `${item.killer} cut off ${item.who}${item.streak >= 2 ? ` — ${item.streak} streak` : ''}` };
         case 'death':
+            if (gameMode === 'arcade_v2' && typeof item.killerId === 'string' && typeof item.killer === 'string') {
+                const streak = item.streak >= 2 ? ` · ${item.streak} streak` : '';
+                const bounty = item.bounty > 0 ? ` · +${item.bounty} bounty` : '';
+                return { asset: '/img/snek.png', className: 'is-kill', text: `${item.killer} cut off ${item.who}${streak}${bounty}` };
+            }
             return { asset: '/img/snek.png', className: 'is-death', text: `${item.who} crashed — score ${item.score}` };
         case 'drop-incoming':
             return { asset: '/img/crate.png', className: '', text: 'Supply drop incoming' };
@@ -78,6 +92,11 @@ function feedContent(item) {
             return { asset: '/img/crate.png', className: '', text: `${item.who} cracked a crate — +${item.apples} apples` };
         case 'golden':
             return { asset: '/img/golden.png', className: '', text: `${item.who} caught the golden apple — +${item.points}` };
+        case 'bounty':
+            return { asset: '/img/golden.png', className: 'is-bounty', text: `Bounty on ${item.who}${item.points > 0 ? ` — +${item.points}` : ''}` };
+        case 'feast':
+        case 'feast-start':
+            return { asset: '/img/snek.png', className: 'is-feast', text: 'Feast — remains linger longer' };
         default:
             return { asset: '/img/snek.png', className: '', text: 'Game update' };
     }
@@ -170,16 +189,25 @@ export const Hud = {
             mute: document.getElementById('hud_mute'),
             mode: document.getElementById('hud_mode'),
         };
-        this.setMode(classicalMode);
+        this.setMode(gameMode);
     },
 
-    setMode(classical) {
-        classicalMode = classical === true;
+    setMode(mode) {
+        gameMode = mode === true || mode === 'classical'
+            ? 'classical'
+            : mode === 'arcade_v2' ? 'arcade_v2' : 'arcade_v1';
         if (els === null) return;
-        setText(els.mode, classicalMode ? 'Classical' : 'Arcade');
-        els.board.setAttribute('aria-label', classicalMode
+        delete els.mode.dataset.feast;
+        setText(els.mode, modeLabel());
+        if (gameMode !== 'arcade_v2') {
+            for (let index = 0; index < MAX_LEADERS; index++) {
+                els.rows[index].row.classList.toggle('hud-bounty', false);
+                rowState[index].isBounty = false;
+            }
+        }
+        els.board.setAttribute('aria-label', gameMode === 'classical'
             ? 'Classical mode standings; special pickups are disabled'
-            : 'Arcade mode standings; special pickups are enabled');
+            : `${modeLabel()} standings; special pickups are enabled`);
     },
 
     setMuted(muted) {
@@ -191,8 +219,19 @@ export const Hud = {
         els.mute.title = label;
     },
 
-    update(players, meId) {
+    update(players, meId, arcadeState = null) {
         if (els === null) return;
+
+        const feastTtl = gameMode === 'arcade_v2' && arcadeState !== null
+            ? Math.max(0, Number(arcadeState.feastTtl) || 0) : 0;
+        if (feastTtl > 0) {
+            els.mode.dataset.feast = 'true';
+            setText(els.mode, `Feast · ${Math.ceil(feastTtl / 1000)}s`);
+        } else {
+            delete els.mode.dataset.feast;
+            setText(els.mode, modeLabel());
+        }
+        const bountyId = gameMode === 'arcade_v2' && arcadeState !== null ? arcadeState.bountyId : null;
 
         const me = findMe(players, meId);
         const nextScoreVisible = me !== null;
@@ -230,7 +269,9 @@ export const Hud = {
 
             if (!rowState[index].visible) elements.row.hidden = false;
             const isMe = player.id === meId;
+            const isBounty = player.id === bountyId;
             if (rowState[index].isMe !== isMe) elements.row.classList.toggle('hud-me', isMe);
+            if (rowState[index].isBounty !== isBounty) elements.row.classList.toggle('hud-bounty', isBounty);
             if (rowState[index].id !== player.id || rowState[index].name !== player.displayName) {
                 setText(elements.name, player.displayName);
             }
@@ -241,12 +282,15 @@ export const Hud = {
             rowState[index].name = player.displayName;
             rowState[index].score = player.score;
             rowState[index].isMe = isMe;
+            rowState[index].isBounty = isBounty;
             rowState[index].visible = true;
+            elements.row.setAttribute('aria-label', `${index + 1}, ${player.displayName}, ${player.score} points${isBounty ? ', bounty' : ''}`);
         }
     },
 
     feed(item) {
         if (els === null) return;
+        if (gameMode !== 'arcade_v2' && (item.type === 'kill' || item.type === 'bounty' || item.type === 'feast' || item.type === 'feast-start')) return;
         const content = feedContent(item);
         const entry = document.createElement('div');
         const icon = document.createElement('img');

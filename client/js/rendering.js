@@ -5,7 +5,7 @@ import { Sfx } from "./audio.js";
 import { Particles } from "./particles.js";
 import { Hud, Motion } from "./hud.js";
 import { decodeSnapshot } from "./snapshot.js";
-import { resetDirection, syncDirection } from "./userInput.js";
+import { releaseBoost, resetDirection, setGameMode, setGameplayEnabled, syncDirection } from "./userInput.js";
 
 // Module scripts run after the DOM is parsed, so the canvas/socket exist
 // already. Wiring handlers here instead of inside window.onload avoids a
@@ -17,17 +17,23 @@ const nameplateLayer = document.getElementById("nameplates");
 
 const TICK_MS = 1000 / 15; // must match the server game loop
 const DROP_TTL_MS = 25000;
+const DEATH_REPLAY_MS = 3500;
+const DANGER_CHECK_MS = 100;
+const DANGER_RADIUS = 32 * 16;
 
 const snakeList = new Map();
 const nameplates = new Map();
 let food = null;
 let isSetup = false;
 let gameOver = false;
+let spectating = false;
+let gameMode = 'arcade_v1';
 let errorTimeout = null;
 let gameOverMenu = null;
+let deathReplay = null;
 
 // World pickups (supply drops, bonus apples, golden apple).
-let world = { bonus: [], drops: [], golden: null };
+let world = { bonus: [], drops: [], golden: null, remains: [], feastTtl: 0, bountyId: null };
 let roster = [];
 let compactPlayers = [];
 const compactById = new Map();
@@ -38,6 +44,9 @@ let lastFrameAt = 0;
 let renderReady = false;
 let framePending = false;
 const prevScores = new Map();
+const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)') || { matches: false };
+let lastDangerCheck = -Infinity;
+let dangerId = null;
 
 function requestFrame(resuming = false) {
     if (!renderReady || framePending) return;
@@ -103,6 +112,7 @@ function ensureNameplate(id, displayName) {
         plate.displayName = displayName;
         plate.element.textContent = displayName;
     }
+    plate.element.classList.toggle('is-bounty', id === world.bountyId && gameMode === 'arcade_v2');
 }
 
 function removeNameplate(id) {
@@ -110,6 +120,14 @@ function removeNameplate(id) {
     if (plate === undefined) return;
     plate.element.remove();
     nameplates.delete(id);
+}
+
+function setBountyId(id) {
+    const next = gameMode === 'arcade_v2' && typeof id === 'string' ? id : null;
+    if (world.bountyId === next) return;
+    if (world.bountyId !== null) nameplates.get(world.bountyId)?.element.classList.toggle('is-bounty', false);
+    world.bountyId = next;
+    if (next !== null) nameplates.get(next)?.element.classList.toggle('is-bounty', true);
 }
 
 function prepareNameplate(snake, t, rect) {
@@ -177,6 +195,7 @@ socket.on("r", (nextRoster) => {
             removeNameplate(id);
         }
     }
+    if (world.bountyId !== null && !live.has(world.bountyId)) setBountyId(null);
     roster = nextRoster;
     compactPlayers = nextPlayers;
     // The server follows every changed roster with an independent keyframe.
@@ -188,7 +207,7 @@ function resizeObjects(array, length) {
     array.length = length;
 }
 
-// The decoder validates the complete v3 frame into bounded scratch storage
+// The decoder validates the complete v5 frame into bounded scratch storage
 // before any visible game state is committed here.
 socket.on("b", (payload) => {
     if (!isSetup || gameOver) return;
@@ -248,6 +267,15 @@ socket.on("b", (payload) => {
             world.golden.y = frame.goldenY * 16;
             world.golden.ttl = frame.goldenTtl;
         }
+        resizeObjects(world.remains, gameMode === 'arcade_v2' ? frame.remainsCount : 0);
+        for (let index = 0; index < world.remains.length; index++) {
+            const remain = world.remains[index];
+            remain.x = frame.remains[index].x * 16;
+            remain.y = frame.remains[index].y * 16;
+            remain.ttl = frame.remains[index].ttl;
+        }
+        world.feastTtl = gameMode === 'arcade_v2' ? frame.feastTtl : 0;
+        setBountyId(gameMode === 'arcade_v2' && frame.hasBounty ? roster[frame.bountySlot]?.[0] : null);
         world.players = compactPlayers;
         lastSnapshotSequence = frame.sequence;
         lastTickAt = performance.now();
@@ -266,17 +294,29 @@ socket.on("b", (payload) => {
             try { Hud.popScore(); } catch (_) {}
         }
     }
-    try { Hud.update(compactPlayers, socket.id); } catch (_) {}
+    try { Hud.update(compactPlayers, socket.id, { feastTtl: world.feastTtl, bountyId: world.bountyId }); } catch (_) {}
 });
 
 socket.on('init', (initData) => {
     document.getElementById('game_popup').style.display = 'none';
-    Hud.setMode(initData.classical === true);
+    gameMode = initData.mode === 'arcade_v2'
+        ? 'arcade_v2'
+        : initData.mode === 'classical' || initData.classical === true ? 'classical' : 'arcade_v1';
+    Hud.setMode(gameMode);
+    setGameMode(gameMode);
 
     food = { x: initData.food.x, y: initData.food.y };
     gameOver = false;
+    spectating = false;
+    deathReplay = null;
+    world.remains.length = 0;
+    world.feastTtl = 0;
+    setBountyId(null);
+    dangerId = null;
+    lastDangerCheck = -Infinity;
     nameplateLayer.hidden = false;
     resetDirection();
+    setGameplayEnabled(true);
     gameOverMenu?.destroy?.();
     gameOverMenu = null;
     isSetup = true;
@@ -295,14 +335,18 @@ socket.on('updateFood', (data) => {
 });
 
 socket.on('feed', (item) => {
+    if (item === null || typeof item !== 'object') return;
     Hud.feed(item);
     if (item.type === 'drop-open') Sfx.drop();
     else if (item.type === 'golden') Sfx.golden();
     else if (item.type === 'join') Sfx.join();
     else if (item.type === 'drop-incoming') Sfx.countIn();
-    else if (item.type === 'death' && item.who !== undefined) {
-        // Burst at the victim's last known position (not our own screen centre).
-        const victim = (world.players || []).find((p) => p.displayName === item.who);
+    else if ((item.type === 'death' || item.type === 'kill') && item.who !== undefined) {
+        // Arcade v2 attribution is identity-based: display names are not unique.
+        const victimId = item.victimId ?? item.whoId ?? item.id;
+        const victim = typeof victimId === 'string'
+            ? compactById.get(victimId)
+            : gameMode === 'arcade_v2' ? undefined : (world.players || []).find((p) => p.displayName === item.who);
         if (victim !== undefined) {
             Particles.burst(victim.snake[0].x + 8, victim.snake[0].y + 8, victim.color, 24, 4);
             requestFrame(true);
@@ -310,19 +354,39 @@ socket.on('feed', (item) => {
     }
 });
 
-socket.on('death', (score) => {
-    gameOver = true; // Stop drawing ticks over the game over screen.
-    nameplateLayer.hidden = true;
-    resetDirection();
-    Sfx.death();
-    shakeUntil = performance.now() + 450;
-    // Burst where OUR snake actually died (last known head position).
+socket.on('death', (death) => {
+    const score = typeof death === 'number' ? death : Number(death?.score) || 0;
+    const replayMs = Number.isFinite(death?.spectateMs) && death.spectateMs > 0
+        ? Math.min(10_000, death.spectateMs) : DEATH_REPLAY_MS;
+    const now = performance.now();
     const me = snakeList.get(socket.id);
     const head = me !== undefined ? me.snake[0] : null;
-    Particles.burst(head !== null ? head.x + 8 : canvas.width / 2,
-                    head !== null ? head.y + 8 : canvas.height / 2,
-                    me !== undefined ? me.color : '#e74c3c', 40, 5);
-    gameOverMenu = new GameOverMenu(ctx);
+    const focus = death?.focus && typeof death.focus === 'object' ? death.focus : death;
+    const focusX = Number.isFinite(focus?.x) ? focus.x : head !== null ? head.x + 8 : canvas.width / 2;
+    const focusY = Number.isFinite(focus?.y) ? focus.y : head !== null ? head.y + 8 : canvas.height / 2;
+
+    releaseBoost();
+    setGameplayEnabled(false);
+    resetDirection();
+    Sfx.death();
+    shakeUntil = now + 450;
+    // Burst where OUR snake actually died (last known head position).
+    Particles.burst(focusX, focusY, me !== undefined ? me.color : '#e74c3c', 40, 5);
+    gameOverMenu?.destroy?.();
+
+    if (gameMode === 'arcade_v2') {
+        gameOver = false;
+        spectating = true;
+        deathReplay = { x: focusX, y: focusY, startedAt: now, until: now + replayMs, duration: replayMs, finished: false };
+        gameOverMenu = new GameOverMenu(ctx, { compact: true });
+        gameOverMenu.setReplay(replayMs);
+    } else {
+        gameOver = true; // Established Classical / Arcade v1 terminal presentation.
+        spectating = false;
+        deathReplay = null;
+        nameplateLayer.hidden = true;
+        gameOverMenu = new GameOverMenu(ctx);
+    }
     gameOverMenu.setScore(score);
     gameOverMenu.draw();
     requestFrame(true);
@@ -334,6 +398,20 @@ socket.on('disconnect', () => {
 
 // ---- Render loop: interpolated movement at display refresh rate ----
 function drawWorld(now) {
+    // Arcade v2 remains stay deliberately quieter than apples: neutral matte
+    // pellets communicate edible mass without turning a death into confetti.
+    if (gameMode === 'arcade_v2') {
+        for (const remain of world.remains) {
+            const alpha = remain.ttl < 2000 ? Math.max(0.25, remain.ttl / 2000) : 1;
+            ctx.globalAlpha = alpha;
+            ctx.fillStyle = '#756d63';
+            ctx.fillRect(remain.x + 4, remain.y + 4, 9, 9);
+            ctx.fillStyle = '#a69b8c';
+            ctx.fillRect(remain.x + 5, remain.y + 5, 3, 2);
+        }
+        ctx.globalAlpha = 1;
+    }
+
     // Main apple with a gentle bob so the board feels alive.
     if (food !== null) {
         const bob = Math.sin(now / 220) * 1.5;
@@ -371,6 +449,90 @@ function drawWorld(now) {
     }
 }
 
+function refreshDanger(now) {
+    if (gameMode !== 'arcade_v2' || spectating || now - lastDangerCheck < DANGER_CHECK_MS) return;
+    lastDangerCheck = now;
+    dangerId = null;
+    const local = snakeList.get(socket.id);
+    const localHead = local?.snake[0];
+    const localPrevious = local?.prevSnake?.[0];
+    if (localHead === undefined || localPrevious === undefined) return;
+
+    let nearestDistance = DANGER_RADIUS * DANGER_RADIUS;
+    for (const [id, other] of snakeList) {
+        if (id === socket.id) continue;
+        const head = other.snake[0];
+        const previous = other.prevSnake?.[0];
+        if (head === undefined || previous === undefined) continue;
+        const x = head.x - localHead.x;
+        const y = head.y - localHead.y;
+        const distance = x * x + y * y;
+        if (distance === 0 || distance > nearestDistance) continue;
+        const relativeX = (head.x - previous.x) - (localHead.x - localPrevious.x);
+        const relativeY = (head.y - previous.y) - (localHead.y - localPrevious.y);
+        if (x * relativeX + y * relativeY >= 0) continue;
+        dangerId = id;
+        nearestDistance = distance;
+    }
+}
+
+function drawDanger(t, now) {
+    if (gameMode !== 'arcade_v2' || spectating) return;
+    refreshDanger(now);
+    if (dangerId === null) return;
+    const local = snakeList.get(socket.id);
+    const threat = snakeList.get(dangerId);
+    const localHead = local?.snake[0], threatHead = threat?.snake[0];
+    if (localHead === undefined || threatHead === undefined) return;
+    const localPrev = local.prevSnake?.[0] || localHead;
+    const threatPrev = threat.prevSnake?.[0] || threatHead;
+    const localX = localPrev.x + (localHead.x - localPrev.x) * t + 8;
+    const localY = localPrev.y + (localHead.y - localPrev.y) * t + 8;
+    const threatX = threatPrev.x + (threatHead.x - threatPrev.x) * t + 8;
+    const threatY = threatPrev.y + (threatHead.y - threatPrev.y) * t + 8;
+    const dx = threatX - localX, dy = threatY - localY;
+    const length = Math.hypot(dx, dy);
+    if (length === 0) return;
+    const ux = dx / length, uy = dy / length;
+    const px = -uy, py = ux;
+    const tipX = localX + ux * 34, tipY = localY + uy * 34;
+    const backX = tipX - ux * 8, backY = tipY - uy * 8;
+
+    ctx.save();
+    ctx.globalAlpha = 0.76;
+    ctx.strokeStyle = '#b93d35';
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(backX + px * 5, backY + py * 5);
+    ctx.lineTo(tipX, tipY);
+    ctx.lineTo(backX - px * 5, backY - py * 5);
+    ctx.stroke();
+    ctx.restore();
+}
+
+function drawDeathReplay(now) {
+    if (deathReplay === null || deathReplay.finished) return;
+    const remaining = deathReplay.until - now;
+    if (remaining <= 0) {
+        deathReplay.finished = true;
+        gameOverMenu?.finishReplay?.();
+        return;
+    }
+    gameOverMenu?.setReplay?.(remaining);
+    const progress = (now - deathReplay.startedAt) / deathReplay.duration;
+    const radius = reducedMotion.matches ? 28 : 24 + Math.max(0, Math.min(1, progress)) * 14;
+    ctx.save();
+    ctx.globalAlpha = Math.max(0.25, remaining / deathReplay.duration);
+    ctx.strokeStyle = '#f5efe6';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(deathReplay.x, deathReplay.y, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+}
+
 function frame(now) {
     framePending = false;
     const dt = lastFrameAt === 0 ? 16 : now - lastFrameAt;
@@ -406,6 +568,8 @@ function frame(now) {
         snake.draw(t);
         prepareNameplate(snake, t, canvasRect);
     }
+    drawDanger(t, now);
+    drawDeathReplay(now);
     placeNameplates(canvasRect);
     Particles.update(dt);
     Particles.draw(ctx);

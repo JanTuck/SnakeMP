@@ -41,6 +41,18 @@ pub const DROP_POINTS: i64 = 2;
 pub const DROP_GROWTH: i64 = 2;
 pub const DROP_APPLES: usize = 4;
 
+// Arcade v2 is intentionally bounded independently of snake length and lobby
+// lifetime so a crowded lobby cannot turn corpse mass into retained state.
+pub const REMAINS_TTL_MS: i64 = 15_000;
+pub const FEAST_REMAINS_TTL_MS: i64 = 25_000;
+pub const FEAST_DURATION_MS: i64 = 10_000;
+pub const CORPSE_REMAINS_MAX: usize = 20;
+pub const REMAINS_PER_GROWTH: u2 = 3;
+pub const BOOST_COST_TICKS: u8 = 15;
+pub const BOOST_MIN_CELLS: usize = 5;
+pub const SPECTATE_FOCUS_MS: i64 = 3_500;
+pub const BOUNTY_MIN_SCORE: i64 = 5;
+
 pub const PING_INTERVAL_MS: i64 = 20_000;
 pub const PING_TIMEOUT_MS: i64 = 15_000;
 

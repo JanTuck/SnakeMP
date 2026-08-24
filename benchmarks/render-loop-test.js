@@ -30,6 +30,13 @@ const vm = require('node:vm');
   let particleUpdates = 0;
   let lastParticleDt = 0;
   const modes = [];
+  const inputModes = [];
+  const gameplayStates = [];
+  const hudUpdates = [];
+  const menus = [];
+  let decodeCalls = 0;
+  let fillRects = 0;
+  let strokes = 0;
   const Particles = {
     burst() { particlesActive = true; },
     hasActive() { return particlesActive; },
@@ -39,6 +46,8 @@ const vm = require('node:vm');
 
   const ctx = {
     clearRect() {}, save() {}, restore() {}, translate() {}, drawImage() {},
+    fillRect() { fillRects += 1; }, beginPath() {}, moveTo() {}, lineTo() {}, arc() {},
+    stroke() { strokes += 1; },
   };
   const canvas = {
     width: 2048,
@@ -57,37 +66,70 @@ const vm = require('node:vm');
   };
 
   class GameOverMenu {
-    constructor() { this.buttonArray = []; }
-    setScore() {}
+    constructor(_ctx, options = {}) { this.buttonArray = []; this.compact = options.compact === true; menus.push(this); }
+    setScore(score) { this.score = score; }
+    setReplay(ms) { this.replay = ms; }
+    finishReplay() { this.finished = true; }
     draw() {}
+    destroy() { this.destroyed = true; }
+  }
+
+  class Snake {
+    constructor(_ctx, meta) {
+      this.id = meta[0]; this.color = meta[2]; this.scale = 16; this.interpolate = true;
+      this.snake = [{ x: 0, y: 0 }]; this.prevSnake = [{ x: 0, y: 0 }];
+    }
+    updateKeyframe(meta) {
+      this.prevSnake = this.id === 'local' ? [{ x: 100, y: 100 }] : [{ x: 200, y: 100 }];
+      this.snake = this.id === 'local' ? [{ x: 116, y: 100 }] : [{ x: 184, y: 100 }];
+    }
+    updateDelta(meta) { this.updateKeyframe(meta); }
+    draw() {}
+  }
+
+  function decodedFrame() {
+    return {
+      playerCount: 2, kind: 0, sequence: decodeCalls, view: {},
+      players: [{ score: 0, cells: 1 }, { score: 4, cells: 1 }],
+      bonusCount: 0, bonus: [], dropCount: 0, drops: [], hasGolden: false,
+      remainsCount: 1, remains: [{ x: 20, y: 20, ttl: 5000 }],
+      feastTtl: 2200, hasBounty: true, bountySlot: 1,
+    };
   }
 
   const context = vm.createContext({
     console,
     socket,
-    Snake: class {},
+    Snake,
     GameOverMenu,
     Sprites: { async load() {}, get() { return undefined; } },
     Sfx: { muted: false, death() {}, toggle() { return false; } },
     Particles,
-    Hud: { init() {}, setMode(classical) { modes.push(classical); }, setMuted() {}, feed() {}, update() {}, popScore() {} },
+    Hud: { init() {}, setMode(mode) { modes.push(mode); }, setMuted() {}, feed() {}, update(players, id, state) { hudUpdates.push({ players, id, state }); }, popScore() {} },
     Motion: { canvas() {}, popup() {} },
-    decodeSnapshot() { return null; },
+    decodeSnapshot(payload) { decodeCalls += 1; return payload === 'valid-frame' ? decodedFrame() : null; },
+    releaseBoost() {},
     resetDirection() {},
+    setGameMode(mode) { inputModes.push(mode); },
+    setGameplayEnabled(enabled) { gameplayStates.push(enabled); },
     syncDirection() {},
     document: {
       getElementById(id) { return elements[id]; },
       querySelector() { return {}; },
       createElement() {
         const element = {
-          classList: { toggle() {} }, style: {}, hidden: false,
+          _classes: new Set(), style: {}, hidden: false,
           appendChild() {}, textContent: '', offsetWidth: 0, offsetHeight: 0,
+        };
+        element.classList = {
+          toggle(name, force) { if (force === false) element._classes.delete(name); else element._classes.add(name); },
+          contains(name) { return element._classes.has(name); },
         };
         element.remove = () => { element.removed = true; };
         return element;
       },
     },
-    window: { location: { reload() {} } },
+    window: { location: { reload() {} }, matchMedia() { return { matches: false }; } },
     performance: { now() { return 100; } },
     requestAnimationFrame(callback) { queuedFrames.push(callback); return queuedFrames.length; },
     setTimeout() { return 1; },
@@ -106,38 +148,62 @@ const vm = require('node:vm');
   socket.emitEvent('r', []);
   assert.equal(nameplateChildren[0].removed, true, 'departed roster members lose their nameplate');
 
-  socket.emitEvent('init', { food: { x: 10, y: 20 }, classical: true });
-  assert.deepEqual(modes, [true], 'classical init state must reach the HUD mode label');
+  socket.emitEvent('init', { food: { x: 10, y: 20 }, mode: 'classical' });
+  assert.deepEqual(modes, ['classical'], 'classical init state must reach the exact HUD mode label');
   assert.equal(queuedFrames.length, 1, 'initial game setup must start rendering');
-  socket.emitEvent('init', { food: { x: 10, y: 20 }, classical: false });
-  assert.deepEqual(modes, [true, false], 'arcade init state must reach the HUD mode label');
+  socket.emitEvent('init', { food: { x: 10, y: 20 }, mode: 'arcade_v1' });
+  socket.emitEvent('init', { food: { x: 10, y: 20 }, mode: 'arcade_v2' });
+  assert.deepEqual(modes, ['classical', 'arcade_v1', 'arcade_v2']);
+  assert.deepEqual(inputModes, ['classical', 'arcade_v1', 'arcade_v2']);
+  assert.equal(gameplayStates.at(-1), true);
   assert.equal(queuedFrames.length, 1, 'repeated setup must not queue duplicate frames');
+
+  socket.emitEvent('r', [
+    ['local', 'Local', '#00aa66'],
+    ['remote', 'Remote', '#aa3344'],
+  ]);
+  socket.emitEvent('b', 'valid-frame');
+  assert.equal(decodeCalls, 1);
+  assert.equal(hudUpdates.at(-1).state.feastTtl, 2200);
+  assert.equal(hudUpdates.at(-1).state.bountyId, 'remote');
+  assert.equal(nameplateChildren.at(-1)._classes.has('is-bounty'), true, 'bounty slot marks the matching unique-id nameplate');
 
   queuedFrames.shift()(100);
   assert.equal(queuedFrames.length, 1, 'active play must continuously schedule frames');
+  assert.ok(fillRects >= 2, 'Arcade v2 renders one matte remain as a base and highlight');
+  assert.ok(strokes >= 1, 'nearest approaching head receives one restrained danger chevron');
 
-  socket.emitEvent('death', 7);
-  assert.equal(queuedFrames.length, 1, 'death must reuse the already pending active-game frame');
+  socket.emitEvent('death', { score: 7, focus: { x: 140, y: 120 } });
+  assert.equal(menus.at(-1).compact, true, 'Arcade v2 uses the compact spectator retry state');
+  assert.equal(elements.nameplates.hidden, false, 'Arcade v2 preserves remote nameplates and the full live board');
+  assert.equal(gameplayStates.at(-1), false, 'death disables gameplay input without disabling chat');
+  socket.emitEvent('b', 'valid-frame');
+  assert.equal(decodeCalls, 2, 'spectators continue applying authoritative snapshots');
+  assert.equal(queuedFrames.length, 1, 'death reuses the already pending live-arena frame');
   queuedFrames.shift()(116);
   assert.equal(particleUpdates, 2);
-  assert.equal(queuedFrames.length, 1, 'game over must render while particles remain active');
+  assert.equal(queuedFrames.length, 1, 'Arcade v2 spectating continues after the particle burst');
 
   particlesActive = false;
-  queuedFrames.shift()(132);
+  queuedFrames.shift()(4000);
   assert.equal(particleUpdates, 3);
-  assert.equal(queuedFrames.length, 0, 'the loop must stop after the game-over particle tail drains');
+  assert.equal(menus.at(-1).finished, true, 'the 3.5 second wreckage replay resolves into retry state');
+  assert.equal(queuedFrames.length, 1, 'the full board stays live after replay');
 
+  socket.emitEvent('init', { food: { x: 30, y: 40 }, mode: 'arcade_v1' });
   socket.emitEvent('death', 8);
-  assert.equal(queuedFrames.length, 1, 'a later render-producing event must restart an idle loop');
+  assert.equal(menus.at(-1).compact, false, 'Arcade v1 retains its established terminal presentation');
+  assert.equal(elements.nameplates.hidden, true);
+  assert.equal(queuedFrames.length, 1);
   particlesActive = false;
-  queuedFrames.shift()(10_000);
+  queuedFrames.shift()(4016);
   assert.equal(queuedFrames.length, 0);
-  assert.equal(lastParticleDt, 16, 'restarting an idle loop must not apply the whole idle gap to fresh particles');
+  assert.equal(lastParticleDt, 16, 'terminal rendering does not apply an idle-sized particle step');
 
-  socket.emitEvent('init', { food: { x: 30, y: 40 } });
+  socket.emitEvent('init', { food: { x: 30, y: 40 }, mode: 'classical' });
   assert.equal(queuedFrames.length, 1, 'rejoining after game over must restart active rendering');
 
-  console.log('render loop tests: PASS (idle start, active cadence, particle drain, event restart)');
+  console.log('render loop tests: PASS (v2 remains/bounty/danger/spectating; v1 terminal isolation)');
 })().catch((error) => {
   console.error(error.stack || error);
   process.exitCode = 1;

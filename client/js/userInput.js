@@ -23,6 +23,34 @@ const OPPOSITE = new Map([
 
 let observedDirection = null;
 const queuedDirections = [];
+let gameMode = "arcade_v1";
+let boostHeld = false;
+let gameplayEnabled = false;
+
+function isEditingTarget(target) {
+    const tag = target && typeof target.tagName === "string" ? target.tagName.toUpperCase() : "";
+    return Boolean((target && target.isContentEditable) || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT");
+}
+
+function emitBoost(active) {
+    if (boostHeld === active) return;
+    boostHeld = active;
+    socket.emit("boost", active);
+}
+
+export function releaseBoost() {
+    if (boostHeld) emitBoost(false);
+}
+
+export function setGameMode(mode) {
+    gameMode = mode === "arcade_v2" ? "arcade_v2" : mode === "classical" ? "classical" : "arcade_v1";
+    if (gameMode !== "arcade_v2") releaseBoost();
+}
+
+export function setGameplayEnabled(enabled) {
+    gameplayEnabled = enabled === true;
+    if (!gameplayEnabled) releaseBoost();
+}
 
 // Reconcile the local turn predictor with authoritative movement. Keeping
 // unobserved turns queued is important: a snapshot for the old heading can
@@ -64,11 +92,9 @@ function emitDirection(direction) {
 
 function handleDirection(event) {
     const input = INPUTS.get(event.code);
-    if (input === undefined) return;
+    if (input === undefined || !gameplayEnabled) return;
 
-    const target = event.target;
-    const tag = target && typeof target.tagName === "string" ? target.tagName.toUpperCase() : "";
-    if ((target && target.isContentEditable) || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+    if (isEditingTarget(event.target)) return;
 
     event.preventDefault();
     if (event.repeat) return;
@@ -76,4 +102,23 @@ function handleDirection(event) {
     emitDirection(input);
 }
 
+function handleBoostDown(event) {
+    if (event.code !== "Space" || !gameplayEnabled || gameMode !== "arcade_v2" || isEditingTarget(event.target)) return;
+    event.preventDefault();
+    if (event.repeat || boostHeld) return;
+    emitBoost(true);
+}
+
+function handleBoostUp(event) {
+    if (event.code !== "Space" || !boostHeld) return;
+    event.preventDefault();
+    emitBoost(false);
+}
+
 document.addEventListener("keydown", handleDirection);
+document.addEventListener("keydown", handleBoostDown);
+document.addEventListener("keyup", handleBoostUp);
+document.addEventListener("visibilitychange", () => {
+    if (document.hidden) releaseBoost();
+});
+if (typeof window !== "undefined") window.addEventListener("blur", releaseBoost);

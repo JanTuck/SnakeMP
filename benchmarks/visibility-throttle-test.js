@@ -29,7 +29,7 @@ function joinPacket(name, lobby) {
 }
 
 function snapshotHeader(data) {
-  if (data.length < 6 || data[0] !== 0x53 || data[1] !== 0x4e || data[2] !== 4 || (data[5] & 0x60) !== 0) return null;
+  if (data.length < 6 || data[0] !== 0x53 || data[1] !== 0x4e || data[2] !== 5 || (data[5] & 0x60) !== 0) return null;
   const kind = data[5] >>> 7;
   const players = data[5] & 0x1f;
   const item = { at: performance.now(), kind, sequence: data.readUInt16LE(3), head: null };

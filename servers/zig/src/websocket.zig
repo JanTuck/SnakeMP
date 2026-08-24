@@ -3,6 +3,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const model = @import("model.zig");
+const text = @import("text.zig");
 
 pub fn header(out: *[10]u8, opcode: u8, len: usize) usize {
     out[0] = 0x80 | opcode;
@@ -24,7 +25,35 @@ pub const ClientPacket = union(enum) {
     join: struct { lobby_id: []const u8, username: []const u8, password: []const u8 },
     direction: model.Direction,
     visibility: bool,
+    boost: bool,
+    chat: []const u8,
 };
+
+pub const MAX_CHAT_BYTES: usize = 160;
+pub const MAX_CHAT_CODEPOINTS: usize = 96;
+
+/// Validate a single-line chat message without allocating. The returned slice
+/// borrows the caller-owned WebSocket payload and excludes surrounding ASCII
+/// spaces. Newlines, tabs, control characters, and directional formatting
+/// controls are rejected rather than normalized so one logical packet always
+/// renders as one bounded message.
+fn chatMessage(raw: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " ");
+    if (trimmed.len == 0 or trimmed.len > MAX_CHAT_BYTES) return null;
+
+    var count: usize = 0;
+    var index: usize = 0;
+    while (index < trimmed.len) {
+        const len = std.unicode.utf8ByteSequenceLength(trimmed[index]) catch return null;
+        if (index + len > trimmed.len) return null;
+        const cp = std.unicode.utf8Decode(trimmed[index .. index + len]) catch return null;
+        if (text.isForbiddenDisplayCodepoint(cp)) return null;
+        count += 1;
+        if (count > MAX_CHAT_CODEPOINTS) return null;
+        index += len;
+    }
+    return trimmed;
+}
 
 /// Validate a fully decoded client frame header before buffering its payload.
 /// The application protocol never fragments messages, and rejecting that
@@ -124,6 +153,17 @@ pub fn clientPacket(payload: []const u8) ?ClientPacket {
             1 => true,
             else => return null,
         } } else null,
+        // Boost is held state rather than an edge-triggered action. Exact
+        // packets make release unambiguous and reject stale/trailing input.
+        4 => if (payload.len == 2) .{ .boost = switch (payload[1]) {
+            0 => false,
+            1 => true,
+            else => return null,
+        } } else null,
+        // The WebSocket frame already carries an exact length, so chat needs
+        // no redundant length byte. Validation keeps the returned slice
+        // borrowed from the unmasked input buffer.
+        5 => if (chatMessage(payload[1..])) |message| .{ .chat = message } else null,
         else => null,
     };
 }
@@ -192,4 +232,80 @@ test "maximum join packet includes bounded password and rejects trailing bytes" 
     oversized[0] = 2;
     oversized[1] = 0;
     try std.testing.expect(clientPacket(&oversized) == null);
+}
+
+test "boost packets are exact held state" {
+    try std.testing.expect(!(clientPacket(&.{ 4, 0 }).?.boost));
+    try std.testing.expect(clientPacket(&.{ 4, 1 }).?.boost);
+    try std.testing.expect(clientPacket(&.{4}) == null);
+    try std.testing.expect(clientPacket(&.{ 4, 0, 0 }) == null);
+    try std.testing.expect(clientPacket(&.{ 4, 2 }) == null);
+    try std.testing.expect(clientPacket(&.{ 4, 255 }) == null);
+}
+
+test "chat packets trim spaces and retain borrowed Unicode payloads" {
+    const packet = "\x05  hello \xf0\x9f\x90\x8d  ";
+    const message = clientPacket(packet).?.chat;
+    try std.testing.expectEqualStrings("hello \xf0\x9f\x90\x8d", message);
+    try std.testing.expect(@intFromPtr(message.ptr) > @intFromPtr(packet.ptr));
+    try std.testing.expect(@intFromPtr(message.ptr) < @intFromPtr(packet.ptr) + packet.len);
+
+    var max_bytes: [1 + MAX_CHAT_BYTES]u8 = undefined;
+    max_bytes[0] = 5;
+    for (0..40) |index| @memcpy(max_bytes[1 + index * 4 ..][0..4], "\xf0\x9f\x90\x8d");
+    const maximum = clientPacket(&max_bytes).?.chat;
+    try std.testing.expectEqual(@as(usize, MAX_CHAT_BYTES), maximum.len);
+    try std.testing.expectEqual(@intFromPtr(&max_bytes) + 1, @intFromPtr(maximum.ptr));
+}
+
+test "chat packets enforce byte and Unicode scalar bounds" {
+    var scalar_limit: [1 + MAX_CHAT_CODEPOINTS]u8 = undefined;
+    scalar_limit[0] = 5;
+    @memset(scalar_limit[1..], 'a');
+    try std.testing.expectEqual(@as(usize, MAX_CHAT_CODEPOINTS), clientPacket(&scalar_limit).?.chat.len);
+
+    var too_many_scalars: [2 + MAX_CHAT_CODEPOINTS]u8 = undefined;
+    too_many_scalars[0] = 5;
+    @memset(too_many_scalars[1..], 'a');
+    try std.testing.expect(clientPacket(&too_many_scalars) == null);
+
+    var too_many_bytes: [1 + MAX_CHAT_BYTES + 4]u8 = undefined;
+    too_many_bytes[0] = 5;
+    for (0..41) |index| @memcpy(too_many_bytes[1 + index * 4 ..][0..4], "\xf0\x9f\x90\x8d");
+    try std.testing.expect(clientPacket(&too_many_bytes) == null);
+
+    // Byte limits apply after surrounding spaces are removed.
+    var padded: [1 + MAX_CHAT_BYTES + 2]u8 = undefined;
+    padded[0] = 5;
+    padded[1] = ' ';
+    for (0..40) |index| @memcpy(padded[2 + index * 4 ..][0..4], "\xf0\x9f\x90\x8d");
+    padded[padded.len - 1] = ' ';
+    try std.testing.expectEqual(@as(usize, MAX_CHAT_BYTES), clientPacket(&padded).?.chat.len);
+}
+
+test "chat packets reject empty malformed and layout-control text" {
+    try std.testing.expect(clientPacket(&.{5}) == null);
+    try std.testing.expect(clientPacket("\x05     ") == null);
+    try std.testing.expect(clientPacket("\x05\xc0\x80") == null);
+    try std.testing.expect(clientPacket("\x05\xf0\x9f\x90") == null);
+
+    const forbidden = [_][]const u8{
+        "\x05line\nline",
+        "\x05tab\ttext",
+        "\x05\x00hidden",
+        "\x05\xc2\x85",
+        "\x05\xe2\x80\xa8",
+        "\x05\xe2\x80\xa9",
+        "\x05\xd8\x9cmark",
+        "\x05\xe2\x80\x8bhidden",
+        "\x05\xe2\x80\x8emark",
+        "\x05\xe2\x80\x8fmark",
+        "\x05\xe2\x80\xaaoverride",
+        "\x05\xe2\x80\xaeoverride",
+        "\x05\xe2\x81\xa0hidden",
+        "\x05\xe2\x81\xa6isolate",
+        "\x05\xe2\x81\xa9isolate",
+        "\x05\xef\xbb\xbfhidden",
+    };
+    for (forbidden) |packet| try std.testing.expect(clientPacket(packet) == null);
 }

@@ -39,6 +39,7 @@ const startupScripts = new Set([
   ...graph,
   path.join(clientRoot, 'js/userInput.js'),
   path.join(clientRoot, 'js/transport.js'),
+  path.join(clientRoot, 'js/chat.js'),
 ]);
 const startupBytes = [...startupScripts].reduce((total, filename) => total + fs.statSync(filename).size, 0);
 
@@ -66,5 +67,15 @@ assert(!/swords\.png/.test(fs.readFileSync(path.join(clientRoot, 'img/CREDITS.md
 assert(!/gsap/i.test(fs.readFileSync(path.join(clientRoot, 'game.html'), 'utf8')), 'game page still loads GSAP');
 assert(!/window\.gsap/.test(rendering), 'rendering still depends on GSAP');
 assert(!/window\.gsap/.test(fs.readFileSync(path.join(clientRoot, 'js/hud.js'), 'utf8')), 'HUD still depends on GSAP');
+
+const gamePage = fs.readFileSync(path.join(clientRoot, 'game.html'), 'utf8');
+const chat = fs.readFileSync(path.join(clientRoot, 'js/chat.js'), 'utf8');
+for (const route of ['/js/chat.js', '/css/chat.css']) {
+  assert(gamePage.includes(route), `game page does not load ${route}`);
+  assert(manifest.includes(`.path = "${route}"`), `chat asset is not embedded: ${route}`);
+}
+assert(/const MAX_HISTORY = 100;/.test(chat), 'chat session history must remain explicitly bounded');
+assert(!/\.innerHTML\b|insertAdjacentHTML|document\.write/.test(chat), 'chat must only render untrusted text through DOM text nodes');
+assert(/\.textContent = name;/.test(chat) && /\.textContent = text;/.test(chat), 'chat names and messages must use textContent');
 
 console.log(`client asset test passed (${graph.size} rendering modules; ${startupScripts.size} startup JS requests / ${startupBytes} B; 4 modules, 1 image, and GSAP removed)`);

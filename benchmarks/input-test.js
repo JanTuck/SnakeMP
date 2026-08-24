@@ -6,12 +6,19 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 (async () => {
-  let keydown;
+  const documentHandlers = new Map();
+  const windowHandlers = new Map();
   const emitted = [];
   global.document = {
+    hidden: false,
     addEventListener(name, handler) {
-      if (name === 'keydown') keydown = handler;
+      let handlers = documentHandlers.get(name);
+      if (!handlers) documentHandlers.set(name, handlers = []);
+      handlers.push(handler);
     },
+  };
+  global.window = {
+    addEventListener(name, handler) { windowHandlers.set(name, handler); },
   };
   global.socket = {
     emit(name, value) { emitted.push([name, value]); },
@@ -20,15 +27,25 @@ const path = require('node:path');
   const source = fs.readFileSync(path.join(__dirname, '..', 'client', 'js', 'userInput.js'), 'utf8');
   const moduleUrl = 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
   const input = await import(moduleUrl);
-  assert.equal(typeof keydown, 'function');
+  assert.equal(documentHandlers.get('keydown').length, 2);
   assert.equal(input.ARROW_LEFT, 'ArrowLeft');
 
   function press(code, repeat = false, target = undefined) {
     let prevented = false;
-    keydown({ code, repeat, target, preventDefault() { prevented = true; } });
+    const event = { code, repeat, target, preventDefault() { prevented = true; } };
+    for (const handler of documentHandlers.get('keydown')) handler(event);
     return prevented;
   }
-  const directions = () => emitted.map((entry) => entry[1]);
+  function release(code, target = undefined) {
+    let prevented = false;
+    const event = { code, target, preventDefault() { prevented = true; } };
+    for (const handler of documentHandlers.get('keyup')) handler(event);
+    return prevented;
+  }
+  const directions = () => emitted.filter((entry) => entry[0] === 'keyPress').map((entry) => entry[1]);
+
+  assert.equal(press('ArrowLeft'), false, 'gameplay input starts disabled while the join dialog is open');
+  input.setGameplayEnabled(true);
 
   assert.equal(press('Escape'), false, 'unrelated keys must remain untouched');
   assert.equal(press('KeyW', false, { tagName: 'input', isContentEditable: false }), false,
@@ -85,12 +102,43 @@ const path = require('node:path');
   assert.equal(press('KeyS', true), true, 'repeated arrows remain prevented from scrolling');
   assert.equal(emitted.length, beforeRepeat, 'OS key-repeat does not enqueue input');
 
+  input.setGameMode('arcade_v1');
+  const beforeV1Space = emitted.length;
+  assert.equal(press('Space'), false, 'Arcade v1 keeps Space untouched');
+  assert.equal(emitted.length, beforeV1Space);
+
+  input.setGameMode('arcade_v2');
+  assert.equal(press('Space', false, { tagName: 'input' }), false, 'Space remains usable in form fields');
+  assert.equal(press('Space'), true, 'Arcade v2 captures held boost');
+  assert.deepEqual(emitted.at(-1), ['boost', true]);
+  press('Space', true);
+  assert.deepEqual(emitted.slice(-1), [['boost', true]], 'repeat cannot duplicate boost-on');
+  assert.equal(release('Space'), true);
+  assert.deepEqual(emitted.at(-1), ['boost', false]);
+
+  press('Space');
+  windowHandlers.get('blur')();
+  assert.deepEqual(emitted.at(-1), ['boost', false], 'window blur releases held boost');
+  press('Space');
+  global.document.hidden = true;
+  for (const handler of documentHandlers.get('visibilitychange')) handler();
+  assert.deepEqual(emitted.at(-1), ['boost', false], 'hidden tabs release held boost');
+  global.document.hidden = false;
+
+  input.setGameplayEnabled(false);
+  const beforeDisabled = emitted.length;
+  assert.equal(press('ArrowUp'), false, 'death disables steering without affecting the chat keyboard');
+  assert.equal(press('Space'), false, 'death disables boost without swallowing Space');
+  assert.equal(emitted.length, beforeDisabled);
+
   delete global.document;
   delete global.socket;
+  delete global.window;
   console.log('absolute steering input tests: PASS');
 })().catch((error) => {
-  delete global.document;
-  delete global.socket;
+      delete global.document;
+      delete global.socket;
+      delete global.window;
   console.error(error.stack || error);
   process.exitCode = 1;
 });

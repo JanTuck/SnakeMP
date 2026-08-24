@@ -69,11 +69,18 @@ export default class Snake {
             if (head === undefined) head = this.snake[0] = { x: 0, y: 0 };
             head.x = player.headX * this.scale;
             head.y = player.headY * this.scale;
-            for (let index = 1; index < player.cells; index++) {
+            const steps = player.steps === 2 ? 2 : 1;
+            if (steps === 2 && player.cells > 1) {
+                let middle = this.snake[1];
+                if (middle === undefined) middle = this.snake[1] = { x: 0, y: 0 };
+                middle.x = (old[0].x + head.x) / 2;
+                middle.y = (old[0].y + head.y) / 2;
+            }
+            for (let index = steps; index < player.cells; index++) {
                 let cell = this.snake[index];
                 if (cell === undefined) cell = this.snake[index] = { x: 0, y: 0 };
-                cell.x = old[index - 1].x;
-                cell.y = old[index - 1].y;
+                cell.x = old[index - steps].x;
+                cell.y = old[index - steps].y;
             }
             this.interpolate = true;
         } else {

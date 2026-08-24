@@ -3,7 +3,7 @@
  * Project server-to-client snapshot bandwidth when background tabs receive
  * visibility-aware keyframes at 1 Hz instead of the foreground 15 Hz stream.
  *
- * Delta and keyframe payloads differ substantially in snapshot v4, so they
+ * Delta and keyframe payloads differ substantially in snapshot v5, so they
  * must be supplied separately. Comma-separated lists are paired by position:
  *   DELTA_BYTES=23,32 KEYFRAME_BYTES=215,300 CLIENTS=12000 \
  *     node benchmarks/visibility-bandwidth.js
@@ -146,7 +146,7 @@ const output = {
     byteScope: 'application snapshot payload only; excludes WebSocket/TCP/IP/TLS framing, control events, and client-to-server inputs',
     clientMix: 'foreground clients receive the periodic delta/keyframe stream; hidden clients receive only independent keyframes at the lower cadence',
     serialization: 'assumes one shared immutable payload per lobby tick, so visibility changes fan-out frequency rather than snapshot encode cost',
-    defaultSamples: 'snapshot v4 production encoder, 16 players with 18 cells each: 215 B keyframe and derived 23 B delta (29.40 B mean with one keyframe per 30 snapshots)',
+    defaultSamples: 'snapshot v5 production encoder, 16 players with 18 cells each: 215 B keyframe and derived 23 B delta (29.40 B mean with one keyframe per 30 snapshots)',
     projectionOnly: 'this is deterministic bandwidth arithmetic, not an end-to-end network or CPU benchmark',
   },
   projections,

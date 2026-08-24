@@ -16,7 +16,13 @@
             <img src="/img/snek.png" alt="" width="48" height="48">
             <span>Snek</span>
         </a>
-        <p class="server-state"><span aria-hidden="true"></span> Server online</p>
+        <div class="server-state" id="server_state" role="status" aria-live="polite" aria-atomic="true" data-state="loading">
+            <span class="server-beacon" aria-hidden="true"></span>
+            <span class="server-state-label" aria-hidden="true">Checking</span>
+            <span class="server-count" aria-hidden="true"><strong id="status_players">—</strong> <span id="status_players_label">players</span></span>
+            <span class="server-count" aria-hidden="true"><strong id="status_lobbies">—</strong> <span id="status_lobbies_label">lobbies</span></span>
+            <span class="visually-hidden" id="status_summary">Live player and lobby totals are loading.</span>
+        </div>
     </header>
 
     <main class="landing">
@@ -62,6 +68,18 @@
 
             <p class="form-error" id="join_error" role="alert" hidden></p>
 
+            <form method="post" action="/quickjoin" class="quick-join-form">
+                <button class="button button-quick" type="submit">
+                    <span class="button-copy">
+                        <strong>Quick Join</strong>
+                        <small>Jump into an open lobby that still has room.</small>
+                    </span>
+                    <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><path d="M4 10h12M11 5l5 5-5 5"/></svg>
+                </button>
+            </form>
+
+            <div class="console-divider console-divider-invite" aria-hidden="true"><span>or use an invite</span></div>
+
             <form method="post" action="/joingame" class="console-form join-form">
                 <fieldset>
                     <legend>Join a lobby</legend>
@@ -89,17 +107,61 @@
                     <legend>New lobby</legend>
                     <div class="field">
                         <label for="createPassword">Lobby password <span>optional</span></label>
-                        <input id="createPassword" name="password" type="password" maxlength="64" autocomplete="new-password" placeholder="Leave blank for open access">
+                        <input id="createPassword" name="password" type="password" maxlength="64" autocomplete="new-password" placeholder="Leave blank for open access" aria-describedby="publicTarget_help">
                     </div>
 
-                    <label class="mode-control" for="classical">
-                        <input id="classical" name="classical" type="checkbox" value="1">
-                        <span class="check-control" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="m3 8 3 3 7-7"/></svg></span>
-                        <span class="mode-copy">
-                            <strong>Classical mode</strong>
-                            <small>Apples only. No golden apples or supply drops.</small>
-                        </span>
-                    </label>
+                    <div class="field public-target-field">
+                        <label for="publicTarget">Quick Join fills to <span>optional</span></label>
+                        <select id="publicTarget" name="publicTarget" aria-describedby="publicTarget_help">
+                            <option value="0" selected>0 players — unlisted</option>
+                            <option value="2">2 players</option>
+                            <option value="3">3 players</option>
+                            <option value="4">4 players</option>
+                            <option value="5">5 players</option>
+                            <option value="6">6 players</option>
+                            <option value="7">7 players</option>
+                            <option value="8">8 players</option>
+                            <option value="9">9 players</option>
+                            <option value="10">10 players</option>
+                            <option value="11">11 players</option>
+                            <option value="12">12 players</option>
+                            <option value="13">13 players</option>
+                            <option value="14">14 players</option>
+                            <option value="15">15 players</option>
+                            <option value="16">16 players</option>
+                        </select>
+                        <small class="field-help" id="publicTarget_help">Set 2–16 to list this lobby until it reaches that many players. Password-protected lobbies are always unlisted.</small>
+                    </div>
+
+                    <fieldset class="mode-picker">
+                        <legend>Game mode</legend>
+                        <div class="mode-options">
+                            <label class="mode-option" for="mode_classical">
+                                <input id="mode_classical" name="mode" type="radio" value="classical"
+                                       aria-labelledby="mode_classical_label" aria-describedby="mode_classical_description">
+                                <span class="mode-surface">
+                                    <span class="mode-heading"><span id="mode_classical_label">Classical</span><span class="radio-mark" aria-hidden="true"></span></span>
+                                    <small id="mode_classical_description">Apples only. Pure snake rules.</small>
+                                </span>
+                            </label>
+                            <label class="mode-option" for="mode_arcade_v1">
+                                <input id="mode_arcade_v1" name="mode" type="radio" value="arcade-v1"
+                                       aria-labelledby="mode_arcade_v1_label" aria-describedby="mode_arcade_v1_description">
+                                <span class="mode-surface">
+                                    <span class="mode-heading"><span id="mode_arcade_v1_label">Arcade v1</span><span class="radio-mark" aria-hidden="true"></span></span>
+                                    <small id="mode_arcade_v1_description">Golden apples and supply drops.</small>
+                                </span>
+                            </label>
+                            <label class="mode-option" for="mode_arcade_v2">
+                                <input id="mode_arcade_v2" name="mode" type="radio" value="arcade-v2"
+                                       aria-labelledby="mode_arcade_v2_label" aria-describedby="mode_arcade_v2_description" checked>
+                                <span class="mode-surface">
+                                    <span class="mode-heading"><span id="mode_arcade_v2_label">Arcade v2</span><span class="radio-mark" aria-hidden="true"></span></span>
+                                    <small id="mode_arcade_v2_description">Boost, remains, bounties and feasts.</small>
+                                </span>
+                            </label>
+                        </div>
+                    </fieldset>
 
                     <button class="button button-secondary" type="submit">
                         <span>Create lobby</span>
@@ -119,7 +181,8 @@
     <script>
         (function () {
             var errors = {
-                'unknown-game': 'That lobby does not exist. Check the code or password, or create a new one.'
+                'unknown-game': 'That lobby does not exist. Check the code or password, or create a new one.',
+                'no-open-lobby': 'No open Quick Join lobby is available yet. Create one and choose a player target to list it.'
             };
             var error = new URLSearchParams(window.location.search).get('error');
             var errorElement = document.getElementById('join_error');
@@ -133,6 +196,7 @@
             var gameId = document.getElementById('gameId');
             var joinPassword = document.getElementById('joinPassword');
             var createPassword = document.getElementById('createPassword');
+            var publicTarget = document.getElementById('publicTarget');
             var joinSubmitting = false;
             var createSubmitting = false;
             var handoffPrefix = 'snek-password-handoff:';
@@ -169,6 +233,15 @@
                 }
             }
 
+            function syncPublicTarget() {
+                var protectedLobby = createPassword.value.length > 0;
+                if (protectedLobby) publicTarget.value = '0';
+                publicTarget.disabled = protectedLobby;
+            }
+
+            createPassword.addEventListener('input', syncPublicTarget);
+            syncPublicTarget();
+
             gameId.addEventListener('change', function () {
                 var normalized = normalizedLobbyId(gameId.value);
                 if (normalized) gameId.value = normalized;
@@ -196,6 +269,7 @@
                     event.preventDefault();
                     return;
                 }
+                syncPublicTarget();
                 if (!passwordFits(createPassword)) {
                     event.preventDefault();
                     return;
@@ -207,5 +281,6 @@
             });
         })();
     </script>
+    <script src="/js/status.js"></script>
 </body>
 </html>

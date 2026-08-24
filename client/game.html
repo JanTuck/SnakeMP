@@ -6,6 +6,7 @@
     <title>Snek | Game</title>
     <link rel="icon" href="/img/snek.png">
     <link rel="stylesheet" href="/css/game.css">
+    <link rel="stylesheet" href="/css/chat.css">
 </head>
 <body>
 <p id="game_error" role="alert"></p>
@@ -16,6 +17,27 @@
                 <h1 id="join_title">Enter the arena</h1>
                 <p id="join_context">Lobby <strong id="lobby_ref">12345</strong> is ready. Choose how you appear to the other players.</p>
             </div>
+            <section class="invite-panel" aria-labelledby="invite_title">
+                <div class="invite-heading">
+                    <h2 id="invite_title">Invite players</h2>
+                    <p>Send this link. If the lobby has a password, share it separately.</p>
+                </div>
+                <label class="sr-only" for="invite_url">Lobby invite link</label>
+                <div class="invite-link-row">
+                    <input id="invite_url" type="url" readonly spellcheck="false" aria-describedby="invite_status">
+                    <div class="invite-actions">
+                        <button id="share_link" class="invite-action" type="button">
+                            <svg aria-hidden="true" viewBox="0 0 20 20"><circle cx="15" cy="4" r="2.25"/><circle cx="5" cy="10" r="2.25"/><circle cx="15" cy="16" r="2.25"/><path d="m7 9 6-4M7 11l6 4"/></svg>
+                            <span>Share</span>
+                        </button>
+                        <button id="copy_link" class="invite-action" type="button">
+                            <svg aria-hidden="true" viewBox="0 0 20 20"><rect x="7" y="7" width="9" height="9" rx="1.5"/><path d="M13 7V5.5A1.5 1.5 0 0 0 11.5 4h-7A1.5 1.5 0 0 0 3 5.5v7A1.5 1.5 0 0 0 4.5 14H7"/></svg>
+                            <span id="copy_link_label">Copy</span>
+                        </button>
+                    </div>
+                </div>
+                <p id="invite_status" class="invite-status" role="status" aria-live="polite"></p>
+            </section>
             <form id="join_form">
                 <div class="field">
                     <label for="username">Player name <span>3&ndash;24 · max 4 non-letters</span></label>
@@ -38,7 +60,25 @@
 </canvas>
 <div id="nameplates" aria-hidden="true"></div>
 <aside id="hud" aria-label="Game status"></aside>
+<section id="game_chat" class="game-chat" aria-label="Lobby chat" hidden>
+    <div id="chat_history" class="chat-history" role="log" aria-live="polite"
+         aria-relevant="additions" aria-label="Chat history"></div>
+    <form id="chat_form" class="chat-form" autocomplete="off">
+        <label class="sr-only" for="chat_input">Message the lobby</label>
+        <input id="chat_input" name="message" type="text" inputmode="text"
+               enterkeyhint="send" autocomplete="off" autocapitalize="sentences"
+               spellcheck="true" aria-describedby="chat_limit"
+               placeholder="Message the lobby">
+        <button id="chat_send" class="chat-send" type="submit">Send</button>
+        <span id="chat_limit" class="sr-only">Up to 96 characters and 160 UTF-8 bytes.</span>
+        <span id="chat_status" class="sr-only" role="status" aria-live="polite"></span>
+    </form>
+    <button id="chat_open" class="chat-open" type="button" aria-label="Open chat"
+            aria-expanded="false" title="Open chat (T)">Chat</button>
+</section>
+<script src="/js/share.js"></script>
 <script src="/js/transport.js"></script>
+<script src="/js/chat.js"></script>
 <script src="/js/userInput.js" type="module"></script>
 <script src="/js/rendering.js" type="module"></script>
 <script>

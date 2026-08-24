@@ -81,12 +81,21 @@ const path = require('node:path');
 
   const elements = new Map();
   function element() {
+    const classes = new Set();
     return {
       textContent: '', hidden: false, title: '', dataset: {},
       children: [],
       append(...children) { this.children.push(...children); },
+      prepend(...children) { this.children.unshift(...children); },
+      get lastElementChild() { return this.children.at(-1) || null; },
+      remove() { this.removed = true; },
       setAttribute(name, value) { this[name] = value; },
-      classList: { toggle() {} },
+      classList: {
+        toggle(name, force) {
+          if (force === false) classes.delete(name); else if (force === true || !classes.has(name)) classes.add(name); else classes.delete(name);
+        },
+        contains(name) { return classes.has(name); },
+      },
     };
   }
   for (const id of ['hud', 'hud_score', 'hud_board', 'hud_you', 'hud_points', 'hud_length', 'hud_rows', 'hud_feed', 'hud_mute', 'hud_mode']) {
@@ -96,17 +105,39 @@ const path = require('node:path');
     getElementById(id) { return elements.get(id) || null; },
     createElement() { return element(); },
   };
-  Hud.setMode(true);
+  Hud.setMode('classical');
   Hud.init();
   assert.equal(elements.get('hud_mode').textContent, 'Classical', 'mode received before HUD initialization must be retained');
   assert.match(elements.get('hud_board')['aria-label'], /special pickups are disabled/);
-  Hud.setMode(false);
-  assert.equal(elements.get('hud_mode').textContent, 'Arcade');
-  assert.match(elements.get('hud_board')['aria-label'], /special pickups are enabled/);
+  Hud.setMode('arcade_v1');
+  assert.equal(elements.get('hud_mode').textContent, 'Arcade v1');
+  assert.match(elements.get('hud_board')['aria-label'], /Arcade v1/);
+  Hud.setMode('arcade_v2');
+  assert.equal(elements.get('hud_mode').textContent, 'Arcade v2');
+  Hud.update([
+    { id: 'leader', displayName: 'Leader', score: 8, snake: [{ x: 0, y: 0 }] },
+    { id: 'me', displayName: 'Me', score: 3, snake: [{ x: 16, y: 0 }] },
+  ], 'me', { feastTtl: 2200, bountyId: 'leader' });
+  assert.equal(elements.get('hud_mode').textContent, 'Feast · 3s', 'feast temporarily replaces only the Arcade v2 mode label');
+  assert.equal(elements.get('hud_rows').children[0].classList.contains('hud-bounty'), true);
+  assert.match(elements.get('hud_rows').children[0]['aria-label'], /bounty/);
+  Hud.setMode('arcade_v1');
+  assert.equal(elements.get('hud_rows').children[0].classList.contains('hud-bounty'), false, 'Arcade v1 clears v2 bounty treatment');
+
+  const originalTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  global.setTimeout = () => 1;
+  global.clearTimeout = () => {};
+  Hud.setMode('arcade_v2');
+  Hud.feed({ type: 'kill', killerId: 'killer-id', killer: 'Hunter', victimId: 'victim-id', who: 'Runner', streak: 3 });
+  assert.equal(elements.get('hud_feed').children[0].children[1].textContent, 'Hunter cut off Runner — 3 streak');
+  assert.equal(elements.get('hud_feed').children[0].className, 'hud-feed-item is-kill');
+  global.setTimeout = originalTimeout;
+  global.clearTimeout = originalClearTimeout;
 
   delete global.document;
   delete global.window;
-  console.log('native motion/HUD tests: PASS (4 transitions, reduced motion, game mode label)');
+  console.log('native motion/HUD tests: PASS (motion, exact modes, feast, bounty, unique-id kill feed)');
 })().catch((error) => {
   delete global.document;
   delete global.window;

@@ -13,6 +13,7 @@
         Uint8Array.of(2, 3)
     ];
     const visibilityPacket = [Uint8Array.of(3, 0), Uint8Array.of(3, 1)];
+    const boostPacket = [Uint8Array.of(4, 0), Uint8Array.of(4, 1)];
 
     class SnekSocket {
         constructor() {
@@ -85,17 +86,34 @@
                 // reconnect it could be applied before the player rejoins.
                 if (code !== undefined && this.ws.readyState === WebSocket.OPEN) {
                     this.ws.send(directionPacket[code]);
+                    return true;
                 }
-                return;
+                return false;
             }
-            if (name !== 'clientReady') return;
+            if (name === 'boost') {
+                if (this.ws.readyState !== WebSocket.OPEN) return false;
+                this.ws.send(boostPacket[first === true ? 1 : 0]);
+                return true;
+            }
+            if (name === 'chat') {
+                const message = String(first == null ? '' : first).trim();
+                if (message.length === 0 || Array.from(message).length > 96) return false;
+                const bytes = encoder.encode(message);
+                if (bytes.length === 0 || bytes.length > 160 || this.ws.readyState !== WebSocket.OPEN) return false;
+                const packet = new Uint8Array(1 + bytes.length);
+                packet[0] = 5;
+                packet.set(bytes, 1);
+                this.ws.send(packet);
+                return true;
+            }
+            if (name !== 'clientReady') return false;
             const username = encoder.encode(String(first));
             const lobby = encoder.encode(String(second));
             // Passwords are opaque user input. Preserve whitespace and other
             // characters exactly; only the protocol's UTF-8 byte bound applies.
             const password = encoder.encode(third == null ? '' : String(third));
             if (username.length === 0 || username.length > 255 ||
-                lobby.length === 0 || lobby.length > 255 || password.length > 64) return;
+                lobby.length === 0 || lobby.length > 255 || password.length > 64) return false;
             const packet = new Uint8Array(4 + lobby.length + username.length + password.length);
             packet[0] = 1;
             packet[1] = lobby.length;
@@ -111,6 +129,7 @@
                 // Only the most recent identity is relevant while connecting.
                 this.pendingJoin = packet;
             }
+            return true;
         }
     }
 

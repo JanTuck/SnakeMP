@@ -97,6 +97,10 @@ canvas {
     transform: translate3d(-50%, 12px, 0);
 }
 
+.player-nameplate.is-bounty {
+    box-shadow: 0 0 0 1px rgba(242, 203, 69, 0.9), 0 4px 12px rgba(4, 6, 11, 0.3);
+}
+
 img { display: block; }
 
 .background_blur {
@@ -113,7 +117,7 @@ img { display: block; }
 
 .popup {
     position: relative;
-    width: min(440px, 100%);
+    width: min(510px, 100%);
     color: var(--ink);
     background: #11151d;
     border: 1px solid var(--line-strong);
@@ -142,6 +146,104 @@ img { display: block; }
 }
 
 .popup-heading strong { color: var(--ink); font-weight: 700; }
+
+.invite-panel {
+    margin-bottom: 22px;
+    padding: 14px;
+    color: var(--ink);
+    background: #090c11;
+    border-radius: 10px;
+}
+
+.invite-heading {
+    margin-bottom: 10px;
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 18px;
+}
+
+.invite-heading h2 {
+    flex: 0 0 auto;
+    margin: 0;
+    color: var(--ink);
+    font-size: 0.8rem;
+    font-weight: 780;
+    letter-spacing: 0.02em;
+    line-height: 1.3;
+}
+
+.invite-heading p {
+    max-width: 34ch;
+    margin: 0;
+    color: var(--ink-muted);
+    font-size: 0.68rem;
+    line-height: 1.4;
+    text-align: right;
+}
+
+.invite-link-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: stretch;
+    gap: 8px;
+}
+
+.popup #invite_url {
+    min-width: 0;
+    min-height: 42px;
+    padding: 9px 11px;
+    color: #d8d2c9;
+    background: #11151d;
+    font-size: 0.74rem;
+    text-overflow: ellipsis;
+}
+
+.invite-actions {
+    display: flex;
+    gap: 7px;
+}
+
+.invite-action {
+    min-width: 74px;
+    min-height: 42px;
+    padding: 8px 10px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    color: var(--ink);
+    background: #202632;
+    border: 0;
+    border-radius: 8px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.72rem;
+    font-weight: 730;
+    transition: color 140ms ease, background-color 140ms ease, transform 120ms ease;
+}
+
+.invite-action:hover { color: #fff; background: #2a3240; }
+.invite-action:active { transform: translateY(1px); }
+
+.invite-action svg {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.6;
+}
+
+.invite-status {
+    min-height: 1.25em;
+    margin: 6px 0 -2px;
+    color: var(--leaf);
+    font-size: 0.67rem;
+    line-height: 1.25;
+}
 
 #join_form { display: grid; gap: 17px; }
 .field { display: grid; gap: 7px; }
@@ -354,6 +456,8 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
     font: inherit;
 }
 
+#hud_mode[data-feast="true"] { color: var(--gold); }
+
 .hud-rows { margin: 0; padding: 0; list-style: none; counter-reset: rank; }
 
 .hud-rows li {
@@ -381,6 +485,20 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 .hud-rows .hud-me { color: #a3ebc1; }
 .hud-rows .hud-me::before,
 .hud-rows .hud-me .hud-pts { color: var(--leaf); }
+
+.hud-rows .hud-bounty .hud-name,
+.hud-rows .hud-bounty .hud-pts { color: var(--gold); }
+
+.hud-rows .hud-bounty .hud-name::after {
+    content: "";
+    width: 5px;
+    height: 5px;
+    margin-left: 6px;
+    display: inline-block;
+    vertical-align: 0.12em;
+    border-radius: 50%;
+    background: var(--gold);
+}
 
 #hud_feed {
     position: absolute;
@@ -412,6 +530,9 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 
 .hud-feed-icon { width: 27px; height: 27px; flex: 0 0 auto; object-fit: contain; }
 .hud-feed-item.is-death .hud-feed-icon { filter: grayscale(1) brightness(0.85); }
+.hud-feed-item.is-kill { border-color: rgba(235, 81, 71, 0.58); }
+.hud-feed-item.is-bounty,
+.hud-feed-item.is-feast { border-color: rgba(242, 203, 69, 0.58); }
 
 #hud_mute {
     position: absolute;
@@ -471,6 +592,10 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 
     .popup { margin-block: auto; }
     .popup_content { padding: 25px 21px 21px; }
+    .invite-heading { display: block; }
+    .invite-heading p { margin-top: 4px; text-align: left; }
+    .invite-link-row { grid-template-columns: 1fr; }
+    .invite-actions { display: grid; grid-template-columns: 1fr 1fr; }
     .hud-panel { left: max(8px, env(safe-area-inset-left)); }
 
     .hud-score {
@@ -515,6 +640,9 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
     .popup_content { padding: 18px 20px 16px; }
     .popup-heading { margin-bottom: 14px; }
     .popup h1 { margin-bottom: 5px; font-size: 1.45rem; }
+    .invite-panel { margin-bottom: 12px; padding: 10px; }
+    .invite-heading { margin-bottom: 7px; }
+    .invite-status { margin-top: 4px; }
     #join_form { gap: 12px; }
     .field { gap: 5px; }
     .popup input { min-height: 44px; padding-block: 9px; }
@@ -537,6 +665,7 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 @media (prefers-reduced-motion: reduce) {
     .btn,
     .popup input,
+    .invite-action,
     #hud_mute { transition-duration: 0.01ms; }
 }
 
@@ -639,6 +768,42 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
     line-height: 1.45;
     text-align: center;
 }
+
+.game-over-action[hidden] { display: none; }
+
+/* Arcade v2 keeps the live, full-board view after death. The replay starts as
+   a small status chip, then resolves into a compact retry control. */
+.game-over-overlay.is-spectating {
+    place-items: end center;
+    padding-bottom: max(18px, env(safe-area-inset-bottom));
+    pointer-events: none;
+    background: none;
+}
+
+.is-spectating .game-over-panel {
+    width: min(340px, 100%);
+    padding: 18px;
+    pointer-events: auto;
+    border-color: rgba(245, 239, 230, 0.2);
+    box-shadow: 0 16px 42px rgba(0, 0, 0, 0.42);
+}
+
+.is-spectating .game-over-panel h1 { font-size: 1.65rem; }
+.is-spectating .game-over-context { margin: 7px 0 14px; }
+.is-spectating .game-over-score { min-height: 48px; margin-bottom: 14px; padding-block: 10px; }
+.is-spectating .game-over-score output { font-size: 1.35rem; }
+.is-spectating .game-over-action { min-height: 44px; }
+.is-spectating .game-over-hint { display: none; }
+
+.is-spectating.is-replay .game-over-panel {
+    width: min(270px, 100%);
+    padding: 14px 16px;
+}
+
+.is-spectating.is-replay .game-over-panel h1 { font-size: 1.2rem; }
+.is-spectating.is-replay .game-over-context { margin: 4px 0 0; }
+.is-spectating.is-replay .game-over-score,
+.is-spectating.is-replay .game-over-action { display: none; }
 
 @media (max-width: 480px) {
     .game-over-overlay {

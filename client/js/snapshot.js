@@ -1,6 +1,7 @@
 const MAX_PLAYERS = 16;
 const MAX_BONUS = 12;
 const MAX_DROPS = 2;
+const MAX_REMAINS = 63;
 const COLS = 128;
 const ROWS = 72;
 const MAX_CELLS = COLS * ROWS;
@@ -11,10 +12,13 @@ const players = Array.from({ length: MAX_PLAYERS }, () => ({
 }));
 const bonus = Array.from({ length: MAX_BONUS }, () => ({ x: 0, y: 0 }));
 const drops = Array.from({ length: MAX_DROPS }, () => ({ x: 0, y: 0, ttl: 0 }));
+const remains = Array.from({ length: MAX_REMAINS }, () => ({ x: 0, y: 0, ttl: 0 }));
 const decoded = {
     view: null, kind: 0, sequence: 0, playerCount: 0, players,
     bonusCount: 0, bonus, dropCount: 0, drops,
-    hasGolden: false, goldenX: 0, goldenY: 0, goldenTtl: 0
+    hasGolden: false, goldenX: 0, goldenY: 0, goldenTtl: 0,
+    remainsCount: 0, remains, feastActive: false, feastTtl: 0,
+    hasBounty: false, bountySlot: 0
 };
 
 function dataView(payload) {
@@ -28,7 +32,7 @@ function validCell(x, y) {
 }
 
 /**
- * Parse and validate a complete v4 snapshot into module-owned scratch state.
+ * Parse and validate a complete v5 snapshot into module-owned scratch state.
  * No caller-visible game state is mutated unless this function succeeds.
  */
 export function decodeSnapshot(payload, expectedPlayers, lastSequence, currentPlayers) {
@@ -36,7 +40,7 @@ export function decodeSnapshot(payload, expectedPlayers, lastSequence, currentPl
     if (view === null || view.byteLength < 7 || expectedPlayers > MAX_PLAYERS) return null;
     let at = 0;
     const need = (bytes) => bytes >= 0 && at + bytes <= view.byteLength;
-    if (view.getUint8(at++) !== 0x53 || view.getUint8(at++) !== 0x4e || view.getUint8(at++) !== 4) return null;
+    if (view.getUint8(at++) !== 0x53 || view.getUint8(at++) !== 0x4e || view.getUint8(at++) !== 5) return null;
     if (!need(3)) return null;
     const sequence = view.getUint16(at, true); at += 2;
     const header = view.getUint8(at++);
@@ -83,32 +87,35 @@ export function decodeSnapshot(payload, expectedPlayers, lastSequence, currentPl
         } else {
             if (!need(1)) return null;
             const flags = view.getUint8(at++);
-            if ((flags & 0xe0) !== 0) return null;
+            if ((flags & 0xc0) !== 0) return null;
             out.mode = flags & 3;
-            if (out.mode === 3) return null;
             const current = currentPlayers[index];
             if (current === undefined || !Array.isArray(current.snake) || current.snake.length === 0) return null;
-            out.cells = current.snake.length + (out.mode === 2 ? 1 : 0);
-            if (out.cells > MAX_CELLS) return null;
+            out.cells = current.snake.length + (out.mode === 2 ? 1 : out.mode === 3 ? -1 : 0);
+            if (out.cells === 0 || out.cells > MAX_CELLS) return null;
             out.score = current.score;
             if ((flags & 4) !== 0) {
                 if (!need(4)) return null;
                 out.score = view.getInt32(at, true); at += 4;
             }
-            if (out.mode === 1 || out.mode === 2) {
+            if (out.mode !== 0) {
                 const direction = (flags >> 3) & 3;
+                out.steps = (flags & 0x20) !== 0 ? 2 : 1;
                 out.headX = current.snake[0].x / 16;
                 out.headY = current.snake[0].y / 16;
-                if (direction === 0) out.headY--; else if (direction === 1) out.headY++;
-                else if (direction === 2) out.headX--; else out.headX++;
+                if (direction === 0) out.headY -= out.steps; else if (direction === 1) out.headY += out.steps;
+                else if (direction === 2) out.headX -= out.steps; else out.headX += out.steps;
                 if (!validCell(out.headX, out.headY)) return null;
-            } else if ((flags & 0x18) !== 0) return null;
+            } else {
+                out.steps = 0;
+                if ((flags & 0x38) !== 0) return null;
+            }
         }
     }
 
     if (!need(1)) return null;
     const worldHeader = view.getUint8(at++);
-    if ((worldHeader & 0x80) !== 0) return null;
+    const hasArcadeExtension = (worldHeader & 0x80) !== 0;
     const bonusCount = worldHeader & 0x0f;
     const dropCount = (worldHeader >>> 4) & 3;
     const hasGolden = (worldHeader & 0x40) !== 0;
@@ -132,6 +139,33 @@ export function decodeSnapshot(payload, expectedPlayers, lastSequence, currentPl
         if (!validCell(goldenX, goldenY)) return null;
         goldenTtl = view.getUint16(at, true); at += 2;
     }
+
+    let remainsCount = 0, feastActive = false, feastTtl = 0;
+    let hasBounty = false, bountySlot = 0;
+    if (hasArcadeExtension) {
+        if (!need(1)) return null;
+        const arcadeHeader = view.getUint8(at++);
+        remainsCount = arcadeHeader & 0x3f;
+        feastActive = (arcadeHeader & 0x40) !== 0;
+        hasBounty = (arcadeHeader & 0x80) !== 0;
+        if (remainsCount > MAX_REMAINS || !need(remainsCount * 4)) return null;
+        for (let index = 0; index < remainsCount; index++) {
+            const x = view.getUint8(at++), y = view.getUint8(at++);
+            if (!validCell(x, y)) return null;
+            remains[index].x = x;
+            remains[index].y = y;
+            remains[index].ttl = view.getUint16(at, true); at += 2;
+        }
+        if (feastActive) {
+            if (!need(2)) return null;
+            feastTtl = view.getUint16(at, true); at += 2;
+        }
+        if (hasBounty) {
+            if (!need(1)) return null;
+            bountySlot = view.getUint8(at++);
+            if (bountySlot >= playerCount) return null;
+        }
+    }
     if (at !== view.byteLength) return null;
 
     decoded.view = view;
@@ -144,5 +178,10 @@ export function decodeSnapshot(payload, expectedPlayers, lastSequence, currentPl
     decoded.goldenX = goldenX;
     decoded.goldenY = goldenY;
     decoded.goldenTtl = goldenTtl;
+    decoded.remainsCount = remainsCount;
+    decoded.feastActive = feastActive;
+    decoded.feastTtl = feastTtl;
+    decoded.hasBounty = hasBounty;
+    decoded.bountySlot = bountySlot;
     return decoded;
 }

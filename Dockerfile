@@ -1,7 +1,8 @@
 FROM scratch
 
 LABEL org.opencontainers.image.title="SnakeMP" \
-      org.opencontainers.image.description="Minimal runtime image for the prebuilt SnakeMP Zig server"
+      org.opencontainers.image.description="Minimal runtime image for the prebuilt SnakeMP Zig server" \
+      io.snakemp.runtime="true"
 
 # The host-side start-docker.sh script builds this static executable first.
 # Keeping compilation out of this file makes the final image contain only the

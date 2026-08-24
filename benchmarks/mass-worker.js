@@ -2,7 +2,9 @@
  * can use several CPU cores instead of becoming the measured bottleneck. */
 const io = require('./socket');
 
-const BOARD_CELLS = 128 * 72;
+const BOARD_COLUMNS = 128;
+const BOARD_ROWS = 72;
+const BOARD_CELLS = BOARD_COLUMNS * BOARD_ROWS;
 
 try { delete globalThis.WebSocket; } catch (_) {}
 
@@ -40,6 +42,7 @@ function addOne(job) {
       observe: job.ordinal % 64 === 0,
       sequence: null,
       cells: [],
+      scratchCells: [],
     };
     sockets.push(state);
     let timer;
@@ -92,43 +95,112 @@ function addOne(job) {
       const view = payload instanceof ArrayBuffer
         ? new DataView(payload)
         : ArrayBuffer.isView(payload) ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength) : null;
-      if (!view || view.byteLength < 7 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 4) return invalid();
+      if (!view || view.byteLength < 7 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 5) return invalid();
       const sequence = view.getUint16(3, true);
       const header = view.getUint8(5);
       if ((header & 0x60) !== 0) return invalid();
       const kind = header >>> 7;
       const players = header & 0x1f;
       if (players > 16 || (kind === 1 && (state.sequence === null || sequence !== ((state.sequence + 1) & 0xffff)))) return invalid();
+      if (kind === 1 && players !== state.cells.length) return invalid();
+      const nextCells = state.scratchCells;
+      nextCells.length = players;
+      if (kind === 1) {
+        for (let i = 0; i < players; i++) nextCells[i] = state.cells[i];
+      }
       let offset = 6;
+      const need = (bytes) => bytes >= 0 && offset + bytes <= view.byteLength;
+      const validCell = (x, y) => x < BOARD_COLUMNS && y < BOARD_ROWS;
       for (let i = 0; i < players; i++) {
         if (kind === 0) {
-          if (offset + 6 > view.byteLength) return invalid();
+          if (!need(6)) return invalid();
           const encoded = view.getUint16(offset + 4, true);
           const cells = encoded & 0x7fff;
           const packed = (encoded & 0x8000) !== 0;
           if (cells === 0 || cells > BOARD_CELLS) return invalid();
-          state.cells[i] = cells;
-          offset += 6 + (packed ? 2 + Math.ceil((cells - 1) / 4) : cells * 2);
+          nextCells[i] = cells;
+          offset += 6;
+          if (packed) {
+            const pathBytes = Math.ceil((cells - 1) / 4);
+            if (!need(2 + pathBytes)) return invalid();
+            let x = view.getUint8(offset++), y = view.getUint8(offset++);
+            if (!validCell(x, y)) return invalid();
+            for (let cell = 1; cell < cells; cell++) {
+              const direction = (view.getUint8(offset + ((cell - 1) >> 2)) >> (((cell - 1) & 3) * 2)) & 3;
+              if (direction === 0) y--; else if (direction === 1) y++;
+              else if (direction === 2) x--; else x++;
+              if (x < 0 || y < 0 || !validCell(x, y)) return invalid();
+            }
+            if (pathBytes > 0 && ((cells - 1) & 3) !== 0) {
+              const usedBits = ((cells - 1) & 3) * 2;
+              if ((view.getUint8(offset + pathBytes - 1) >> usedBits) !== 0) return invalid();
+            }
+            offset += pathBytes;
+          } else {
+            if (!need(cells * 2)) return invalid();
+            for (let cell = 0; cell < cells; cell++) {
+              if (!validCell(view.getUint8(offset + cell * 2), view.getUint8(offset + cell * 2 + 1))) return invalid();
+            }
+            offset += cells * 2;
+          }
         } else {
-          if (offset >= view.byteLength) return invalid();
+          if (!need(1)) return invalid();
           const flags = view.getUint8(offset++);
           const mode = flags & 3;
-          if ((flags & 0xe0) !== 0 || mode === 3 || state.cells[i] === undefined) return invalid();
-          if ((flags & 4) !== 0) offset += 4;
-          if (mode === 0 && (flags & 0x18) !== 0) return invalid();
-          if (mode === 2) state.cells[i]++;
+          if ((flags & 0xc0) !== 0 || nextCells[i] === undefined) return invalid();
+          if ((flags & 4) !== 0) {
+            if (!need(4)) return invalid();
+            offset += 4;
+          }
+          if (mode === 0 && (flags & 0x38) !== 0) return invalid();
+          if (mode === 2 && ++nextCells[i] > BOARD_CELLS) return invalid();
+          if (mode === 3 && --nextCells[i] === 0) return invalid();
         }
-        if (offset > view.byteLength) return invalid();
       }
-      if (offset >= view.byteLength) return invalid();
+      if (!need(1)) return invalid();
       const world = view.getUint8(offset++);
-      if ((world & 0x80) !== 0) return invalid();
+      const hasArcadeExtension = (world & 0x80) !== 0;
       const bonus = world & 0x0f;
       const drops = (world >>> 4) & 3;
       const golden = (world & 0x40) !== 0;
       if (bonus > 12 || drops > 2) return invalid();
-      offset += bonus * 2 + drops * 4 + (golden ? 4 : 0);
+      if (!need(bonus * 2)) return invalid();
+      for (let i = 0; i < bonus; i++) {
+        if (!validCell(view.getUint8(offset), view.getUint8(offset + 1))) return invalid();
+        offset += 2;
+      }
+      if (!need(drops * 4)) return invalid();
+      for (let i = 0; i < drops; i++) {
+        if (!validCell(view.getUint8(offset), view.getUint8(offset + 1))) return invalid();
+        offset += 4;
+      }
+      if (golden) {
+        if (!need(4) || !validCell(view.getUint8(offset), view.getUint8(offset + 1))) return invalid();
+        offset += 4;
+      }
+      if (hasArcadeExtension) {
+        if (!need(1)) return invalid();
+        const arcade = view.getUint8(offset++);
+        const remains = arcade & 0x3f;
+        const feast = (arcade & 0x40) !== 0;
+        const bounty = (arcade & 0x80) !== 0;
+        if (!need(remains * 4)) return invalid();
+        for (let i = 0; i < remains; i++) {
+          if (!validCell(view.getUint8(offset), view.getUint8(offset + 1))) return invalid();
+          offset += 4;
+        }
+        if (feast) {
+          if (!need(2)) return invalid();
+          offset += 2;
+        }
+        if (bounty) {
+          if (!need(1) || view.getUint8(offset) >= players) return invalid();
+          offset++;
+        }
+      }
       if (offset !== view.byteLength) return invalid();
+      state.scratchCells = state.cells;
+      state.cells = nextCells;
       state.sequence = sequence;
       recordTick();
     });
