@@ -52,8 +52,6 @@ pub const assets = [_]Asset{
     .{ .path = "/img/sparkles.png", .ctype = PNG, .body = @embedFile("generated/client/img/sparkles.png") },
     .{ .path = "/img/snek.png", .ctype = PNG, .body = @embedFile("generated/client/img/snek.png") },
     .{ .path = "/img/CREDITS.md", .ctype = MD, .body = @embedFile("generated/client/img/CREDITS.md") },
-
-    .{ .path = "/vendor/gsap.min.js", .ctype = JS, .body = @embedFile("generated/client/vendor/gsap.min.js") },
 };
 
 /// Linear scan is fine: the table has ~30 fixed entries.

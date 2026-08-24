@@ -239,7 +239,7 @@ A free cell contains no snake, food, bonus apple, drop, or golden apple.
 - `POST /generateid`: create lobby and `303 /game/<id>`
 - `POST /joingame`: URL-encoded or JSON `gameId`, then a valid-game redirect or
   `303 /?error=unknown-game`
-- `/css/*`, `/js/*`, `/img/*`, and `/vendor/gsap.min.js`: compile-time embedded
+- `/css/*`, `/js/*`, and `/img/*`: compile-time embedded
   canonical client assets
 - `GET /debug/stats`: available only with `SNEK_DEBUG=1`; includes RSS,
   connections, players, worker packing, network/frame counters, input timing,

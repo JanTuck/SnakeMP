@@ -10,7 +10,50 @@ const rowState = Array.from({ length: MAX_LEADERS }, () => ({
     isMe: false,
     visible: false,
 }));
-const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
+
+// GSAP used to account for most of the client JavaScript payload for these
+// four small transitions. Keep their choreography in one testable place and
+// let the browser's compositor run it directly through the Web Animations API.
+const POWER3_OUT = 'cubic-bezier(0.165, 0.84, 0.44, 1)';
+const QUAD_OUT = 'cubic-bezier(0.333333, 0.666667, 0.666667, 1)';
+const BACK_OUT_1_6 = 'cubic-bezier(0.333333, 1.533333, 0.666667, 1)';
+
+function play(element, keyframes, timing) {
+    if (reducedMotion.matches || typeof element?.animate !== 'function') return null;
+    return element.animate(keyframes, timing);
+}
+
+export const Motion = Object.freeze({
+    feed(entry) {
+        return play(entry, [
+            { translate: '24px 0', opacity: 0.65 },
+            { translate: '0 0', opacity: 1 },
+        ], { duration: 280, easing: POWER3_OUT });
+    },
+
+    score(score) {
+        return play(score, [
+            { scale: 1.06 },
+            { scale: 1 },
+        ], { duration: 220, easing: POWER3_OUT });
+    },
+
+    canvas(canvas) {
+        return play(canvas, [
+            { opacity: 0.4 },
+            { opacity: 1 },
+        ], { duration: 400, easing: QUAD_OUT });
+    },
+
+    popup(popup) {
+        if (popup === null) return null;
+        return play(popup, [
+            { translate: '0 -50px', opacity: 0 },
+            { translate: '0 0', opacity: 1 },
+        ], { duration: 500, easing: BACK_OUT_1_6 });
+    },
+});
 
 let els = null;
 const lastMe = { id: null, name: '', score: 0, length: 0 };
@@ -204,9 +247,7 @@ export const Hud = {
         entry.append(icon, text);
         els.feed.prepend(entry);
 
-        if (!reduceMotion && window.gsap) {
-            window.gsap.from(entry, { x: 24, opacity: 0.65, duration: 0.28, ease: 'power3.out' });
-        }
+        Motion.feed(entry);
 
         while (els.feed.children.length > 5) {
             const oldest = els.feed.lastElementChild;
@@ -218,7 +259,7 @@ export const Hud = {
     },
 
     popScore() {
-        if (els === null || reduceMotion || !window.gsap) return;
-        window.gsap.fromTo(els.score, { scale: 1.06 }, { scale: 1, duration: 0.22, ease: 'power3.out' });
+        if (els === null) return;
+        Motion.score(els.score);
     },
 };

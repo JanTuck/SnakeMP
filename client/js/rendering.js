@@ -3,7 +3,7 @@ import GameOverMenu from "./menu/gameOverMenu.js";
 import { Sprites } from "./sprites.js";
 import { Sfx } from "./audio.js";
 import { Particles } from "./particles.js";
-import { Hud } from "./hud.js";
+import { Hud, Motion } from "./hud.js";
 import { decodeSnapshot } from "./snapshot.js";
 
 // Module scripts run after the DOM is parsed, so the canvas/socket exist
@@ -197,7 +197,7 @@ socket.on('init', (initData) => {
     gameOver = false;
     gameOverMenu = null;
     isSetup = true;
-    if (window.gsap) window.gsap.fromTo(canvas, { opacity: 0.4 }, { opacity: 1, duration: 0.4 });
+    Motion.canvas(canvas);
 });
 
 socket.on('game_error', (errorMessage) => {
@@ -322,8 +322,6 @@ function frame(now) {
     document.getElementById('hud_mute').addEventListener('click', () => {
         Hud.setMuted(Sfx.toggle());
     });
-    if (window.gsap) {
-        window.gsap.from('#game_popup .popup', { y: -50, opacity: 0, duration: 0.5, ease: 'back.out(1.6)' });
-    }
+    Motion.popup(document.querySelector('#game_popup .popup'));
     requestAnimationFrame(frame);
 })();

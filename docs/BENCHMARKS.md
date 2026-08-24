@@ -256,6 +256,32 @@ obsolete routes. The change removes five browser requests, four JavaScript
 modules, 4,880 bytes of startup payload, and 4,944 bytes of embedded asset
 bodies. It does not change visuals or game behavior.
 
+The only remaining third-party browser bundle was the 72,925-byte GSAP file,
+used for four transform/opacity transitions. Those transitions now use the
+native Web Animations API with the same initial/final states, durations, and
+equivalent easing curves. Their helper checks the live
+`prefers-reduced-motion` media query before every animation, while unsupported
+browsers keep the visible CSS end state as a progressive fallback. A mocked
+`Element.animate` regression validates all four keyframe/timing pairs, repeated
+score events, the fallback, and reduced-motion suppression.
+
+The startup comparison counts the unique external JavaScript resources needed
+by `game.html` (the complete `rendering.js` module graph plus direct transport
+and input scripts) and sums their uncompressed source bytes:
+
+| Game startup surface | With GSAP | Native motion | Change |
+|---|---:|---:|---:|
+| JavaScript requests | 12 | **11** | -1 |
+| JavaScript source bytes | 122,996 B | **51,123 B** | -71,873 B (-58.4%) |
+| Embedded HTTP routes | 30 | **29** | -1 |
+| `game.html` bytes | 2,618 B | **2,574 B** | -44 B |
+
+`npm run test:client-assets` reproduces the after-side graph/request/byte count
+and fails if the deleted vendor file or route returns. The server does not
+compress assets, so the 71,873-byte external-JavaScript reduction is also the
+loopback transfer reduction; the removed classic script was render-blocking,
+whereas the retained game entry points are modules or the required transport.
+
 Backpressured output queues now compact released descriptor prefixes after 64
 items once the prefix is at least half the array, retain at most 256 descriptors
 after completely draining, and cap live WebSocket items at 4,096 in addition to

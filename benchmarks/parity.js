@@ -154,13 +154,13 @@ const hasChainedUpLeft = (moves) => {
   const snapshotClient = await get('/js/snapshot.js');
   check('GET /js/snapshot.js serves rendering dependency', snapshotClient.status === 200 && snapshotClient.body.includes('decodeSnapshot'), 'status=' + snapshotClient.status);
   const gsap = await get('/vendor/gsap.min.js');
-  check('GET /vendor/gsap.min.js serves embedded vendor bundle', gsap.status === 200 && gsap.body.length > 1000, 'status=' + gsap.status);
+  check('removed GSAP route returns 404', gsap.status === 404, 'status=' + gsap.status);
   const created = await post('/generateid');
   const loc = String(created.headers.location || '');
   check('POST /generateid -> 303 /game/<id>', created.status === 303 && /\/game\/.+/.test(loc), loc);
   const lobbyId = decodeURIComponent(loc.split('/').pop());
   const gamePage = await get('/game/' + lobbyId);
-  check('GET /game/<id> serves game page', gamePage.status === 200 && gamePage.body.includes('canvas'), 'status=' + gamePage.status);
+  check('GET /game/<id> serves dependency-free game page', gamePage.status === 200 && gamePage.body.includes('canvas') && !gamePage.body.includes('gsap'), 'status=' + gamePage.status);
   const gated = await get('/game.html');
   check('GET /game.html gated', gated.status === 302, 'status=' + gated.status);
   const joinOk = await post('/joingame', 'gameId=' + encodeURIComponent(lobbyId));

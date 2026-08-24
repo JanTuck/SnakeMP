@@ -35,12 +35,20 @@ for (const filename of graph) {
   assert(manifest.includes(`.path = "${route}"`), `browser dependency is not embedded: ${route}`);
 }
 
+const startupScripts = new Set([
+  ...graph,
+  path.join(clientRoot, 'js/userInput.js'),
+  path.join(clientRoot, 'js/transport.js'),
+]);
+const startupBytes = [...startupScripts].reduce((total, filename) => total + fs.statSync(filename).size, 0);
+
 const removed = [
   ['js/box.js', '/js/box.js'],
   ['js/food.js', '/js/food.js'],
   ['js/gameObject.js', '/js/gameObject.js'],
   ['js/resourceHandler.js', '/js/resourceHandler.js'],
   ['img/swords.png', '/img/swords.png'],
+  ['vendor/gsap.min.js', '/vendor/gsap.min.js'],
 ];
 for (const [relative, route] of removed) {
   assert(!fs.existsSync(path.join(clientRoot, relative)), `obsolete client asset still exists: ${relative}`);
@@ -55,5 +63,8 @@ assert.strictEqual(
   'initial and updated food coordinates must remain plain position objects',
 );
 assert(!/swords\.png/.test(fs.readFileSync(path.join(clientRoot, 'img/CREDITS.md'), 'utf8')), 'removed image remains in credits');
+assert(!/gsap/i.test(fs.readFileSync(path.join(clientRoot, 'game.html'), 'utf8')), 'game page still loads GSAP');
+assert(!/window\.gsap/.test(rendering), 'rendering still depends on GSAP');
+assert(!/window\.gsap/.test(fs.readFileSync(path.join(clientRoot, 'js/hud.js'), 'utf8')), 'HUD still depends on GSAP');
 
-console.log(`client asset test passed (${graph.size} rendering modules; 4 modules and 1 image removed)`);
+console.log(`client asset test passed (${graph.size} rendering modules; ${startupScripts.size} startup JS requests / ${startupBytes} B; 4 modules, 1 image, and GSAP removed)`);
