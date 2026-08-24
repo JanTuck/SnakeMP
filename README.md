@@ -16,8 +16,8 @@ docs/         protocol specification and measured performance history
 ```
 
 One edge-triggered epoll reactor owns connections and HTTP/WebSocket I/O. Game
-workers are created only as lobby capacity requires them and process up to 128
-lobbies each by default. At 12,000 players in 750 lobbies this is six game
+workers are created only when a lobby gains a player and process up to 128
+active lobbies each by default. At 12,000 players in 750 lobbies this is six game
 workers, not 750 threads.
 
 The hot path no longer uses Socket.IO, Engine.IO, or JSON snapshots. Browser
@@ -42,9 +42,13 @@ Useful runtime overrides are:
 
 - `SNEK_MAX_PLAYERS` (default `100`)
 - `SNEK_MAX_PLAYERS_PER_LOBBY` (default and supported browser value `16`)
+- `SNEK_MAX_LOBBIES` (default `4096`, including the permanent default lobby)
 - `SNEK_LOBBIES_PER_WORKER` (default `128`)
 - `SNEK_LOBBY_IDLE_MS` (default `60000`)
 - `SNEK_DEBUG=1` to expose local benchmark statistics at `/debug/stats`
+
+`POST /generateid` returns `503 Service Unavailable` while the configured lobby
+capacity is full; idle non-default lobbies free slots when they are reaped.
 
 ## Development and verification
 
@@ -56,6 +60,7 @@ npm install
 npm run check
 npm run parity
 npm run test:memory
+npm run test:lobbies
 node benchmarks/wire-format-bench.js
 ```
 

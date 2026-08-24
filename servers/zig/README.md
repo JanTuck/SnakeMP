@@ -35,14 +35,19 @@ Environment variables:
 | `SNEK_DEBUG` | unset | Set to `1` for `/debug/stats` |
 | `SNEK_MAX_PLAYERS` | `100` | Global player cap; 12k test used `12000` |
 | `SNEK_MAX_PLAYERS_PER_LOBBY` | `16` | Lobby cap; canonical binary-v3 browser is tested at 16 |
+| `SNEK_MAX_LOBBIES` | `4096` | Generated-lobby resource cap, including the permanent default lobby |
 | `SNEK_LOBBIES_PER_WORKER` | `128` | Game-worker packing threshold |
 | `SNEK_LOBBY_IDLE_MS` | `60000` | Empty non-default lobby lifetime |
 
-The worker pool expands automatically: up to 128 lobbies share one game
-worker, 129..256 use two, and 750 use six. Each worker has a 128 KiB stack and
-a reusable per-tick arena. The network side remains one edge-triggered epoll
-reactor regardless of lobby count. Empty excess workers are stopped after their
-lobbies are reaped.
+`POST /generateid` returns `503 Service Unavailable` at `SNEK_MAX_LOBBIES`;
+idle non-default lobbies free capacity when the maintenance loop reaps them.
+
+The worker pool is lazy: empty generated lobbies use no game threads. Once
+players join, up to 128 active lobbies share one worker, 129..256 use two, and
+750 use six. Each worker has a 128 KiB stack and a reusable per-tick arena. The
+network side remains one edge-triggered epoll reactor regardless of lobby
+count. Empty lobbies detach on the next maintenance cycle and their now-empty
+workers stop immediately, before lobby-id reaping.
 
 ## Source layout
 
@@ -100,6 +105,7 @@ cd ../..
 npm install
 npm run parity
 npm run test:memory
+npm run test:lobbies
 node benchmarks/wire-format-bench.js
 cd servers/zig && zig run -O ReleaseFast bench_snapshot.zig
 cd servers/zig && zig run -O ReleaseFast bench_tick_scratch.zig

@@ -10,6 +10,9 @@ pub const BACKGROUND_SNAPSHOT_MS: i64 = 1_000;
 
 pub const DEFAULT_MAX_PLAYERS_GLOBAL: usize = 100;
 pub const DEFAULT_MAX_PLAYERS_PER_LOBBY: usize = 16;
+/// Includes the permanent default lobby. Empty generated lobbies are cheap,
+/// but still retain ids, maps, and debug-metric rows until their idle TTL.
+pub const DEFAULT_MAX_LOBBIES: usize = 4096;
 pub const LOBBIES_PER_WORKER: usize = 128;
 pub const GAME_WORKER_STACK: usize = 128 * 1024;
 pub const LOBBY_IDLE_DELETE_MS: i64 = 60_000;

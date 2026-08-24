@@ -9,14 +9,16 @@ transport.
 - The simulation runs at **15 Hz**, one tick every **66.67 ms**.
 - A single edge-triggered Linux epoll reactor owns listening, HTTP parsing,
   WebSocket framing, connection lifetime, and nonblocking socket writes.
-- Game workers are allocated adaptively. A worker owns up to **128 lobbies** by
-  default, processes them sequentially each tick, and uses a 128 KiB stack plus
-  a retained per-tick arena. Each additional block of 128 lobbies creates
-  another worker; empty excess workers are removed again.
+- Game workers are allocated lazily and adaptively. Empty lobbies own no game
+  thread. A worker owns up to **128 active lobbies** by default, processes them
+  sequentially each tick, and uses a 128 KiB stack plus a retained per-tick
+  arena. Empty lobbies are detached during the next maintenance cycle, and an
+  empty worker is stopped immediately.
 - Each lobby has a mutex, private PRNG, stable insertion-ordered player map, and
-  retained snapshot buffer. The lock order is lobby, connection membership,
-  then connection output, which prevents player/connection use-after-free while
-  the reactor and game workers run concurrently.
+  retained snapshot buffer. The cross-thread lock order is worker, lobby,
+  connection membership, then connection output, which prevents
+  player/connection use-after-free while the reactor and game workers run
+  concurrently.
 - Ready sockets use direct nonblocking writes. Per-connection output storage is
   retained and copied into only when the socket applies backpressure.
 
@@ -39,6 +41,9 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
 - Lobby ids are created by `POST /generateid` as
   `id-<base36-random><base36-time>`.
 - Lobby `12345` always exists and is never deleted.
+- At most 4096 lobbies exist by default, including `12345`
+  (`SNEK_MAX_LOBBIES`). At capacity, `POST /generateid` returns HTTP 503 without
+  allocating an id or lobby; reaping an idle lobby frees a slot.
 - Other empty lobbies are reaped after 60 seconds by default. Override the
   lifecycle test/deployment value with `SNEK_LOBBY_IDLE_MS`.
 - Default global capacity is 100 players (`SNEK_MAX_PLAYERS`).
@@ -63,8 +68,8 @@ Invalid data produces
 
 On success the server:
 
-1. sends `init` with scale and food to the joining connection;
-2. creates the player at a random free cell;
+1. creates and commits the player at a random free cell;
+2. sends `init` with scale and food to the joining connection;
 3. marks the lobby roster dirty;
 4. sends a `join` feed event to lobby members;
 5. sends the new roster before the next binary snapshot.

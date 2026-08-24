@@ -35,13 +35,13 @@ fn ceilDiv(numerator: u64, denominator: u64) u64 {
     return numerator / denominator + @intFromBool(numerator % denominator != 0);
 }
 
-/// Count is still a hard safety bound: even idle lobbies must have room to all
-/// become active. Measured work may request additional workers before that
-/// bound is reached.
+/// Only active lobbies are assigned to workers. Count remains the packing
+/// safety bound while measured work may request additional workers sooner.
 pub fn desiredWorkerCount(lobby_count: usize, total_cost_ns: u64, max_lobbies_per_worker: usize, target_ns: u64) usize {
+    if (lobby_count == 0) return 0;
     const by_count = ceilDiv(@intCast(lobby_count), @intCast(@max(1, max_lobbies_per_worker)));
     const by_cost = ceilDiv(total_cost_ns, @max(1, target_ns));
-    const wanted = @max(@as(u64, 1), @max(by_count, by_cost));
+    const wanted = @max(by_count, by_cost);
     return @intCast(@min(wanted, @as(u64, @intCast(@max(1, lobby_count)))));
 }
 
@@ -67,7 +67,7 @@ pub fn worthwhileMove(heavy_ns: u64, light_ns: u64, candidate_ns: u64) bool {
 test "worker count observes count capacity and measured tick budget" {
     const target = targetTickBudgetNs(66_666_667);
     try std.testing.expectEqual(@as(u64, 39_999_999), target);
-    try std.testing.expectEqual(@as(usize, 1), desiredWorkerCount(0, 0, 128, target));
+    try std.testing.expectEqual(@as(usize, 0), desiredWorkerCount(0, 0, 128, target));
     try std.testing.expectEqual(@as(usize, 6), desiredWorkerCount(750, 0, 128, target));
     try std.testing.expectEqual(@as(usize, 3), desiredWorkerCount(100, 81_000_000, 128, target));
 }

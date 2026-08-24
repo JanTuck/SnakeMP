@@ -136,6 +136,9 @@ pub const PendingOutput = union(enum) {
 
 pub const Lobby = struct {
     id: []u8,
+    /// Reactor-owned. Generated lobbies do not acquire a simulation thread
+    /// until their first successful player join.
+    worker_assigned: bool = false,
     mutex: std.Io.Mutex = .init,
     rng: std.Random.DefaultPrng = undefined,
     players: std.StringArrayHashMapUnmanaged(*Player) = .{},

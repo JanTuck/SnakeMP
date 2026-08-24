@@ -14,6 +14,7 @@
     "test:snapshot": "node benchmarks/snapshot-test.js",
     "test:memory": "npm run build:zig && node benchmarks/run-memory-ramp.js",
     "test:lifecycle": "npm run build:zig && node benchmarks/run-memory-lifecycle-audit.js",
+    "test:lobbies": "npm run build:zig && node benchmarks/run-lobby-resource-audit.js",
     "parity": "bash benchmarks/run-parity.sh",
     "benchmark:build": "node benchmarks/build-release.js",
     "bench:snapshot": "cd servers/zig && zig run -O ReleaseFast --cache-dir .zig-cache --global-cache-dir .zig-global-cache bench_snapshot.zig",

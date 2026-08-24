@@ -50,6 +50,7 @@ const TICK_NS = config.TICK_NS;
 const BACKGROUND_SNAPSHOT_MS = config.BACKGROUND_SNAPSHOT_MS;
 const DEFAULT_MAX_PLAYERS_GLOBAL = config.DEFAULT_MAX_PLAYERS_GLOBAL;
 const DEFAULT_MAX_PLAYERS_PER_LOBBY = config.DEFAULT_MAX_PLAYERS_PER_LOBBY;
+const DEFAULT_MAX_LOBBIES = config.DEFAULT_MAX_LOBBIES;
 const DEFAULT_LOBBIES_PER_WORKER = config.LOBBIES_PER_WORKER;
 const GAME_WORKER_STACK = config.GAME_WORKER_STACK;
 const DEFAULT_LOBBY_IDLE_DELETE_MS = config.LOBBY_IDLE_DELETE_MS;
@@ -86,6 +87,7 @@ var rng_prng: std.Random.DefaultPrng = undefined;
 var lobbies: std.StringArrayHashMapUnmanaged(*Lobby) = .empty;
 var max_players_global: usize = DEFAULT_MAX_PLAYERS_GLOBAL;
 var max_players_per_lobby: usize = DEFAULT_MAX_PLAYERS_PER_LOBBY;
+var max_lobbies: usize = DEFAULT_MAX_LOBBIES;
 var lobbies_per_worker: usize = DEFAULT_LOBBIES_PER_WORKER;
 var lobby_idle_delete_ms: i64 = DEFAULT_LOBBY_IDLE_DELETE_MS;
 var total_players: std.atomic.Value(usize) = .init(0);
@@ -809,13 +811,15 @@ fn gameWorkerLoop(worker: *GameWorker) void {
     }
 }
 
-fn createGameWorker() !*GameWorker {
+fn createGameWorker(initial_lobby: ?*Lobby) !*GameWorker {
     const worker = try galloc.create(GameWorker);
+    errdefer galloc.destroy(worker);
     worker.* = .{};
+    errdefer worker.lobbies.deinit(galloc);
+    if (initial_lobby) |lobby| try worker.lobbies.append(galloc, lobby);
     try game_workers.append(galloc, worker);
+    errdefer _ = game_workers.pop();
     worker.thread = std.Thread.spawn(.{ .stack_size = GAME_WORKER_STACK }, gameWorkerLoop, .{worker}) catch |err| {
-        _ = game_workers.pop();
-        galloc.destroy(worker);
         return err;
     };
     return worker;
@@ -832,6 +836,7 @@ fn workerEstimatedCostLocked(worker: *GameWorker) u64 {
 }
 
 fn assignGameWorker(lobby: *Lobby) !void {
+    std.debug.assert(!lobby.worker_assigned);
     var best: ?*GameWorker = null;
     var best_cost: u64 = std.math.maxInt(u64);
     var best_count: usize = std.math.maxInt(usize);
@@ -851,12 +856,12 @@ fn assignGameWorker(lobby: *Lobby) !void {
     if (best) |worker| {
         worker.mutex.lockUncancelable(g_io);
         defer worker.mutex.unlock(g_io);
-        return worker.lobbies.append(galloc, lobby);
+        try worker.lobbies.append(galloc, lobby);
+        lobby.worker_assigned = true;
+        return;
     }
-    const worker = try createGameWorker();
-    worker.mutex.lockUncancelable(g_io);
-    defer worker.mutex.unlock(g_io);
-    try worker.lobbies.append(galloc, lobby);
+    _ = try createGameWorker(lobby);
+    lobby.worker_assigned = true;
 }
 
 fn lockAllGameWorkers() void {
@@ -875,7 +880,7 @@ fn unlockAllGameWorkers() void {
 /// ticks. Appending to the destination happens before removal from the source,
 /// so allocation failure leaves ownership unchanged.
 fn retireLightestGameWorker(now_ms: i64, aa: Allocator) bool {
-    if (game_workers.items.len <= 1) return false;
+    if (game_workers.items.len == 0) return false;
     const loads = aa.alloc(u64, game_workers.items.len) catch return false;
     lockAllGameWorkers();
 
@@ -982,7 +987,7 @@ fn rebalanceGameWorkers(now_ms: i64, aa: Allocator) void {
     const target_ns = worker_balance.targetTickBudgetNs(TICK_NS);
     const desired = worker_balance.desiredWorkerCount(lobby_count, total_cost_ns, lobbies_per_worker, target_ns);
     while (game_workers.items.len < desired) {
-        _ = createGameWorker() catch break;
+        _ = createGameWorker(null) catch break;
         last_worker_resize_ms = now_ms;
     }
     if (game_workers.items.len > desired and now_ms - last_worker_resize_ms >= worker_balance.pool_shrink_cooldown_ms) {
@@ -995,13 +1000,14 @@ fn rebalanceGameWorkers(now_ms: i64, aa: Allocator) void {
 }
 
 fn unassignGameWorker(lobby: *Lobby) void {
+    if (!lobby.worker_assigned) return;
     var empty_index: ?usize = null;
     for (game_workers.items, 0..) |worker, worker_index| {
         worker.mutex.lockUncancelable(g_io);
         for (worker.lobbies.items, 0..) |candidate, lobby_index| {
             if (candidate == lobby) {
                 _ = worker.lobbies.swapRemove(lobby_index);
-                if (worker.lobbies.items.len == 0 and game_workers.items.len > 1) empty_index = worker_index;
+                if (worker.lobbies.items.len == 0) empty_index = worker_index;
                 worker.mutex.unlock(g_io);
                 break;
             }
@@ -1011,8 +1017,46 @@ fn unassignGameWorker(lobby: *Lobby) void {
         }
         break;
     }
+    lobby.worker_assigned = false;
     if (empty_index) |index| {
         const worker = game_workers.swapRemove(index);
+        worker.stop.store(true, .release);
+        if (worker.thread) |thread| thread.join();
+        worker.lobbies.deinit(galloc);
+        galloc.destroy(worker);
+    }
+}
+
+/// Freeze each worker between ticks and detach lobbies that no longer contain
+/// players. Their ids remain joinable until the normal idle TTL expires; a
+/// later join assigns a worker again before publishing the player.
+fn deactivateEmptyLobbies() void {
+    var worker_index: usize = 0;
+    while (worker_index < game_workers.items.len) {
+        const worker = game_workers.items[worker_index];
+        worker.mutex.lockUncancelable(g_io);
+        var lobby_index: usize = 0;
+        while (lobby_index < worker.lobbies.items.len) {
+            const lobby = worker.lobbies.items[lobby_index];
+            lobby.mutex.lockUncancelable(g_io);
+            const empty = lobby.players.count() == 0;
+            if (empty) lobby.worker_assigned = false;
+            lobby.mutex.unlock(g_io);
+            if (empty) {
+                _ = worker.lobbies.swapRemove(lobby_index);
+            } else {
+                lobby_index += 1;
+            }
+        }
+        const retire = worker.lobbies.items.len == 0;
+        worker.mutex.unlock(g_io);
+
+        if (!retire) {
+            worker_index += 1;
+            continue;
+        }
+        const removed = game_workers.swapRemove(worker_index);
+        std.debug.assert(removed == worker);
         worker.stop.store(true, .release);
         if (worker.thread) |thread| thread.join();
         worker.lobbies.deinit(galloc);
@@ -1037,11 +1081,6 @@ fn createLobbyLocked(id: []u8) !*Lobby {
     l.rng = std.Random.DefaultPrng.init(seed);
     l.food = randomCell(l);
     lobbies.put(galloc, id, l) catch |e| {
-        galloc.destroy(l);
-        return e;
-    };
-    assignGameWorker(l) catch |e| {
-        _ = lobbies.orderedRemove(id);
         galloc.destroy(l);
         return e;
     };
@@ -1103,6 +1142,37 @@ fn broadcastGoldenFeed(l: *Lobby, p: *Player, aa: Allocator) void {
 
 // ------------------------------------------------------------------ joining
 
+/// Build all persistent player state before a lazy worker is acquired. The
+/// caller holds the lobby mutex so spawn selection and lobby RNG use are safe.
+fn createPlayerLocked(c: *Conn, target: *Lobby, username: []const u8, aa: Allocator) !*Player {
+    const p = try galloc.create(Player);
+    errdefer galloc.destroy(p);
+    p.* = .{
+        .id = undefined,
+        .name = undefined,
+        .color_hex = undefined,
+        .conn = c,
+    };
+    p.id = try galloc.dupe(u8, c.sidSlice());
+    errdefer galloc.free(p.id);
+    p.name = try galloc.dupe(u8, username);
+    errdefer galloc.free(p.name);
+    p.color_hex = try galloc.dupe(u8, randomColorHex(aa));
+    errdefer galloc.free(p.color_hex);
+    try p.snake.append(galloc, pickSpawnCell(target));
+    return p;
+}
+
+/// Caller holds the lobby mutex. A worker acquired only for this unpublished
+/// join must be released outside that mutex to preserve worker -> lobby order.
+fn discardPreparedPlayerLocked(target: *Lobby, player: *Player, activated_worker: bool) void {
+    destroyPlayer(player);
+    if (!activated_worker) return;
+    target.mutex.unlock(g_io);
+    unassignGameWorker(target);
+    target.mutex.lockUncancelable(g_io);
+}
+
 fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_arg: ?[]const u8) void {
     // Already playing on this socket: silently ignore (rejoin guard).
     c.membership_mutex.lockUncancelable(g_io);
@@ -1122,66 +1192,70 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
         return;
     }
     const target = lobby.?;
+    if (totalPlayersLocked() >= max_players_global) {
+        sendGameError(c, ERR_SERVER_FULL, aa);
+        return;
+    }
     target.mutex.lockUncancelable(g_io);
-    defer target.mutex.unlock(g_io);
 
     // Recheck under the lobby ownership lock. This serializes joins with the
     // lobby worker and with disconnect/death cleanup.
     c.membership_mutex.lockUncancelable(g_io);
     const joined_while_waiting = c.player != null;
     c.membership_mutex.unlock(g_io);
-    if (joined_while_waiting) return;
+    if (joined_while_waiting) {
+        target.mutex.unlock(g_io);
+        return;
+    }
     if (totalPlayersLocked() >= max_players_global) {
+        target.mutex.unlock(g_io);
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
     }
     if (target.players.count() >= max_players_per_lobby) {
+        target.mutex.unlock(g_io);
         sendGameError(c, ERR_LOBBY_FULL, aa);
         return;
     }
 
-    // init goes to the joining socket only, before the join feed.
-    {
-        var args: Buf = .empty;
-        defer args.deinit(aa);
-        pf(&args, aa, ",{{\"scale\":16,\"food\":{{\"x\":{d},\"y\":{d}}}}}", .{ target.food.x, target.food.y }) catch return;
-        const frame = eventFrame(aa, "init", args.items) catch return;
-        defer aa.free(frame);
-        connEnqueueText(c, frame);
+    const p = createPlayerLocked(c, target, chk.trimmed, aa) catch {
+        target.mutex.unlock(g_io);
+        sendGameError(c, ERR_SERVER_FULL, aa);
+        return;
+    };
+
+    // Worker locks precede lobby locks everywhere else. Release the lobby
+    // while assigning its first worker, after every persistent allocation has
+    // succeeded, then reacquire it before publishing membership.
+    const activated_worker = !target.worker_assigned;
+    if (activated_worker) {
+        target.mutex.unlock(g_io);
+        assignGameWorker(target) catch {
+            destroyPlayer(p);
+            sendGameError(c, ERR_SERVER_FULL, aa);
+            return;
+        };
+        target.mutex.lockUncancelable(g_io);
     }
+    defer target.mutex.unlock(g_io);
 
-    const pos = pickSpawnCell(target);
-    const col = randomColorHex(aa);
-
-    const p = galloc.create(Player) catch return;
-    p.* = .{
-        .id = undefined,
-        .name = undefined,
-        .color_hex = undefined,
-        .conn = c,
-    };
-    p.id = galloc.dupe(u8, c.sidSlice()) catch {
-        galloc.destroy(p);
+    var init_args: Buf = .empty;
+    defer init_args.deinit(aa);
+    pf(&init_args, aa, ",{{\"scale\":16,\"food\":{{\"x\":{d},\"y\":{d}}}}}", .{ target.food.x, target.food.y }) catch {
+        discardPreparedPlayerLocked(target, p, activated_worker);
+        sendGameError(c, ERR_SERVER_FULL, aa);
         return;
     };
-    p.name = galloc.dupe(u8, chk.trimmed) catch {
-        galloc.free(p.id);
-        galloc.destroy(p);
+    const init_frame = eventFrame(aa, "init", init_args.items) catch {
+        discardPreparedPlayerLocked(target, p, activated_worker);
+        sendGameError(c, ERR_SERVER_FULL, aa);
         return;
     };
-    p.color_hex = galloc.dupe(u8, col) catch {
-        galloc.free(p.id);
-        galloc.free(p.name);
-        galloc.destroy(p);
-        return;
-    };
-    p.snake.append(galloc, pos) catch {
-        destroyPlayer(p);
-        return;
-    };
+    defer aa.free(init_frame);
 
     target.players.put(galloc, p.id, p) catch {
-        destroyPlayer(p);
+        discardPreparedPlayerLocked(target, p, activated_worker);
+        sendGameError(c, ERR_SERVER_FULL, aa);
         return;
     };
     _ = total_players.fetchAdd(1, .acq_rel);
@@ -1191,6 +1265,10 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
     c.membership_mutex.unlock(g_io);
     target.roster_dirty = true;
     target.last_empty_at = 0;
+
+    // init goes to the joining socket only and remains ordered before the join
+    // feed. Its frame was prepared before membership became externally visible.
+    connEnqueueText(c, init_frame);
 
     // feed join to everyone in the room (including the joiner).
     var args: Buf = .empty;
@@ -1703,6 +1781,7 @@ fn buildStats(aa: Allocator) ![]u8 {
         .totalPlayers = totalPlayersLocked(),
         .maxPlayers = max_players_global,
         .maxPlayersPerLobby = max_players_per_lobby,
+        .maxLobbies = max_lobbies,
         .connections = connections.count(),
         .lobbyWorkers = game_workers.items.len,
         .lobbiesPerWorker = lobbies_per_worker,
@@ -1778,6 +1857,15 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
 
     if (is_post) {
         if (std.mem.eql(u8, dec_path, "/generateid")) {
+            if (lobbies.count() >= max_lobbies) {
+                return sendResponse(c, aa, .{
+                    .status = 503,
+                    .reason = "Service Unavailable",
+                    .ctype = "text/plain; charset=utf-8",
+                    .body = "Lobby capacity reached; try again later",
+                    .keep_alive = keep_alive,
+                });
+            }
             var idbuf: [48]u8 = undefined;
             var new_id: []const u8 = undefined;
             while (true) {
@@ -2176,6 +2264,7 @@ fn reactorLoop() void {
         if (now_ms >= next_maintenance) {
             serviceHeartbeats(now_ms, aa);
             reapIdleLobbies(now_ms);
+            deactivateEmptyLobbies();
             rebalanceGameWorkers(now_ms, aa);
             next_maintenance = now_ms + 1000;
         }
@@ -2228,6 +2317,7 @@ pub fn main(init: std.process.Init) !void {
     max_players_global = envUsize(init.minimal.environ, "SNEK_MAX_PLAYERS", DEFAULT_MAX_PLAYERS_GLOBAL, 100_000);
     max_players_per_lobby = envUsize(init.minimal.environ, "SNEK_MAX_PLAYERS_PER_LOBBY", DEFAULT_MAX_PLAYERS_PER_LOBBY, binary_snapshot.MAX_PLAYERS);
     max_players_per_lobby = @min(max_players_per_lobby, max_players_global);
+    max_lobbies = envUsize(init.minimal.environ, "SNEK_MAX_LOBBIES", DEFAULT_MAX_LOBBIES, 100_000);
     lobbies_per_worker = envUsize(init.minimal.environ, "SNEK_LOBBIES_PER_WORKER", DEFAULT_LOBBIES_PER_WORKER, 10_000);
     lobby_idle_delete_ms = @intCast(envUsize(init.minimal.environ, "SNEK_LOBBY_IDLE_MS", @intCast(DEFAULT_LOBBY_IDLE_DELETE_MS), 24 * 60 * 60 * 1000));
 

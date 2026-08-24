@@ -36,6 +36,7 @@ pub const Stats = struct {
     totalPlayers: usize,
     maxPlayers: usize,
     maxPlayersPerLobby: usize,
+    maxLobbies: usize,
     connections: usize,
     lobbyWorkers: usize,
     lobbiesPerWorker: usize,
@@ -82,6 +83,7 @@ test "typed stats JSON escapes strings and preserves field names" {
         .totalPlayers = 3,
         .maxPlayers = 4,
         .maxPlayersPerLobby = 5,
+        .maxLobbies = 64,
         .connections = 6,
         .lobbyWorkers = 7,
         .lobbiesPerWorker = 8,
@@ -99,6 +101,7 @@ test "typed stats JSON escapes strings and preserves field names" {
     defer allocator.free(json);
 
     try std.testing.expect(std.mem.indexOf(u8, json, "\"maxPlayersPerLobby\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"maxLobbies\":64") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"workerLoads\":[{") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "quote\\\"line\\n") != null);
 }
