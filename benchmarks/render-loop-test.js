@@ -91,7 +91,7 @@ const vm = require('node:vm');
         : [{ x: 184, y: 100 }];
     }
     updateDelta(meta) { this.updateKeyframe(meta); }
-    draw(_t, isLocal) { snakeDraws.push({ id: this.id, isLocal }); }
+    draw(t, isLocal, localDirection) { snakeDraws.push({ id: this.id, t, isLocal, localDirection }); }
   }
 
   function decodedFrame() {
@@ -119,6 +119,7 @@ const vm = require('node:vm');
     resetDirection() {},
     setGameMode(mode) { inputModes.push(mode); },
     setGameplayEnabled(enabled) { gameplayStates.push(enabled); },
+    getPredictedDirection() { return 'ArrowUp'; },
     syncDirection(direction) { directions.push(direction); },
     document: {
       getElementById(id) { return elements[id]; },
@@ -183,9 +184,9 @@ const vm = require('node:vm');
   assert.ok(fillRects >= 2, 'Arcade v2 renders one matte remain as a base and highlight');
   assert.ok(strokes >= 1, 'nearest approaching head receives one restrained danger chevron');
   assert.deepEqual(snakeDraws.slice(-2), [
-    { id: 'local', isLocal: true },
-    { id: 'remote', isLocal: false },
-  ], 'only the local snake receives the resolution-independent head locator');
+    { id: 'local', t: 1, isLocal: true, localDirection: 'ArrowUp' },
+    { id: 'remote', t: 0, isLocal: false, localDirection: null },
+  ], 'local input uses the newest authoritative position while remote motion remains interpolated');
 
   wrapHeads = true;
   socket.emitEvent('b', 'valid-frame');

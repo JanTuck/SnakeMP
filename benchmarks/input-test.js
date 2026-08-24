@@ -71,11 +71,14 @@ const path = require('node:path');
 
   input.resetDirection();
   input.syncDirection('ArrowRight');
+  assert.equal(input.getPredictedDirection(), 'ArrowRight', 'rendering starts from the authoritative heading');
   const rapidStart = emitted.length;
   press('ArrowLeft');  // opposite: ignored
   press('ArrowRight'); // unchanged: ignored
   press('ArrowUp');
+  assert.equal(input.getPredictedDirection(), 'ArrowUp', 'accepted input is visible to rendering synchronously');
   press('ArrowRight');
+  assert.equal(input.getPredictedDirection(), 'ArrowUp', 'the visible heading follows the next authoritative queued turn');
   press('ArrowDown');  // queue is full; do not drift beyond server capacity
   assert.deepEqual(directions().slice(rapidStart), ['ArrowUp', 'ArrowRight'],
     'horizontal left/right no longer remap, while absolute turns mirror the server queue limit');
@@ -84,6 +87,7 @@ const path = require('node:path');
   assert.deepEqual(directions().slice(rapidStart), ['ArrowUp', 'ArrowRight'],
     'an old snapshot cannot reinterpret or overfill queued absolute turns');
   input.syncDirection('ArrowUp');
+  assert.equal(input.getPredictedDirection(), 'ArrowRight', 'the second queued turn becomes visible after the first is acknowledged');
   press('ArrowDown'); // reverse of queued right is allowed only after it becomes perpendicular
   assert.deepEqual(directions().slice(rapidStart), ['ArrowUp', 'ArrowRight', 'ArrowDown'],
     'acknowledging a turn frees one predictor slot without losing the next turn');

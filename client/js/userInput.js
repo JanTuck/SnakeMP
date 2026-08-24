@@ -80,6 +80,13 @@ function predictedDirection() {
         : queuedDirections[queuedDirections.length - 1];
 }
 
+// Rendering reads the accepted local intent on the next animation frame. This
+// gives the head immediate directional feedback without moving it ahead of the
+// authoritative server position or changing collision geometry.
+export function getPredictedDirection() {
+    return queuedDirections.length === 0 ? observedDirection : queuedDirections[0];
+}
+
 function emitDirection(direction) {
     const previous = predictedDirection();
     if (previous !== null && (direction === previous || direction === OPPOSITE.get(previous))) return;

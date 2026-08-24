@@ -5,7 +5,7 @@ import { Sfx } from "./audio.js?v=__SNEK_ASSET_REV__";
 import { Particles } from "./particles.js?v=__SNEK_ASSET_REV__";
 import { Hud, Motion } from "./hud.js?v=__SNEK_ASSET_REV__";
 import { decodeSnapshot } from "./snapshot.js?v=__SNEK_ASSET_REV__";
-import { releaseBoost, resetDirection, setGameMode, setGameplayEnabled, syncDirection } from "./userInput.js?v=__SNEK_ASSET_REV__";
+import { getPredictedDirection, releaseBoost, resetDirection, setGameMode, setGameplayEnabled, syncDirection } from "./userInput.js?v=__SNEK_ASSET_REV__";
 
 // Module scripts run after the DOM is parsed, so the canvas/socket exist
 // already. Wiring handlers here instead of inside window.onload avoids a
@@ -571,9 +571,16 @@ function frame(now) {
 
     drawWorld(now);
     const canvasRect = canvas.getBoundingClientRect();
+    const localDirection = getPredictedDirection();
     for (let snake of snakeList.values()) {
-        snake.draw(t, snake.id === socket.id);
-        prepareNameplate(snake, t, canvasRect);
+        const isLocal = snake.id === socket.id;
+        // Remote snakes keep one-tick interpolation for smooth network motion.
+        // The local snake is already authoritative when its snapshot arrives;
+        // drawing that newest state immediately avoids adding another 66.7 ms
+        // of presentation lag after the server has accepted a turn.
+        const snakeT = isLocal ? 1 : t;
+        snake.draw(snakeT, isLocal, isLocal ? localDirection : null);
+        prepareNameplate(snake, snakeT, canvasRect);
     }
     drawDanger(t, now);
     drawDeathReplay(now);

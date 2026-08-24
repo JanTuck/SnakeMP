@@ -1,3 +1,10 @@
+const HEADING_VECTOR = Object.freeze({
+    ArrowRight: Object.freeze([1, 0]),
+    ArrowLeft: Object.freeze([-1, 0]),
+    ArrowDown: Object.freeze([0, 1]),
+    ArrowUp: Object.freeze([0, -1])
+});
+
 export default class Snake {
     constructor(ctx, meta) {
         this.scale = 16;
@@ -110,7 +117,7 @@ export default class Snake {
     }
 
     // t in [0, 1]: interpolation between the previous and current tick.
-    draw(t, isLocal = false) {
+    draw(t, isLocal = false, localDirection = null) {
         const cur = this.snake;
         const prev = this.interpolate && this.prevSnake !== undefined && this.prevSnake.length > 0 ? this.prevSnake : cur;
         const ctx = this.ctx;
@@ -149,11 +156,12 @@ export default class Snake {
                 ctx.lineWidth = 1.25;
                 ctx.stroke();
                 ctx.restore();
+                const predicted = isLocal && localDirection !== null ? HEADING_VECTOR[localDirection] : undefined;
                 const dx = c.x - (prev[0] ? prev[0].x : c.x);
                 const dy = c.y - (prev[0] ? prev[0].y : c.y);
                 const len = Math.abs(dx) + Math.abs(dy);
-                const fx = len > 0 ? dx / len : 1;
-                const fy = len > 0 ? dy / len : 0;
+                const fx = predicted !== undefined ? predicted[0] : len > 0 ? dx / len : 1;
+                const fy = predicted !== undefined ? predicted[1] : len > 0 ? dy / len : 0;
                 // Eyes: offset forward and to both sides of the heading.
                 const ex = x + s / 2 + fx * 3;
                 const ey = y + s / 2 + fy * 3;
