@@ -39,8 +39,12 @@ function snapshotHeader(data) {
 }
 
 socket.on('message', (data, isBinary) => {
-  if (isBinary) {
-    const header = snapshotHeader(Buffer.from(data));
+  const bytes = Buffer.from(data);
+  // ws 7.x does not consistently provide the isBinary callback argument.
+  // The production payload has an unambiguous magic prefix, matching the
+  // compatibility check in benchmarks/socket.js.
+  if (isBinary === true || (bytes.length >= 2 && bytes[0] === 0x53 && bytes[1] === 0x4e)) {
+    const header = snapshotHeader(bytes);
     if (header !== null) frames.push(header);
     return;
   }

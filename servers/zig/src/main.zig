@@ -337,11 +337,24 @@ fn updateConnInterest(c: *Conn, want_write: bool) void {
 fn releasePending(output: model.PendingOutput) void {
     switch (output) {
         .owned => |bytes| galloc.free(bytes),
+        .borrowed => {},
         .shared => |frame| releaseSharedFrame(frame),
     }
 }
 
+fn outputEmpty(c: *const Conn) bool {
+    return c.output_head == c.output.items.len;
+}
+
+fn prepareOutputAppend(c: *Conn) void {
+    if (!outputEmpty(c)) return;
+    c.output.clearRetainingCapacity();
+    c.output_head = 0;
+    c.output_offset = 0;
+}
+
 fn appendOwnedOutput(c: *Conn, first: []const u8, second: []const u8) bool {
+    prepareOutputAppend(c);
     const size = first.len + second.len;
     if (c.output_bytes + size > MAX_QUEUE_BYTES) {
         c.poisoned = true;
@@ -363,18 +376,34 @@ fn appendOwnedOutput(c: *Conn, first: []const u8, second: []const u8) bool {
     return true;
 }
 
+fn appendBorrowedOutput(c: *Conn, bytes: []const u8) bool {
+    prepareOutputAppend(c);
+    if (bytes.len == 0) return true;
+    if (c.output_bytes + bytes.len > MAX_QUEUE_BYTES) {
+        c.poisoned = true;
+        return false;
+    }
+    c.output.append(galloc, .{ .borrowed = bytes }) catch {
+        c.poisoned = true;
+        return false;
+    };
+    c.output_bytes += bytes.len;
+    updateConnInterest(c, true);
+    return true;
+}
+
 /// A fresh keyframe makes every not-yet-started snapshot before it obsolete,
 /// including dependent deltas. Never remove the head after a partial write:
 /// websocket frame bytes may not be interleaved.
 fn coalesceForKeyframe(c: *Conn) void {
-    var index: usize = 0;
+    var index: usize = c.output_head;
     while (index < c.output.items.len) {
-        if (index == 0 and c.output_offset != 0) {
+        if (index == c.output_head and c.output_offset != 0) {
             index += 1;
             continue;
         }
         switch (c.output.items[index]) {
-            .owned => index += 1,
+            .owned, .borrowed => index += 1,
             .shared => |frame| {
                 c.output_bytes -= frame.len();
                 releaseSharedFrame(frame);
@@ -385,6 +414,7 @@ fn coalesceForKeyframe(c: *Conn) void {
 }
 
 fn appendSharedOutput(c: *Conn, frame: *model.SharedFrame, offset: usize) bool {
+    prepareOutputAppend(c);
     std.debug.assert(offset <= frame.len());
     if (frame.keyframe) coalesceForKeyframe(c);
     const remaining = frame.len() - offset;
@@ -398,7 +428,7 @@ fn appendSharedOutput(c: *Conn, frame: *model.SharedFrame, offset: usize) bool {
         c.poisoned = true;
         return false;
     };
-    if (c.output.items.len == 1) c.output_offset = offset;
+    if (c.output.items.len - c.output_head == 1) c.output_offset = offset;
     c.output_bytes += remaining;
     updateConnInterest(c, true);
     return true;
@@ -409,7 +439,7 @@ fn connQueueRaw(c: *Conn, bytes: []const u8) void {
     c.output_mutex.lockUncancelable(g_io);
     defer c.output_mutex.unlock(g_io);
     if (c.closing or c.poisoned or bytes.len == 0) return;
-    if (c.output.items.len != 0) {
+    if (!outputEmpty(c)) {
         _ = appendOwnedOutput(c, bytes, "");
         return;
     }
@@ -435,6 +465,62 @@ fn connQueueRaw(c: *Conn, bytes: []const u8) void {
     }
 }
 
+/// HTTP response fast path. The header is stack-backed by the caller, while
+/// static bodies point into embedded process-lifetime storage. A ready socket
+/// uses one writev without copying either slice; backpressure copies only the
+/// short header and borrows static body bytes.
+fn connQueueResponse(c: *Conn, header: []const u8, body: []const u8, body_static: bool) void {
+    c.output_mutex.lockUncancelable(g_io);
+    defer c.output_mutex.unlock(g_io);
+    if (c.closing or c.poisoned) return;
+
+    const queueSuffix = struct {
+        fn append(connection: *Conn, header_suffix: []const u8, body_suffix: []const u8, static: bool) void {
+            if (header_suffix.len > 0 and !appendOwnedOutput(connection, header_suffix, "")) return;
+            if (body_suffix.len == 0) return;
+            if (static) {
+                _ = appendBorrowedOutput(connection, body_suffix);
+            } else {
+                _ = appendOwnedOutput(connection, body_suffix, "");
+            }
+        }
+    }.append;
+
+    if (!outputEmpty(c)) {
+        queueSuffix(c, header, body, body_static);
+        return;
+    }
+
+    const vec = [2]posix.iovec_const{
+        .{ .base = header.ptr, .len = header.len },
+        .{ .base = body.ptr, .len = body.len },
+    };
+    while (true) {
+        const rc = linux.writev(c.fd, &vec, if (body.len == 0) 1 else vec.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const sent: usize = @intCast(rc);
+                _ = network_bytes_sent.fetchAdd(sent, .monotonic);
+                if (sent < header.len) {
+                    queueSuffix(c, header[sent..], body, body_static);
+                } else if (sent < header.len + body.len) {
+                    queueSuffix(c, "", body[sent - header.len ..], body_static);
+                }
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => {
+                queueSuffix(c, header, body, body_static);
+                return;
+            },
+            else => {
+                c.poisoned = true;
+                return;
+            },
+        }
+    }
+}
+
 /// Fast path uses one writev syscall and performs no allocation or copy.
 /// Infrequent control frames are copied only when a socket applies backpressure.
 fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
@@ -444,7 +530,7 @@ fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
     _ = websocket_frames_sent.fetchAdd(1, .monotonic);
     var hdr: [10]u8 = undefined;
     const hlen = wsHeader(&hdr, opcode, payload.len);
-    if (c.output.items.len != 0) {
+    if (!outputEmpty(c)) {
         _ = appendOwnedOutput(c, hdr[0..hlen], payload);
         return;
     }
@@ -487,7 +573,7 @@ fn connEnqueueSharedFrame(c: *Conn, frame: *model.SharedFrame) void {
     defer c.output_mutex.unlock(g_io);
     if (c.closing or c.poisoned) return;
     _ = websocket_frames_sent.fetchAdd(1, .monotonic);
-    if (c.output.items.len != 0) {
+    if (!outputEmpty(c)) {
         _ = appendSharedOutput(c, frame, 0);
         return;
     }
@@ -526,11 +612,12 @@ fn connEnqueueText(c: *Conn, payload: []const u8) void {
 fn flushOutput(c: *Conn) bool {
     c.output_mutex.lockUncancelable(g_io);
     defer c.output_mutex.unlock(g_io);
-    while (c.output.items.len != 0) {
-        const output = c.output.items[0];
+    while (!outputEmpty(c)) {
+        const output = c.output.items[c.output_head];
         const total = output.len();
         const rc = switch (output) {
             .owned => |bytes| linux.write(c.fd, bytes[c.output_offset..].ptr, total - c.output_offset),
+            .borrowed => |bytes| linux.write(c.fd, bytes[c.output_offset..].ptr, total - c.output_offset),
             .shared => |frame| writeSharedFrame(c.fd, frame, c.output_offset),
         };
         switch (linux.errno(rc)) {
@@ -540,7 +627,8 @@ fn flushOutput(c: *Conn) bool {
                 c.output_bytes -= sent;
                 _ = network_bytes_sent.fetchAdd(sent, .monotonic);
                 if (c.output_offset == total) {
-                    releasePending(c.output.orderedRemove(0));
+                    releasePending(output);
+                    c.output_head += 1;
                     c.output_offset = 0;
                 }
             },
@@ -549,6 +637,8 @@ fn flushOutput(c: *Conn) bool {
             else => return false,
         }
     }
+    c.output.clearRetainingCapacity();
+    c.output_head = 0;
     updateConnInterest(c, false);
     return !c.close_after_write;
 }
@@ -575,7 +665,7 @@ fn connPoisoned(c: *Conn) bool {
 fn connOutputDrained(c: *Conn) bool {
     c.output_mutex.lockUncancelable(g_io);
     defer c.output_mutex.unlock(g_io);
-    return c.output.items.len == 0;
+    return outputEmpty(c);
 }
 
 // ------------------------------------------------------- room operations
@@ -1125,7 +1215,7 @@ fn handleVisibility(c: *Conn, visible: bool) void {
         // Make the first background keyframe immediate; subsequent delivery is
         // bounded by BACKGROUND_SNAPSHOT_MS. Publish the deadline first so a
         // lobby worker that sees the hidden state also sees the reset.
-        c.next_background_snapshot_ms.store(0, .release);
+        if (!was_hidden) c.next_background_snapshot_ms.store(0, .release);
         c.snapshot_hidden.store(true, .release);
     }
 }
@@ -1413,34 +1503,38 @@ const SendOpts = struct {
     reason: []const u8,
     ctype: ?[]const u8 = null,
     body: []const u8 = "",
+    body_static: bool = false,
     location: ?[]const u8 = null,
     keep_alive: bool,
     head_only: bool = false,
 };
 
 fn sendResponse(c: *Conn, aa: Allocator, o: SendOpts) void {
+    _ = aa;
+    var header_storage: [1024]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&header_storage);
+    const header_allocator = fixed.allocator();
     var b: Buf = .empty;
-    defer b.deinit(aa);
-    pf(&b, aa, "HTTP/1.1 {d} {s}" ++ CRLF, .{ o.status, o.reason }) catch return;
-    b.appendSlice(aa, "X-Content-Type-Options: nosniff" ++ CRLF) catch return;
-    b.appendSlice(aa, "X-Frame-Options: DENY" ++ CRLF) catch return;
-    b.appendSlice(aa, "Referrer-Policy: no-referrer" ++ CRLF) catch return;
+    defer b.deinit(header_allocator);
+    pf(&b, header_allocator, "HTTP/1.1 {d} {s}" ++ CRLF, .{ o.status, o.reason }) catch return;
+    b.appendSlice(header_allocator, "X-Content-Type-Options: nosniff" ++ CRLF) catch return;
+    b.appendSlice(header_allocator, "X-Frame-Options: DENY" ++ CRLF) catch return;
+    b.appendSlice(header_allocator, "Referrer-Policy: no-referrer" ++ CRLF) catch return;
     if (o.location) |loc| {
-        b.appendSlice(aa, "Location: ") catch return;
-        b.appendSlice(aa, loc) catch return;
-        b.appendSlice(aa, CRLF) catch return;
+        b.appendSlice(header_allocator, "Location: ") catch return;
+        b.appendSlice(header_allocator, loc) catch return;
+        b.appendSlice(header_allocator, CRLF) catch return;
     }
     if (o.ctype) |ct| {
-        b.appendSlice(aa, "Content-Type: ") catch return;
-        b.appendSlice(aa, ct) catch return;
-        b.appendSlice(aa, CRLF) catch return;
+        b.appendSlice(header_allocator, "Content-Type: ") catch return;
+        b.appendSlice(header_allocator, ct) catch return;
+        b.appendSlice(header_allocator, CRLF) catch return;
     }
-    pf(&b, aa, "Content-Length: {d}" ++ CRLF, .{o.body.len}) catch return;
+    pf(&b, header_allocator, "Content-Length: {d}" ++ CRLF, .{o.body.len}) catch return;
     const conn_hdr: []const u8 = if (o.keep_alive) "Connection: keep-alive" ++ CRLF else "Connection: close" ++ CRLF;
-    b.appendSlice(aa, conn_hdr) catch return;
-    b.appendSlice(aa, CRLF) catch return;
-    if (!o.head_only) b.appendSlice(aa, o.body) catch return;
-    connQueueRaw(c, b.items);
+    b.appendSlice(header_allocator, conn_hdr) catch return;
+    b.appendSlice(header_allocator, CRLF) catch return;
+    connQueueResponse(c, b.items, if (o.head_only) "" else o.body, o.body_static);
     if (!o.keep_alive) c.close_after_write = true;
 }
 
@@ -1626,7 +1720,7 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
 
     if (is_get or is_head) {
         if (std.mem.eql(u8, dec_path, "/")) {
-            return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = assets.assets[0].ctype, .body = assets.index_html, .keep_alive = keep_alive, .head_only = head_only });
+            return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = assets.assets[0].ctype, .body = assets.index_html, .body_static = true, .keep_alive = keep_alive, .head_only = head_only });
         }
         if (std.mem.eql(u8, dec_path, "/game.html")) {
             // lobby gate: direct requests bounce home
@@ -1640,7 +1734,7 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
             const gid = percentDecode(aa, raw_id);
             const exists = lobbies.contains(gid);
             if (exists) {
-                return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = "text/html; charset=utf-8", .body = assets.game_html, .keep_alive = keep_alive, .head_only = head_only });
+                return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = "text/html; charset=utf-8", .body = assets.game_html, .body_static = true, .keep_alive = keep_alive, .head_only = head_only });
             }
             return sendRedirect(c, aa, 302, "/", keep_alive, head_only);
         }
@@ -1649,7 +1743,7 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
             return sendNotFound(c, aa, keep_alive, head_only);
         }
         if (assets.find(dec_path)) |a| {
-            return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = a.ctype, .body = a.body, .keep_alive = keep_alive, .head_only = head_only });
+            return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = a.ctype, .body = a.body, .body_static = true, .keep_alive = keep_alive, .head_only = head_only });
         }
         return sendNotFound(c, aa, keep_alive, head_only);
     }
@@ -1788,7 +1882,7 @@ fn parseWsFrames(c: *Conn, aa: Allocator, data: []u8) !WsResult {
                 return .{ .consumed = off, .closed = true };
             },
             0x9 => connEnqueueFrame(c, 0xA, payload), // ws ping -> ws pong
-            0xA => {}, // ws pong
+            0xA => c.awaiting_pong_since = null, // ws pong
             else => {},
         }
     }
@@ -1817,6 +1911,7 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
         const head_at = std.mem.indexOf(u8, c.input.items, CRLF ++ CRLF) orelse {
             return c.input.items.len <= MAX_HTTP_HEAD_LINE;
         };
+        if (head_at > MAX_HTTP_HEAD_LINE) return false;
         const head = c.input.items[0..head_at];
         const request_line_end = std.mem.indexOf(u8, head, CRLF) orelse return false;
         const request_line = head[0..request_line_end];
@@ -1828,9 +1923,10 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
         const version = request_line[sp2 + 1 ..];
         if (!std.mem.startsWith(u8, version, "HTTP/")) return false;
 
-        var content_length: usize = 0;
+        var content_length: ?usize = null;
         var connection_close = false;
         var connection_keep = false;
+        var connection_upgrade = false;
         var upgrade_ws = false;
         var ws_key: []const u8 = "";
         var ws_version_ok = false;
@@ -1844,10 +1940,18 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
             const name = line[0..colon];
             const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
             if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                content_length = std.fmt.parseInt(usize, value, 10) catch return false;
+                const parsed = std.fmt.parseInt(usize, value, 10) catch return false;
+                if (content_length) |known| {
+                    if (known != parsed) return false;
+                } else content_length = parsed;
+            } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                // Chunked request bodies are intentionally unsupported. Never
+                // combine TE with this Content-Length framing parser.
+                return false;
             } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
                 connection_close = std.ascii.indexOfIgnoreCase(value, "close") != null;
                 connection_keep = std.ascii.indexOfIgnoreCase(value, "keep-alive") != null;
+                connection_upgrade = std.ascii.indexOfIgnoreCase(value, "upgrade") != null;
             } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
                 upgrade_ws = std.ascii.indexOfIgnoreCase(value, "websocket") != null;
             } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
@@ -1859,25 +1963,30 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
             }
         }
 
-        if (content_length > MAX_HTTP_BODY) {
+        const body_len = content_length orelse 0;
+        if (body_len > MAX_HTTP_BODY) {
             sendResponse(c, aa, .{ .status = 413, .reason = "Payload Too Large", .ctype = "text/html; charset=utf-8", .body = "<html><body><h1>Payload Too Large</h1></body></html>", .keep_alive = false });
             return true;
         }
         const body_at = head_at + 2 * CRLF.len;
-        const request_len = body_at + content_length;
+        const request_len = body_at + body_len;
         if (c.input.items.len < request_len) return true;
         const body = c.input.items[body_at..request_len];
 
         if (upgrade_ws) {
             const qpos = std.mem.indexOfScalar(u8, target, '?');
             const path = if (qpos) |i| target[0..i] else target;
-            if (!std.mem.eql(u8, path, "/ws") or ws_key.len == 0 or !ws_version_ok or !doUpgrade(c, aa, ws_key)) {
+            if (!std.mem.eql(u8, method, "GET") or !connection_upgrade or !std.mem.eql(u8, path, "/ws") or ws_key.len == 0 or !ws_version_ok or !doUpgrade(c, aa, ws_key)) {
                 sendResponse(c, aa, .{ .status = 400, .reason = "Bad Request", .ctype = "text/plain; charset=utf-8", .body = "websocket upgrade rejected", .keep_alive = false });
                 return true;
             }
             consumeInput(c, request_len);
             c.mode = .websocket;
             c.next_ping_ms = unixMillis() + PING_INTERVAL_MS;
+            if (c.input.items.len == 0) {
+                c.input.deinit(galloc);
+                c.input = .empty;
+            }
             return processWsInput(c, aa);
         }
 
@@ -1885,6 +1994,7 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
         const keep_alive = if (http10) connection_keep and !connection_close else !connection_close;
         routeAndRespond(c, aa, method, target, body, body_is_json, keep_alive);
         consumeInput(c, request_len);
+        if (connPoisoned(c)) return false;
     }
     return true;
 }
@@ -1899,7 +2009,6 @@ fn readAvailable(c: *Conn, aa: Allocator) bool {
                 if (count == 0) return false;
                 _ = network_bytes_received.fetchAdd(count, .monotonic);
                 c.last_activity_ms = unixMillis();
-                c.awaiting_pong_since = null;
                 c.input.appendSlice(galloc, scratch[0..count]) catch return false;
                 const max_input = if (c.mode == .http) MAX_HTTP_INPUT else MAX_WS_INPUT;
                 if (c.input.items.len > max_input) return false;
@@ -1928,7 +2037,7 @@ fn teardownConn(c: *Conn) void {
     c.output_mutex.lockUncancelable(g_io);
     c.closing = true;
     closeFd(c.fd);
-    for (c.output.items) |output| releasePending(output);
+    for (c.output.items[c.output_head..]) |output| releasePending(output);
     c.output.deinit(galloc);
     c.output_mutex.unlock(g_io);
     c.input.deinit(galloc);
@@ -2049,9 +2158,6 @@ fn setSockOpts(fd: posix.fd_t) void {
     if (builtin.os.tag != .linux) return;
     const one: c_int = 1;
     posix.setsockopt(fd, 6, 1, std.mem.asBytes(&one)) catch {}; // TCP_NODELAY
-    var tvb: [16]u8 = [_]u8{0} ** 16;
-    std.mem.writeInt(u64, tvb[0..8], 3, builtin.cpu.arch.endian()); // SO_SNDTIMEO 3s
-    posix.setsockopt(fd, 1, 20, &tvb) catch {};
 }
 
 // ------------------------------------------------------------------ signals / main
@@ -2166,12 +2272,29 @@ test "binary client packets reject malformed and partial input" {
     try std.testing.expectEqual(true, websocket.clientPacket(&.{ 3, 1 }).?.visibility);
 }
 
+test "only a websocket pong satisfies the heartbeat" {
+    var connection = Conn{ .fd = -1, .awaiting_pong_since = 123 };
+    var ignored_text = [_]u8{ 0x81, 0x80, 1, 2, 3, 4 };
+    const text_result = try parseWsFrames(&connection, std.testing.allocator, &ignored_text);
+    try std.testing.expectEqual(ignored_text.len, text_result.consumed);
+    try std.testing.expectEqual(@as(?i64, 123), connection.awaiting_pong_since);
+
+    var pong = [_]u8{ 0x8a, 0x80, 5, 6, 7, 8 };
+    const pong_result = try parseWsFrames(&connection, std.testing.allocator, &pong);
+    try std.testing.expectEqual(pong.len, pong_result.consumed);
+    try std.testing.expectEqual(@as(?i64, null), connection.awaiting_pong_since);
+}
+
 test "visibility hint throttles delivery and requires foreground resync" {
     var connection = Conn{ .fd = -1 };
     handleVisibility(&connection, false);
     try std.testing.expect(connection.snapshot_hidden.load(.acquire));
     try std.testing.expectEqual(@as(i64, 0), connection.next_background_snapshot_ms.load(.acquire));
     try std.testing.expect(!connection.snapshot_needs_keyframe.load(.acquire));
+
+    connection.next_background_snapshot_ms.store(42, .release);
+    handleVisibility(&connection, false);
+    try std.testing.expectEqual(@as(i64, 42), connection.next_background_snapshot_ms.load(.acquire));
 
     handleVisibility(&connection, true);
     try std.testing.expect(!connection.snapshot_hidden.load(.acquire));

@@ -34,8 +34,12 @@ pub const ERR_LOBBY_FULL = "This game is full";
 
 pub const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 pub const MAX_HTTP_HEAD_LINE: usize = 16 * 1024;
-pub const MAX_HTTP_BODY: usize = 1024 * 1024;
-pub const MAX_HTTP_INPUT: usize = MAX_HTTP_HEAD_LINE + MAX_HTTP_BODY + 4;
+// The only body-bearing route accepts a short lobby id. Four KiB leaves ample
+// JSON/form headroom without allowing a slow client to pin a MiB per socket.
+pub const MAX_HTTP_BODY: usize = 4 * 1024;
+// Aggregate buffered input may contain several complete pipelined requests.
+// Keep that compatibility without restoring the former ~1 MiB per-socket cap.
+pub const MAX_HTTP_INPUT: usize = 128 * 1024;
 // The largest application packet is a 513-byte join (3-byte prefix plus two
 // u8-length strings). Leave bounded headroom for future packet kinds, while
 // keeping adversarial per-connection retention in the kilobytes, not MiB.

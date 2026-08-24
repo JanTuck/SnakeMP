@@ -86,6 +86,8 @@ const moved = (samples, axis, sign) => {
   check('GET /js/rendering.js serves shared client', clientScript.status === 200 && clientScript.body.length > 100, 'status=' + clientScript.status);
   const socketClient = await get('/js/transport.js');
   check('GET /js/transport.js serves native websocket client', socketClient.status === 200 && socketClient.body.includes('WebSocket'), 'status=' + socketClient.status);
+  const snapshotClient = await get('/js/snapshot.js');
+  check('GET /js/snapshot.js serves rendering dependency', snapshotClient.status === 200 && snapshotClient.body.includes('decodeSnapshot'), 'status=' + snapshotClient.status);
   const gsap = await get('/vendor/gsap.min.js');
   check('GET /vendor/gsap.min.js serves embedded vendor bundle', gsap.status === 200 && gsap.body.length > 1000, 'status=' + gsap.status);
   const created = await post('/generateid');

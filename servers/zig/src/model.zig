@@ -124,11 +124,14 @@ pub const SharedFrame = struct {
 
 pub const PendingOutput = union(enum) {
     owned: []u8,
+    /// Immutable process-lifetime bytes, currently embedded HTTP assets.
+    borrowed: []const u8,
     shared: *SharedFrame,
 
     pub fn len(output: PendingOutput) usize {
         return switch (output) {
             .owned => |bytes| bytes.len,
+            .borrowed => |bytes| bytes.len,
             .shared => |frame| frame.len(),
         };
     }
@@ -168,6 +171,7 @@ pub const Conn = struct {
     sid: [SID_LEN]u8 = undefined,
     input: std.ArrayListUnmanaged(u8) = .empty,
     output: std.ArrayListUnmanaged(PendingOutput) = .empty,
+    output_head: usize = 0,
     output_offset: usize = 0,
     output_bytes: usize = 0,
     mode: enum { http, websocket } = .http,

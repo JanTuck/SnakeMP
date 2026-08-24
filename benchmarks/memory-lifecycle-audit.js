@@ -27,7 +27,7 @@ const CHURN_ROUNDS = positiveInt('LIFECYCLE_CHURN_ROUNDS', 3);
 const CHURN_CONNECTIONS = positiveInt('LIFECYCLE_CHURN_CONNECTIONS', 300);
 const RETAINED_CONNECTIONS = positiveInt('LIFECYCLE_RETAINED_CONNECTIONS', 64);
 const FRAGMENT_BYTES = positiveInt('LIFECYCLE_FRAGMENT_BYTES', 256 * 1024);
-const PARTIAL_BYTES = positiveInt('LIFECYCLE_PARTIAL_BYTES', 128 * 1024);
+const PARTIAL_BYTES = positiveInt('LIFECYCLE_PARTIAL_BYTES', 512);
 const LOBBY_WAVES = positiveInt('LIFECYCLE_LOBBY_WAVES', 3);
 const LOBBIES_PER_WAVE = positiveInt('LIFECYCLE_LOBBIES_PER_WAVE', 64);
 const MALFORMED_CONNECTIONS = positiveInt('LIFECYCLE_MALFORMED_CONNECTIONS', 300);
@@ -35,6 +35,8 @@ const PIPELINE_WAVES = positiveInt('LIFECYCLE_PIPELINE_WAVES', 3);
 const PIPELINE_CONNECTIONS = positiveInt('LIFECYCLE_PIPELINE_CONNECTIONS', 12);
 const PIPELINE_REQUESTS = positiveInt('LIFECYCLE_PIPELINE_REQUESTS', 400);
 const MAX_RECOVERY_DRIFT = positiveInt('LIFECYCLE_MAX_RECOVERY_DRIFT_BYTES', 64 * 1024 * 1024);
+const MAX_BACKPRESSURE_GROWTH = positiveInt('LIFECYCLE_MAX_BACKPRESSURE_GROWTH_BYTES', 8 * 1024 * 1024);
+const MAX_BACKPRESSURE_SLOPE = positiveInt('LIFECYCLE_MAX_BACKPRESSURE_SLOPE_BYTES', 2 * 1024 * 1024);
 
 function positiveInt(name, fallback) {
   const value = Number(process.env[name]);
@@ -239,13 +241,14 @@ async function fragmentedPhase(baseline) {
 
 async function partialFramePhase(baseline) {
   const sockets = await openMany(RETAINED_CONNECTIONS);
-  const declaredLength = Math.max(PARTIAL_BYTES + 1, 256 * 1024);
-  const header = Buffer.alloc(14);
+  const declaredLength = Math.min(1024, Math.max(PARTIAL_BYTES + 1, 513));
+  const receivedLength = Math.min(PARTIAL_BYTES, declaredLength - 1);
+  const header = Buffer.alloc(8);
   header[0] = 0x82;
-  header[1] = 0xff;
-  header.writeBigUInt64BE(BigInt(declaredLength), 2);
-  header.writeUInt32BE(0x12345678, 10);
-  const partial = Buffer.alloc(PARTIAL_BYTES, 0x6b);
+  header[1] = 0xfe;
+  header.writeUInt16BE(declaredLength, 2);
+  header.writeUInt32BE(0x12345678, 4);
+  const partial = Buffer.alloc(receivedLength, 0x6b);
   for (const socket of sockets) socket._socket.write(Buffer.concat([header, partial]));
   await wait(500);
   const active = await sampledStats();
@@ -255,8 +258,8 @@ async function partialFramePhase(baseline) {
   return {
     connections: sockets.length,
     declaredBytesPerConnection: declaredLength,
-    receivedBytesPerConnection: PARTIAL_BYTES,
-    retainedInputBytes: sockets.length * PARTIAL_BYTES,
+    receivedBytesPerConnection: receivedLength,
+    retainedInputBytes: sockets.length * receivedLength,
     active,
     recovered: await sampledStats(),
   };
@@ -334,6 +337,10 @@ async function backpressurePhase(baseline) {
     waves.push({ wave, active, recovered: await sampledStats() });
   }
   const recovered = waves[waves.length - 1].recovered;
+  const recoveredRss = waves.map((wave) => wave.recovered.rssMedian);
+  const recoveredSlopeBytesPerWave = recoveredRss.length < 2
+    ? 0
+    : (recoveredRss.at(-1) - recoveredRss[0]) / (recoveredRss.length - 1);
   return {
     waves,
     connections: PIPELINE_CONNECTIONS,
@@ -341,6 +348,7 @@ async function backpressurePhase(baseline) {
     before,
     recovered,
     persistentRssGrowthBytes: Math.max(0, recovered.rssMedian - before.rssMedian),
+    recoveredSlopeBytesPerWave,
   };
 }
 
@@ -367,6 +375,8 @@ function assertion(name, pass, actual, expected) {
       pipelineConnections: PIPELINE_CONNECTIONS,
       pipelineRequests: PIPELINE_REQUESTS,
       maxRecoveryDriftBytes: MAX_RECOVERY_DRIFT,
+      maxBackpressureGrowthBytes: MAX_BACKPRESSURE_GROWTH,
+      maxBackpressureSlopeBytes: MAX_BACKPRESSURE_SLOPE,
     },
     baseline: await sampledStats(),
     phases: {},
@@ -405,6 +415,24 @@ function assertion(name, pass, actual, expected) {
     evidence.final.lobbies <= baseline.lobbies,
     evidence.final.lobbies,
     '<= ' + baseline.lobbies,
+  ));
+  evidence.assertions.push(assertion(
+    'legal partial websocket frames remain connected while incomplete',
+    evidence.phases.partialFrames.active.connections >= evidence.baseline.connections + RETAINED_CONNECTIONS,
+    evidence.phases.partialFrames.active.connections,
+    '>= ' + (evidence.baseline.connections + RETAINED_CONNECTIONS),
+  ));
+  evidence.assertions.push(assertion(
+    'HTTP backpressure recovery growth remains bounded',
+    evidence.phases.backpressure.persistentRssGrowthBytes <= MAX_BACKPRESSURE_GROWTH,
+    evidence.phases.backpressure.persistentRssGrowthBytes,
+    '<= ' + MAX_BACKPRESSURE_GROWTH,
+  ));
+  evidence.assertions.push(assertion(
+    'HTTP backpressure recovery slope remains bounded',
+    evidence.phases.backpressure.recoveredSlopeBytesPerWave <= MAX_BACKPRESSURE_SLOPE,
+    evidence.phases.backpressure.recoveredSlopeBytesPerWave,
+    '<= ' + MAX_BACKPRESSURE_SLOPE,
   ));
   evidence.assertions.push(assertion(
     'recovered RSS remains within the lifecycle audit envelope',
