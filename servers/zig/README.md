@@ -37,7 +37,7 @@ Environment variables:
 | `SNEK_MAX_PLAYERS_PER_LOBBY` | `16` | Lobby cap; canonical binary-v5 browser is tested at 16 |
 | `SNEK_MAX_LOBBIES` | `4096` | Generated-lobby resource cap, including the permanent default lobby |
 | `SNEK_LOBBIES_PER_WORKER` | `128` | Game-worker packing threshold |
-| `SNEK_LOBBY_IDLE_MS` | `60000` | Empty non-default lobby lifetime |
+| `SNEK_LOBBY_IDLE_MS` | `1800000` | Empty non-default lobby lifetime (30 minutes) |
 
 `POST /generateid` returns `503 Service Unavailable` at `SNEK_MAX_LOBBIES`;
 idle non-default lobbies free capacity when the maintenance loop reaps them.

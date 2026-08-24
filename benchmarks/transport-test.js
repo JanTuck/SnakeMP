@@ -132,6 +132,26 @@ assert.equal(second.sent.length, 2);
 assert.deepEqual(Array.from(second.sent[0]), [3, 1]);
 assert.deepEqual(Array.from(second.sent[1]), Array.from(first.sent[1]));
 
+// A fast join reply can beat deferred rendering modules. The inline form
+// listener sees init immediately, and a rendering listener attached afterward
+// must receive that same acknowledgement once instead of leaving the popup up.
+let inlineInitCalls = 0;
+let lateRenderingInitCalls = 0;
+let lateRenderingInitData = null;
+transport.on('init', () => { inlineInitCalls += 1; });
+second.receive('["init",{"mode":"arcade_v2","scale":16}]');
+assert.equal(inlineInitCalls, 1);
+transport.on('init', (data) => {
+  lateRenderingInitCalls += 1;
+  lateRenderingInitData = data;
+});
+assert.equal(lateRenderingInitCalls, 1, 'a late rendering listener receives the retained init exactly once');
+assert.deepEqual(
+  JSON.parse(JSON.stringify(lateRenderingInitData)),
+  { mode: 'arcade_v2', scale: 16 },
+  'the retained init preserves the authoritative mode and board setup'
+);
+
 // UTF-8 protocol limits are byte limits, not JavaScript code-unit limits.
 const beforeOversize = second.sent.length;
 transport.emit('clientReady', '🐍'.repeat(63), 'room');

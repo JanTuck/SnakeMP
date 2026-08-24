@@ -19,6 +19,12 @@
         constructor() {
             this.id = '';
             this.listeners = new Map();
+            // `init` is the join acknowledgement that unlocks the whole game
+            // UI. Module scripts can finish loading after a fast server reply,
+            // so keep the current acknowledgement available for each listener
+            // that attaches late instead of silently dropping it.
+            this.hasInit = false;
+            this.lastInit = undefined;
             this.pendingJoin = null;
             this.retryMs = 250;
             this.connect();
@@ -27,6 +33,7 @@
             let handlers = this.listeners.get(name);
             if (handlers === undefined) this.listeners.set(name, handlers = []);
             handlers.push(handler);
+            if (name === 'init' && this.hasInit) handler(this.lastInit);
             return this;
         }
         reconnect() {
@@ -78,11 +85,20 @@
                 try { event = JSON.parse(message.data); } catch (_) { return; }
                 if (!Array.isArray(event) || typeof event[0] !== 'string') return;
                 if (event[0] === 'id' && typeof event[1] === 'string') this.id = event[1];
+                if (event[0] === 'init') {
+                    this.hasInit = true;
+                    this.lastInit = event[1];
+                } else if (event[0] === 'game_error') {
+                    this.hasInit = false;
+                    this.lastInit = undefined;
+                }
                 this.dispatch(event[0], event[1]);
             };
             ws.onclose = () => {
                 if (this.ws !== ws) return;
                 this.id = '';
+                this.hasInit = false;
+                this.lastInit = undefined;
                 this.dispatch('disconnect', 'transport close');
                 const delay = this.retryMs;
                 this.retryMs = Math.min(5000, this.retryMs * 2);
@@ -117,6 +133,11 @@
                 return true;
             }
             if (name !== 'clientReady') return false;
+            // A new join/retry needs its own authoritative acknowledgement;
+            // never replay the preceding life/session to a listener that loads
+            // while the request is in flight.
+            this.hasInit = false;
+            this.lastInit = undefined;
             const username = encoder.encode(String(first));
             const lobby = encoder.encode(String(second));
             // Passwords are opaque user input. Preserve whitespace and other

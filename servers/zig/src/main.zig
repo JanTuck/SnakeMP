@@ -2496,6 +2496,10 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
     l.stats.max_tick_ms = @max(l.stats.max_tick_ms, dur_ms);
 }
 
+fn idleLobbyExpired(empty: bool, last_empty_at: i64, now: i64, ttl: i64) bool {
+    return empty and now - last_empty_at >= ttl;
+}
+
 fn reapIdleLobbies(now: i64) void {
     var index: usize = 0;
     while (index < lobbies.count()) {
@@ -2509,7 +2513,7 @@ fn reapIdleLobbies(now: i64) void {
         if (!empty) {
             l.last_empty_at = 0;
         } else if (l.last_empty_at == 0) l.last_empty_at = now;
-        const expired = empty and now - l.last_empty_at >= lobby_idle_delete_ms;
+        const expired = idleLobbyExpired(empty, l.last_empty_at, now, lobby_idle_delete_ms);
         l.mutex.unlock(g_io);
         if (expired) {
             lobbies.swapRemoveAt(index);
@@ -4419,6 +4423,15 @@ test "quick join target counts active snakes and ignores chat spectators" {
     try std.testing.expect(quickJoinEligibleLocked(&lobby));
     try lobby.players.append(galloc, &second);
     try std.testing.expect(!quickJoinEligibleLocked(&lobby));
+}
+
+test "empty generated lobby survives the full thirty minute waiting window" {
+    const created_at: i64 = 123_456;
+    const ttl = config.LOBBY_IDLE_DELETE_MS;
+    try std.testing.expectEqual(@as(i64, 30 * 60_000), ttl);
+    try std.testing.expect(!idleLobbyExpired(true, created_at, created_at + ttl - 1, ttl));
+    try std.testing.expect(idleLobbyExpired(true, created_at, created_at + ttl, ttl));
+    try std.testing.expect(!idleLobbyExpired(false, created_at, created_at + ttl, ttl));
 }
 
 test "quick join respects the creator-selected lobby capacity" {

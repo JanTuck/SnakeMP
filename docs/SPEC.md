@@ -70,7 +70,8 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
 - At most 4096 lobbies exist by default, including `12345`
   (`SNEK_MAX_LOBBIES`). At capacity, `POST /generateid` returns HTTP 503 without
   allocating an id or lobby; reaping an idle lobby frees a slot.
-- Other empty lobbies are reaped after 60 seconds by default. Override the
+- Other empty lobbies are reaped after 30 minutes by default, so a creator can
+  remain on the waiting/login screen while sharing the invite. Override the
   lifecycle test/deployment value with `SNEK_LOBBY_IDLE_MS`.
 - Default process-wide capacity is 100 retained lobby identities
   (`SNEK_MAX_PLAYERS`): active snakes and game-over chat spectators use the same

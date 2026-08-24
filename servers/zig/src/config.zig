@@ -22,7 +22,9 @@ pub const DEFAULT_MAX_PLAYERS_PER_LOBBY: usize = 32;
 pub const DEFAULT_MAX_LOBBIES: usize = 4096;
 pub const LOBBIES_PER_WORKER: usize = 128;
 pub const GAME_WORKER_STACK: usize = 128 * 1024;
-pub const LOBBY_IDLE_DELETE_MS: i64 = 60_000;
+/// Keep newly created rooms available while their creator is still sharing the
+/// invite or choosing a name on the waiting screen.
+pub const LOBBY_IDLE_DELETE_MS: i64 = 30 * 60_000;
 pub const DEFAULT_LOBBY_ID = "12345";
 /// Passwords are request- and packet-bounded before hashing. This is a byte
 /// limit (not a code-point limit), matching HTTP and WebSocket wire lengths.

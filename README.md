@@ -109,7 +109,7 @@ Useful runtime overrides are:
 - `SNEK_MAX_PLAYERS_PER_LOBBY` (default and supported browser value `16`)
 - `SNEK_MAX_LOBBIES` (default `4096`, including the permanent default lobby)
 - `SNEK_LOBBIES_PER_WORKER` (default `128`)
-- `SNEK_LOBBY_IDLE_MS` (default `60000`)
+- `SNEK_LOBBY_IDLE_MS` (default `1800000`, keeping an empty waiting room alive for 30 minutes)
 - `SNEK_DEBUG=1` to expose local benchmark statistics at `/debug/stats`
 
 `POST /generateid` returns `503 Service Unavailable` while the configured lobby

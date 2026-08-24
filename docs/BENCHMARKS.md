@@ -417,7 +417,7 @@ game workers, and reduced RSS by 90.6% and VM by 91.9%. Raw evidence:
 
 `npm run test:memory` launches an isolated server and runs four consecutive
 waves of 1,000 players across 63 temporary lobbies per wave. It accelerates the
-60-second empty-lobby lifetime to 60 ms (**1,000x lifecycle acceleration**),
+30-minute empty-lobby lifetime to 60 ms (**30,000x lifecycle acceleration**),
 then verifies that players, connections, and temporary lobbies return to zero,
 approximately zero, and one respectively after every wave.
 

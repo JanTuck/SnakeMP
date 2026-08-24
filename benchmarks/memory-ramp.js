@@ -2,7 +2,7 @@
  * Accelerated lifecycle/RSS integration test for the native WebSocket server.
  *
  * The server should be started with SNEK_DEBUG=1 and
- * SNEK_LOBBY_IDLE_MS=60 (the production 60 second idle lifetime at 1000x).
+ * SNEK_LOBBY_IDLE_MS=60 (the production 30-minute idle lifetime at 30,000x).
  * Each wave creates fresh lobbies, joins a large number of stationary players,
  * closes every socket, waits for lifecycle cleanup, and checks that both state
  * and resident memory return to a bounded baseline.
