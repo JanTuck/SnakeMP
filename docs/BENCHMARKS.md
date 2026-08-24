@@ -219,6 +219,32 @@ trailing requests, request bodies followed by another request, `Connection:
 close`, headerless HTTP/1.0 requests, and a WebSocket frame coalesced with its
 upgrade request.
 
+Backpressured output queues now compact released descriptor prefixes after 64
+items once the prefix is at least half the array, retain at most 256 descriptors
+after completely draining, and cap live WebSocket items at 4,096 in addition to
+the four MiB byte cap. Previously, a connection that continuously made partial
+progress without fully draining could retain every consumed descriptor; at 15
+snapshots/s that stale metadata alone could grow by roughly 31 MiB per day per
+connection. The queue unit test preserves a partially written live head and
+exact byte accounting across compaction.
+
+Empty-lobby reaping also changed from duplicated-ID collection plus ordered map
+removal to an allocation-free in-place swap removal. Expiring all 4,095
+temporary lobbies at the default cap previously shifted 8,382,465 later map
+entries—at least 191.9 MiB of key/value movement—whereas the new pass visits
+and removes each lobby once. `npm run bench:lobby-reap` excludes map setup,
+validates the exact permanent survivor and removed-value checksum, and reports
+the median of seven ReleaseFast samples:
+
+| Temporary lobbies | Ordered removal | Swap removal | Speedup |
+|---:|---:|---:|---:|
+| 64 | 5.022 us | 0.278 us | 18.06x |
+| 1,000 | 866.824 us | 4.449 us | 194.84x |
+| 4,095 | 14,712.030 us | 34.555 us | **425.76x** |
+
+The isolated integration audit additionally verified all 64 temporary lobbies
+were reaped and creation capacity recovered.
+
 ## Historical v1 wire-format microbenchmark
 
 This older format-selection benchmark is retained to document why binary

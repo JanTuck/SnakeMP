@@ -76,6 +76,9 @@ const MAX_HTTP_BODY = config.MAX_HTTP_BODY;
 const MAX_HTTP_INPUT = config.MAX_HTTP_INPUT;
 const MAX_WS_INPUT = config.MAX_WS_INPUT;
 const MAX_QUEUE_BYTES = config.MAX_QUEUE_BYTES;
+const MAX_QUEUE_ITEMS: usize = 4096;
+const OUTPUT_COMPACT_MIN_HEAD: usize = 64;
+const OUTPUT_RETAINED_ITEMS: usize = 256;
 const HTTP_IDLE_MS = config.HTTP_IDLE_MS;
 
 // ------------------------------------------------------------------ state
@@ -348,17 +351,44 @@ fn outputEmpty(c: *const Conn) bool {
     return c.output_head == c.output.items.len;
 }
 
-fn prepareOutputAppend(c: *Conn) void {
-    if (!outputEmpty(c)) return;
-    c.output.clearRetainingCapacity();
+fn resetOutputStorage(c: *Conn) void {
+    std.debug.assert(outputEmpty(c));
+    std.debug.assert(c.output_bytes == 0);
+    if (c.output.capacity > OUTPUT_RETAINED_ITEMS) {
+        c.output.deinit(galloc);
+        c.output = .empty;
+    } else {
+        c.output.clearRetainingCapacity();
+    }
     c.output_head = 0;
     c.output_offset = 0;
+}
+
+fn compactOutputPrefix(c: *Conn) void {
+    if (c.output_head < OUTPUT_COMPACT_MIN_HEAD) return;
+    const live = c.output.items.len - c.output_head;
+    if (c.output_head < live) return;
+    std.mem.copyForwards(model.PendingOutput, c.output.items[0..live], c.output.items[c.output_head..]);
+    c.output.shrinkRetainingCapacity(live);
+    c.output_head = 0;
+}
+
+fn prepareOutputAppend(c: *Conn) void {
+    if (outputEmpty(c)) {
+        resetOutputStorage(c);
+    } else {
+        compactOutputPrefix(c);
+    }
+}
+
+fn outputItemLimitReached(c: *const Conn) bool {
+    return c.mode == .websocket and c.output.items.len - c.output_head >= MAX_QUEUE_ITEMS;
 }
 
 fn appendOwnedOutput(c: *Conn, first: []const u8, second: []const u8) bool {
     prepareOutputAppend(c);
     const size = first.len + second.len;
-    if (c.output_bytes + size > MAX_QUEUE_BYTES) {
+    if (outputItemLimitReached(c) or c.output_bytes + size > MAX_QUEUE_BYTES) {
         c.poisoned = true;
         return false;
     }
@@ -381,7 +411,7 @@ fn appendOwnedOutput(c: *Conn, first: []const u8, second: []const u8) bool {
 fn appendBorrowedOutput(c: *Conn, bytes: []const u8) bool {
     prepareOutputAppend(c);
     if (bytes.len == 0) return true;
-    if (c.output_bytes + bytes.len > MAX_QUEUE_BYTES) {
+    if (outputItemLimitReached(c) or c.output_bytes + bytes.len > MAX_QUEUE_BYTES) {
         c.poisoned = true;
         return false;
     }
@@ -420,7 +450,7 @@ fn appendSharedOutput(c: *Conn, frame: *model.SharedFrame, offset: usize) bool {
     std.debug.assert(offset <= frame.len());
     if (frame.keyframe) coalesceForKeyframe(c);
     const remaining = frame.len() - offset;
-    if (c.output_bytes + remaining > MAX_QUEUE_BYTES) {
+    if (outputItemLimitReached(c) or c.output_bytes + remaining > MAX_QUEUE_BYTES) {
         c.poisoned = true;
         return false;
     }
@@ -638,12 +668,14 @@ fn flushOutput(c: *Conn) bool {
                 }
             },
             .INTR => continue,
-            .AGAIN => return true,
+            .AGAIN => {
+                compactOutputPrefix(c);
+                return true;
+            },
             else => return false,
         }
     }
-    c.output.clearRetainingCapacity();
-    c.output_head = 0;
+    resetOutputStorage(c);
     updateConnInterest(c, false);
     return !c.close_after_write;
 }
@@ -1575,13 +1607,13 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
 }
 
 fn reapIdleLobbies(now: i64) void {
-    var doomed: std.ArrayListUnmanaged([]u8) = .empty;
-    defer {
-        for (doomed.items) |dz| galloc.free(dz);
-        doomed.deinit(galloc);
-    }
-    for (lobbies.values()) |l| {
-        if (std.mem.eql(u8, l.id, DEFAULT_LOBBY_ID)) continue;
+    var index: usize = 0;
+    while (index < lobbies.count()) {
+        const l = lobbies.values()[index];
+        if (std.mem.eql(u8, l.id, DEFAULT_LOBBY_ID)) {
+            index += 1;
+            continue;
+        }
         l.mutex.lockUncancelable(g_io);
         const empty = l.players.count() == 0;
         if (!empty) {
@@ -1590,12 +1622,11 @@ fn reapIdleLobbies(now: i64) void {
         const expired = empty and now - l.last_empty_at >= lobby_idle_delete_ms;
         l.mutex.unlock(g_io);
         if (expired) {
-            const dup = galloc.dupe(u8, l.id) catch continue;
-            doomed.append(galloc, dup) catch galloc.free(dup);
+            lobbies.swapRemoveAt(index);
+            destroyLobby(l);
+        } else {
+            index += 1;
         }
-    }
-    for (doomed.items) |dz| {
-        if (lobbies.fetchOrderedRemove(dz)) |kv| destroyLobby(kv.value);
     }
 }
 
@@ -2422,6 +2453,33 @@ test "websocket headers use minimal RFC lengths" {
     try std.testing.expectEqualSlices(u8, &.{ 0x82, 17 }, header[0..2]);
     try std.testing.expectEqual(@as(usize, 4), wsHeader(&header, 2, 126));
     try std.testing.expectEqualSlices(u8, &.{ 0x82, 126, 0, 126 }, header[0..4]);
+}
+
+test "output queue compacts released prefixes and drops oversized idle storage" {
+    galloc = std.testing.allocator;
+    var connection = Conn{ .fd = -1 };
+    defer connection.output.deinit(galloc);
+
+    for (0..80) |_| try connection.output.append(galloc, .{ .borrowed = "a" });
+    try connection.output.append(galloc, .{ .borrowed = "xy" });
+    for (0..49) |_| try connection.output.append(galloc, .{ .borrowed = "b" });
+    connection.output_head = 80;
+    connection.output_offset = 1;
+    connection.output_bytes = 50;
+    compactOutputPrefix(&connection);
+    try std.testing.expectEqual(@as(usize, 50), connection.output.items.len);
+    try std.testing.expectEqual(@as(usize, 0), connection.output_head);
+    try std.testing.expectEqual(@as(usize, 1), connection.output_offset);
+    try std.testing.expectEqual(@as(usize, 50), connection.output_bytes);
+    try std.testing.expectEqualStrings("xy", connection.output.items[0].borrowed);
+
+    connection.output.clearRetainingCapacity();
+    connection.output_head = 0;
+    connection.output_offset = 0;
+    connection.output_bytes = 0;
+    try connection.output.ensureTotalCapacity(galloc, OUTPUT_RETAINED_ITEMS + 1);
+    resetOutputStorage(&connection);
+    try std.testing.expectEqual(@as(usize, 0), connection.output.capacity);
 }
 
 test "color conversion clamps floating point edge values" {

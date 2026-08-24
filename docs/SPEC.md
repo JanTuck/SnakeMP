@@ -20,7 +20,10 @@ transport.
   player/connection use-after-free while the reactor and game workers run
   concurrently.
 - Ready sockets use direct nonblocking writes. Per-connection output storage is
-  retained and copied into only when the socket applies backpressure.
+  retained and copied into only when the socket applies backpressure. Consumed
+  queue prefixes are compacted incrementally, oversized idle descriptor arrays
+  are released, and WebSocket queues are bounded by both four MiB of live bytes
+  and 4,096 live items.
 
 The worker packing threshold is configurable with `SNEK_LOBBIES_PER_WORKER`.
 The default of 128 was validated at 750 active lobbies: six game workers held

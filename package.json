@@ -20,6 +20,7 @@
     "benchmark:build": "node benchmarks/build-release.js",
     "bench:snapshot": "cd servers/zig && zig run -O ReleaseFast --cache-dir .zig-cache --global-cache-dir .zig-global-cache bench_snapshot.zig",
     "bench:tick-scratch": "cd servers/zig && zig run -O ReleaseFast --cache-dir .zig-cache --global-cache-dir .zig-global-cache bench_tick_scratch.zig",
+    "bench:lobby-reap": "cd servers/zig && zig run -O ReleaseFast --cache-dir .zig-cache --global-cache-dir .zig-global-cache bench_lobby_reap.zig",
     "bench:http-pipeline": "node benchmarks/http-pipeline-bench.js",
     "bench": "npm run build:zig && bash benchmarks/run-benchmarks.sh"
   },
