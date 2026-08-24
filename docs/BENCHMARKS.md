@@ -183,6 +183,34 @@ at 1 Hz consumes 220 B/s: a **57.36%** reduction, not the naive 93.33% cadence
 ratio. `node benchmarks/visibility-bandwidth.js` projects mixed-client totals
 with those payload classes separately.
 
+## HTTP pipeline compaction benchmark
+
+The HTTP parser previously removed every completed request from the front of
+its receive buffer immediately. A large pipeline therefore moved all remaining
+bytes once per request, making buffer copies grow quadratically. It now parses
+with an offset and compacts the buffer once when the batch is complete.
+
+`npm run bench:http-pipeline` sends minimal keep-alive requests over one
+loopback connection, validates the exact number and ordering of responses, and
+reports the median of three ReleaseFast samples. Timing includes response I/O;
+the smallest batch is correspondingly noisy. The paired measurements were:
+
+| Requests in one pipeline | Before | After | Change |
+|---:|---:|---:|---:|
+| 64 | 0.833 ms | 1.602 ms | noise-scale regression |
+| 256 | 2.976 ms | 1.828 ms | 38.6% faster |
+| 1,024 | 11.302 ms | 6.531 ms | 42.2% faster |
+| 2,048 | 23.063 ms | 13.181 ms | 42.8% faster |
+| 4,096 | 65.380 ms | 24.696 ms | 62.2% faster |
+| 6,240 | 129.133 ms | 39.096 ms | **69.7% faster** |
+
+At 6,240 minimal 21-byte requests, the old parser moved about 390 MiB of buffer
+contents. The offset parser performs one final compaction and returned all
+6,240 responses in order. Protocol parity tests additionally cover partial
+trailing requests, request bodies followed by another request, `Connection:
+close`, headerless HTTP/1.0 requests, and a WebSocket frame coalesced with its
+upgrade request.
+
 ## Historical v1 wire-format microbenchmark
 
 This older format-selection benchmark is retained to document why binary

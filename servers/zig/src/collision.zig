@@ -142,6 +142,7 @@ pub const Index = struct {
     }
 
     pub fn maskAt(index: *const Index, position: model.CellPos) Mask {
+        if (!index.enabled) return 0;
         const cell = cellIndex(position) orelse return 0;
         return index.cells[cell];
     }
@@ -265,6 +266,7 @@ test "short lobbies retain the exact lower-cost scan path" {
     const players = [_]*model.Player{ &a, &b };
     const index = Index.build(&players);
     try std.testing.expect(!index.enabled);
+    try std.testing.expectEqual(@as(Mask, 0), index.maskAt(.{ .x = 0, .y = 0 }));
     const hit = index.otherAt(0, &a).?;
     try std.testing.expectEqual(@as(usize, 1), hit.slot);
     try std.testing.expect(hit.player == &b);

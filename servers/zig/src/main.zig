@@ -2025,13 +2025,20 @@ fn processWsInput(c: *Conn, aa: Allocator) bool {
 }
 
 fn processHttpInput(c: *Conn, aa: Allocator) bool {
+    // Parse a complete pipeline with an offset and compact once on exit. The
+    // previous per-request memmove made an N-request batch copy O(N²) bytes.
+    var consumed: usize = 0;
+    defer consumeInput(c, consumed);
     while (c.mode == .http and !c.close_after_write) {
-        const head_at = std.mem.indexOf(u8, c.input.items, CRLF ++ CRLF) orelse {
-            return c.input.items.len <= MAX_HTTP_HEAD_LINE;
+        const input = c.input.items[consumed..];
+        const head_at = std.mem.indexOf(u8, input, CRLF ++ CRLF) orelse {
+            return input.len <= MAX_HTTP_HEAD_LINE;
         };
         if (head_at > MAX_HTTP_HEAD_LINE) return false;
-        const head = c.input.items[0..head_at];
-        const request_line_end = std.mem.indexOf(u8, head, CRLF) orelse return false;
+        const head = input[0..head_at];
+        // With no headers, the CRLF that terminates the request line is also
+        // the first half of the CRLFCRLF delimiter and lies just past `head`.
+        const request_line_end = std.mem.indexOf(u8, head, CRLF) orelse head.len;
         const request_line = head[0..request_line_end];
         const sp1 = std.mem.indexOfScalar(u8, request_line, ' ') orelse return false;
         const sp2 = std.mem.lastIndexOfScalar(u8, request_line, ' ') orelse return false;
@@ -2054,7 +2061,8 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
         var ws_version_seen = false;
         var body_is_json = false;
         var header_count: usize = 0;
-        var lines = std.mem.splitSequence(u8, head[request_line_end + CRLF.len ..], CRLF);
+        const headers_at = @min(head.len, request_line_end + CRLF.len);
+        var lines = std.mem.splitSequence(u8, head[headers_at..], CRLF);
         while (lines.next()) |line| {
             header_count += 1;
             if (header_count > 200) return false;
@@ -2096,8 +2104,8 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
         }
         const body_at = head_at + 2 * CRLF.len;
         const request_len = body_at + body_len;
-        if (c.input.items.len < request_len) return true;
-        const body = c.input.items[body_at..request_len];
+        if (input.len < request_len) return true;
+        const body = input[body_at..request_len];
 
         if (upgrade_ws) {
             const qpos = std.mem.indexOfScalar(u8, target, '?');
@@ -2108,7 +2116,9 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
                 sendResponse(c, aa, .{ .status = 400, .reason = "Bad Request", .ctype = "text/plain; charset=utf-8", .body = "websocket upgrade rejected", .keep_alive = false });
                 return true;
             }
-            consumeInput(c, request_len);
+            consumed += request_len;
+            consumeInput(c, consumed);
+            consumed = 0;
             c.mode = .websocket;
             c.next_ping_ms = unixMillis() + PING_INTERVAL_MS;
             if (c.input.items.len == 0) {
@@ -2120,7 +2130,7 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
 
         const keep_alive = if (http10) connection_keep and !connection_close else !connection_close;
         routeAndRespond(c, aa, method, target, body, body_is_json, keep_alive);
-        consumeInput(c, request_len);
+        consumed += request_len;
         if (connPoisoned(c)) return false;
     }
     return true;

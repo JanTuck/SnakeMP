@@ -166,6 +166,23 @@ const hasChainedUpLeft = (moves) => {
   check('security headers', String(hdrs['x-content-type-options']).toLowerCase() === 'nosniff' && String(hdrs['x-frame-options']).toLowerCase() === 'deny', JSON.stringify({ n: hdrs['x-content-type-options'], f: hdrs['x-frame-options'] }));
   const partial = await rawParts(['GET / HTTP/1.1\r\nHo', 'st: 127.0.0.1\r\nConnection: close\r\n', '\r\n']);
   check('partial HTTP request is assembled incrementally', partial.startsWith('HTTP/1.1 200'), partial.slice(0, 32));
+  const noHeaders = await rawParts(['GET / HTTP/1.0\r\n\r\n']);
+  check('HTTP/1.0 request without headers is accepted', noHeaders.startsWith('HTTP/1.1 200'), noHeaders.slice(0, 32));
+  const partialPipeline = await rawParts([
+    'GET /missing HTTP/1.1\r\nHost:x\r\n\r\nGET / HTTP/1.',
+    '0\r\n\r\n',
+  ]);
+  check('complete pipeline prefix survives a partial trailing request',
+    (partialPipeline.match(/HTTP\/1\.1 /g) || []).length === 2 &&
+      partialPipeline.indexOf('404 Not Found') < partialPipeline.indexOf('200 OK'), 'responses=' + (partialPipeline.match(/HTTP\/1\.1 /g) || []).length);
+  const bodyPipeline = await rawParts([
+    'POST /joingame HTTP/1.1\r\nHost:x\r\nContent-Length: 8\r\n\r\ngameId=x' +
+    'GET / HTTP/1.0\r\n\r\n',
+  ]);
+  check('pipelined request offsets preserve bodies and following requests',
+    bodyPipeline.indexOf('303 See Other') >= 0 && bodyPipeline.indexOf('303 See Other') < bodyPipeline.indexOf('200 OK'), bodyPipeline.slice(0, 32));
+  const closePipeline = await rawParts(['GET / HTTP/1.1\r\nConnection: close\r\n\r\nGET /missing HTTP/1.0\r\n\r\n']);
+  check('Connection close ignores later pipelined requests', (closePipeline.match(/HTTP\/1\.1 /g) || []).length === 1, closePipeline.slice(0, 32));
   await rawParts(['POST /joingame HTTP/1.1\r\nHost: x\r\nContent-Length: nope\r\n\r\n']);
   check('malformed HTTP closes safely and server remains healthy', (await get('/')).status === 200);
   const validWsHeaders =
@@ -181,7 +198,9 @@ const hasChainedUpLeft = (moves) => {
   check('websocket upgrade rejects header-token substrings', !substringUpgrade.startsWith('HTTP/1.1 101'), substringUpgrade.slice(0, 32));
   const http10Upgrade = await rawParts(['GET /ws HTTP/1.0\r\n' + validWsHeaders]);
   check('websocket upgrade requires HTTP/1.1', http10Upgrade.startsWith('HTTP/1.1 400'), http10Upgrade.slice(0, 32));
-  const rsvFrame = await rawPartsOutcome(['GET /ws HTTP/1.1\r\n' + validWsHeaders, maskedFrame(0xC2, [2, 0])]);
+  const rsvFrame = await rawPartsOutcome([Buffer.concat([
+    Buffer.from('GET /ws HTTP/1.1\r\n' + validWsHeaders), maskedFrame(0xC2, [2, 0]),
+  ])]);
   check('websocket parser rejects reserved bits', rsvFrame.reason !== 'timeout', rsvFrame.reason);
   const invalidTextFrame = await rawPartsOutcome(['GET /ws HTTP/1.1\r\n' + validWsHeaders, maskedFrame(0x81, [0xC0, 0x80])]);
   check('websocket parser rejects invalid UTF-8 text', invalidTextFrame.reason !== 'timeout', invalidTextFrame.reason);

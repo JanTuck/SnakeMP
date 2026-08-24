@@ -61,6 +61,7 @@ npm run check
 npm run parity
 npm run test:memory
 npm run test:lobbies
+npm run bench:http-pipeline
 node benchmarks/wire-format-bench.js
 ```
 
