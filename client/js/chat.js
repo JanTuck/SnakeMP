@@ -60,7 +60,7 @@
     }
 
     function reconcileRoster(nextRoster) {
-        if (!Array.isArray(nextRoster) || nextRoster.length > 16) return;
+        if (!Array.isArray(nextRoster) || nextRoster.length > 32) return;
         const candidates = [];
         const ids = new Set();
         for (const meta of nextRoster) {

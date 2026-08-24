@@ -267,10 +267,13 @@ pub const Lobby = struct {
     password_salt: [16]u8 = @splat(0),
     password_hash: [32]u8 = @splat(0),
     password_protected: bool = false,
-    /// Zero keeps a room invite-only. Values 2...16 make a passwordless room
+    /// Zero keeps a room invite-only. Values 2...32 make a passwordless room
     /// discoverable by Quick Join until its active snakes reach this soft
     /// target; retained game-over chat members do not make a room look full.
     public_target: u8 = 0,
+    /// Creator-selected active-player ceiling. Public creation exposes 16 or
+    /// 32; an operator-level limit may clamp the stored value lower.
+    max_players: u8 = 16,
     /// Shared, allocation-free chat token bucket. Access is serialized by the
     /// lobby mutex alongside membership and broadcast fan-out.
     chat_tokens: u8 = LOBBY_CHAT_TOKEN_CAPACITY,
@@ -278,13 +281,16 @@ pub const Lobby = struct {
     /// The creator fixes this for the lobby lifetime. Arcade v1 remains the
     /// compatibility default; Classical and Arcade v2 are always explicit.
     mode: GameMode = .arcade_v1,
+    /// Optional arena rule chosen by the lobby creator. Crossing any edge
+    /// re-enters on the opposite edge instead of counting as a wall death.
+    wrap_walls: bool = false,
     /// Reactor-owned. Generated lobbies do not acquire a simulation thread
     /// until their first successful player join.
     worker_assigned: bool = false,
     mutex: std.Io.Mutex = .init,
     rng: std.Random.DefaultPrng = undefined,
     /// Stable insertion order is protocol-significant; membership is capped at
-    /// 16, so a pointer list is smaller and cheaper than a string hash map.
+    /// 32, so a pointer list is smaller and cheaper than a string hash map.
     players: std.ArrayListUnmanaged(*Player) = .empty,
     /// Eliminated connections remain attached for game-over chat, while their
     /// binary death replay ends at Conn.spectating_until. Callers enforce
@@ -308,7 +314,7 @@ pub const Lobby = struct {
     snapshot_sequence: u16 = 0,
     snapshot_since_keyframe: u8 = 0,
     snapshot_player_count: u8 = 0,
-    snapshot_previous: [16]SnapshotPlayerState = [_]SnapshotPlayerState{.{}} ** 16,
+    snapshot_previous: [32]SnapshotPlayerState = [_]SnapshotPlayerState{.{}} ** 32,
     /// Fast EWMA of complete tick cost, written only by the owning worker.
     /// The reactor reads it while worker mutexes are held during rebalancing.
     balance_ewma_ns: u64 = 0,

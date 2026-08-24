@@ -13,8 +13,10 @@ pub const TICK_NS: u64 = 66_666_667;
 /// to stay warm without paying the foreground 15 Hz fan-out cost.
 pub const BACKGROUND_SNAPSHOT_MS: i64 = 1_000;
 
-pub const DEFAULT_MAX_PLAYERS_GLOBAL: usize = 100;
-pub const DEFAULT_MAX_PLAYERS_PER_LOBBY: usize = 16;
+/// One process intentionally maps to one protocol-sized arena. Operators can
+/// lower these limits, but cannot raise them beyond the 32-player wire cap.
+pub const DEFAULT_MAX_PLAYERS_GLOBAL: usize = 32;
+pub const DEFAULT_MAX_PLAYERS_PER_LOBBY: usize = 32;
 /// Includes the permanent default lobby. Empty generated lobbies are cheap,
 /// but still retain ids, maps, and debug-metric rows until their idle TTL.
 pub const DEFAULT_MAX_LOBBIES: usize = 4096;

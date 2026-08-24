@@ -251,6 +251,10 @@ const HUD_MUTE_COL: i32 = COLS * 5 / 6;
 const HUD_MUTE_ROW: i32 = ROWS * 5 / 6;
 const HUD_CHAT_COL: i32 = COLS * 2 / 5;
 const HUD_CHAT_ROW: i32 = ROWS * 3 / 5;
+// Four cells preserve roughly a quarter-second of reaction time at 15 Hz while
+// still allowing every advertised 32-player lobby slot to receive a safe spawn.
+const SPAWN_HEAD_CLEARANCE_CELLS: i32 = 4;
+const SPAWN_BODY_CLEARANCE_CELLS: i32 = 2;
 
 /// Keep every mode's objectives comfortably inside the playable field and out
 /// of the responsive HUD's conservative footprint. A shallow full-width band
@@ -300,6 +304,43 @@ fn snakeOccupies(l: *Lobby, cell: CellPos) bool {
     return false;
 }
 
+fn pickupOccupies(l: *const Lobby, cell: CellPos) bool {
+    if (sameCell(l.food, cell)) return true;
+    for (l.bonus.items) |bonus| if (sameCell(bonus.pos, cell)) return true;
+    for (l.drops.items) |drop| if (sameCell(drop.pos, cell)) return true;
+    if (l.golden) |golden| if (sameCell(golden.pos, cell)) return true;
+    for (l.remains.items) |remain| if (sameCell(remain.pos, cell)) return true;
+    return false;
+}
+
+fn cellDistance(left: CellPos, right: CellPos) i32 {
+    const dx = @abs(@divExact(left.x - right.x, CELL));
+    const dy = @abs(@divExact(left.y - right.y, CELL));
+    return @intCast(@max(dx, dy));
+}
+
+/// Authoritative join safety: the central half provides wall reaction room,
+/// pickups are never hidden beneath a new snake, and existing heads/bodies get
+/// separate buffers so a player cannot materialize into an unavoidable death.
+fn spawnCellSafe(l: *const Lobby, cell: CellPos) bool {
+    if (cell.x < (COLS / 4) * CELL or cell.x >= (COLS - COLS / 4) * CELL or
+        cell.y < (ROWS / 4) * CELL or cell.y >= (ROWS - ROWS / 4) * CELL)
+    {
+        return false;
+    }
+    // A mathematically safe spawn is still unusable when the local head is
+    // hidden beneath the standings, chat, feed, or sound controls.
+    if (!objectiveCellSafe(cell)) return false;
+    if (pickupOccupies(l, cell)) return false;
+    for (l.players.items) |player| {
+        for (player.snake.items, 0..) |segment, index| {
+            const clearance = if (index == 0) SPAWN_HEAD_CLEARANCE_CELLS else SPAWN_BODY_CLEARANCE_CELLS;
+            if (cellDistance(cell, segment) <= clearance) return false;
+        }
+    }
+    return true;
+}
+
 /// Free of snakes AND every pickup kind (SPEC "Free cell"), 200 attempts.
 fn randomFreeCell(l: *Lobby) ?CellPos {
     var attempt: usize = 0;
@@ -341,19 +382,23 @@ fn randomFreeCell(l: *Lobby) ?CellPos {
     return null;
 }
 
-/// Join spawn: avoid snakes (inner retries) and food, up to 100 attempts.
-fn pickSpawnCell(l: *Lobby) CellPos {
-    var pos = randomSpawnCell(l);
-    var attempt: usize = 0;
-    while (attempt < 100) : (attempt += 1) {
-        var t: usize = 0;
-        while (t < 1000) : (t += 1) {
-            pos = randomSpawnCell(l);
-            if (!snakeOccupies(l, pos)) break;
-        }
-        if (!(pos.x == l.food.x and pos.y == l.food.y)) return pos;
+/// Random probes preserve natural distribution. The exhaustive fallback makes
+/// success/failure authoritative: null means no safe central cell exists, not
+/// merely that the random retry budget was unlucky.
+fn pickSpawnCell(l: *Lobby) ?CellPos {
+    for (0..256) |_| {
+        const candidate = randomSpawnCell(l);
+        if (spawnCellSafe(l, candidate)) return candidate;
     }
-    return pos;
+    var cy: i32 = ROWS / 4;
+    while (cy < ROWS - ROWS / 4) : (cy += 1) {
+        var cx: i32 = COLS / 4;
+        while (cx < COLS - COLS / 4) : (cx += 1) {
+            const candidate: CellPos = .{ .x = cx * CELL, .y = cy * CELL };
+            if (spawnCellSafe(l, candidate)) return candidate;
+        }
+    }
+    return null;
 }
 
 // Thirty-two visually separated colors cover the complete live+spectator cap.
@@ -391,6 +436,12 @@ fn choosePlayerColor(l: *Lobby) []const u8 {
 
 fn collidedWall(h: CellPos) bool {
     return h.x > GRID_W - CELL or h.x < 0 or h.y > GRID_H - CELL or h.y < 0;
+}
+
+fn wrapPlayerHead(player: *Player) void {
+    const head = &player.snake.items[0];
+    head.x = @mod(head.x, GRID_W);
+    head.y = @mod(head.y, GRID_H);
 }
 
 // ------------------------------------------------------------------ connection
@@ -1437,19 +1488,36 @@ fn parsePublicTarget(raw: ?[]const u8) ?u8 {
     return null;
 }
 
-fn createLobbyLocked(id: []u8, password: []const u8, mode: model.GameMode, public_target: u8) !*Lobby {
+fn parseLobbyCapacity(raw: ?[]const u8) ?u8 {
+    const value = raw orelse return 16;
+    if (value.len == 0 or std.mem.eql(u8, value, "16")) return 16;
+    if (std.mem.eql(u8, value, "32")) return 32;
+    return null;
+}
+
+fn parseWrapWalls(raw: ?[]const u8) ?bool {
+    const value = raw orelse return false;
+    if (std.mem.eql(u8, value, "solid")) return false;
+    if (std.mem.eql(u8, value, "wrap")) return true;
+    return null;
+}
+
+fn createLobbyLocked(id: []u8, password: []const u8, mode: model.GameMode, public_target: u8, wrap_walls: bool, requested_capacity: u8) !*Lobby {
     const l = try galloc.create(Lobby);
     errdefer galloc.destroy(l);
     const seed = rng_prng.random().int(u64);
     var password_salt: [16]u8 = undefined;
     rng_prng.random().bytes(&password_salt);
+    const lobby_capacity: u8 = @intCast(@min(@as(usize, requested_capacity), max_players_per_lobby));
     l.* = .{
         .id = id,
         .password_salt = password_salt,
         .password_hash = if (password.len == 0) @splat(0) else hashPassword(&password_salt, password),
         .password_protected = password.len != 0,
-        .public_target = if (password.len == 0) public_target else 0,
+        .public_target = if (password.len == 0) @min(public_target, lobby_capacity) else 0,
+        .max_players = lobby_capacity,
         .mode = mode,
+        .wrap_walls = wrap_walls,
         .food = undefined,
     };
     l.rng = std.Random.DefaultPrng.init(seed);
@@ -1466,7 +1534,7 @@ fn createLobbyLocked(id: []u8, password: []const u8, mode: model.GameMode, publi
 
 fn quickJoinEligibleLocked(l: *const Lobby) bool {
     if (l.password_protected or l.public_target < 2) return false;
-    const target = @min(@as(usize, l.public_target), max_players_per_lobby);
+    const target = @min(@as(usize, l.public_target), @as(usize, l.max_players));
     return l.players.items.len < target;
 }
 
@@ -1582,7 +1650,7 @@ fn createPlayerLocked(c: *Conn, target: *Lobby, username: []const u8, aa: Alloca
     _ = aa;
     p.color_hex = try galloc.dupe(u8, choosePlayerColor(target));
     errdefer galloc.free(p.color_hex);
-    try p.snake.append(galloc, pickSpawnCell(target));
+    try p.snake.append(galloc, pickSpawnCell(target) orelse return error.NoSafeSpawn);
     return p;
 }
 
@@ -1717,15 +1785,15 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
     }
-    if (target.players.items.len >= max_players_per_lobby) {
+    if (target.players.items.len >= target.max_players) {
         target.mutex.unlock(g_io);
         sendGameError(c, ERR_LOBBY_FULL, aa);
         return;
     }
 
-    const p = createPlayerLocked(c, target, chk.trimmed, aa) catch {
+    const p = createPlayerLocked(c, target, chk.trimmed, aa) catch |err| {
         target.mutex.unlock(g_io);
-        sendGameError(c, ERR_SERVER_FULL, aa);
+        sendGameError(c, if (err == error.NoSafeSpawn) ERR_LOBBY_FULL else ERR_SERVER_FULL, aa);
         return;
     };
 
@@ -1761,7 +1829,12 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
     };
-    pf(&init_args, aa, ",\"classical\":{}}}", .{target.mode.isClassical()}) catch {
+    pf(&init_args, aa, ",\"classical\":{},\"walls\":\"{s}\",\"wrapWalls\":{},\"capacity\":{d}}}", .{
+        target.mode.isClassical(),
+        if (target.wrap_walls) "wrap" else "solid",
+        target.wrap_walls,
+        target.max_players,
+    }) catch {
         discardPreparedPlayerLocked(target, p, activated_worker);
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
@@ -1970,11 +2043,12 @@ fn buildRoster(l: *Lobby) ![]const u8 {
     return l.roster_wire.items[0 .. l.roster_wire.items.len - 1];
 }
 
-fn applyMoveAndCheckWall(player: *Player, slot: usize, collision_index: *collision.Index) bool {
+fn applyMoveAndCheckWall(l: *const Lobby, player: *Player, slot: usize, collision_index: *collision.Index) bool {
     const before_move = collision.BeforeMove.capture(player);
     player.applyMove(galloc);
+    if (l.wrap_walls) wrapPlayerHead(player);
     collision_index.afterMove(slot, player, before_move);
-    return collidedWall(player.snake.items[0]);
+    return !l.wrap_walls and collidedWall(player.snake.items[0]);
 }
 
 /// Resolve collisions from one immutable tick-start position set. A snake
@@ -2245,7 +2319,10 @@ fn simulateArcadeV2Locked(l: *Lobby, now: i64, aa: Allocator) void {
     _ = resolveCurrentArcadeV2DeathsLocked(l, bounty, now, aa);
 
     for (l.players.items) |player| collectAtHeadLocked(l, player, aa);
-    for (l.players.items) |player| player.applyMove(galloc);
+    for (l.players.items) |player| {
+        player.applyMove(galloc);
+        if (l.wrap_walls) wrapPlayerHead(player);
+    }
     _ = resolveCurrentArcadeV2DeathsLocked(l, bounty, now, aa);
 
     var extra: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
@@ -2261,6 +2338,7 @@ fn simulateArcadeV2Locked(l: *Lobby, now: i64, aa: Allocator) void {
         if (player.snake.items.len == 0) continue;
         collectAtHeadLocked(l, player, aa);
         player.applyMove(galloc);
+        if (l.wrap_walls) wrapPlayerHead(player);
     }
     _ = resolveCurrentArcadeV2DeathsLocked(l, bounty, now, aa);
     updateBountySlot(l);
@@ -2357,7 +2435,7 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
                 }
             }
 
-            if (applyMoveAndCheckWall(p, slot, &collision_index)) {
+            if (applyMoveAndCheckWall(l, p, slot, &collision_index)) {
                 const focus = p.snake.items[0];
                 sendDeathEvent(p.conn, p.score, focus, aa);
                 feedDeath(l, p, null, 0, aa);
@@ -2718,7 +2796,7 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
 
     if (is_get or is_head) {
         if (std.mem.eql(u8, dec_path, "/")) {
-            return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = assets.assets[0].ctype, .body = assets.index_html, .body_static = true, .keep_alive = keep_alive, .head_only = head_only });
+            return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = assets.assets[0].ctype, .body = assets.index_html, .body_static = true, .cache_control = "no-store", .keep_alive = keep_alive, .head_only = head_only });
         }
         if (std.mem.eql(u8, dec_path, "/game.html")) {
             // lobby gate: direct requests bounce home
@@ -2732,7 +2810,7 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
             const gid = percentDecode(aa, raw_id);
             const exists = lobbies.contains(gid);
             if (exists) {
-                return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = "text/html; charset=utf-8", .body = assets.game_html, .body_static = true, .keep_alive = keep_alive, .head_only = head_only });
+                return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = "text/html; charset=utf-8", .body = assets.game_html, .body_static = true, .cache_control = "no-store", .keep_alive = keep_alive, .head_only = head_only });
             }
             return sendRedirect(c, aa, 302, "/", keep_alive, head_only);
         }
@@ -2744,7 +2822,11 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
             return sendPublicStatus(c, aa, keep_alive, head_only);
         }
         if (assets.find(dec_path)) |a| {
-            return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = a.ctype, .body = a.body, .body_static = true, .keep_alive = keep_alive, .head_only = head_only });
+            const cache_control = if (std.mem.startsWith(u8, a.ctype, "text/html"))
+                "no-store"
+            else
+                "no-cache, must-revalidate";
+            return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = a.ctype, .body = a.body, .body_static = true, .cache_control = cache_control, .keep_alive = keep_alive, .head_only = head_only });
         }
         return sendNotFound(c, aa, keep_alive, head_only);
     }
@@ -2783,13 +2865,47 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
                     .keep_alive = keep_alive,
                 });
             };
-            const target_value = if (body.len > 0) extractFormField(aa, body, "publicTarget") else null;
-            const public_target = parsePublicTarget(target_value) orelse {
+            const capacity_value = if (body.len > 0) extractFormField(aa, body, "capacity") else null;
+            const capacity = parseLobbyCapacity(capacity_value) orelse {
                 return sendResponse(c, aa, .{
                     .status = 400,
                     .reason = "Bad Request",
                     .ctype = "text/plain; charset=utf-8",
-                    .body = "Quick Join target must be 0 or 2 through 16",
+                    .body = "Lobby capacity must be 16 or 32",
+                    .keep_alive = keep_alive,
+                });
+            };
+            const target_value = if (body.len > 0) extractFormField(aa, body, "publicTarget") else null;
+            // Passwordless lobbies are discoverable until their selected
+            // capacity. Explicit legacy targets remain accepted for old clients.
+            const public_target = if (target_value) |legacy_target|
+                (parsePublicTarget(legacy_target) orelse {
+                    return sendResponse(c, aa, .{
+                        .status = 400,
+                        .reason = "Bad Request",
+                        .ctype = "text/plain; charset=utf-8",
+                        .body = "Quick Join target must be 0 or 2 through 32",
+                        .keep_alive = keep_alive,
+                    });
+                })
+            else
+                capacity;
+            if (public_target > capacity) {
+                return sendResponse(c, aa, .{
+                    .status = 400,
+                    .reason = "Bad Request",
+                    .ctype = "text/plain; charset=utf-8",
+                    .body = "Quick Join target cannot exceed lobby capacity",
+                    .keep_alive = keep_alive,
+                });
+            }
+            const walls_value = if (body.len > 0) extractFormField(aa, body, "walls") else null;
+            const wrap_walls = parseWrapWalls(walls_value) orelse {
+                return sendResponse(c, aa, .{
+                    .status = 400,
+                    .reason = "Bad Request",
+                    .ctype = "text/plain; charset=utf-8",
+                    .body = "Walls must be solid or wrap",
                     .keep_alive = keep_alive,
                 });
             };
@@ -2811,7 +2927,7 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
             const owned = galloc.dupe(u8, new_id) catch {
                 return sendServerError(c, aa);
             };
-            _ = createLobbyLocked(owned, password, mode, public_target) catch {
+            _ = createLobbyLocked(owned, password, mode, public_target, wrap_walls, capacity) catch {
                 galloc.free(owned);
                 return sendServerError(c, aa);
             };
@@ -3338,7 +3454,7 @@ pub fn main(init: std.process.Init) !void {
     galloc = init.gpa;
     debug_enabled = if (init.minimal.environ.getPosix("SNEK_DEBUG")) |v| std.mem.eql(u8, v, "1") else false;
     const port: u16 = if (init.minimal.environ.getPosix("PORT")) |v| (std.fmt.parseInt(u16, v, 10) catch 3000) else 3000;
-    max_players_global = envUsize(init.minimal.environ, "SNEK_MAX_PLAYERS", DEFAULT_MAX_PLAYERS_GLOBAL, 100_000);
+    max_players_global = envUsize(init.minimal.environ, "SNEK_MAX_PLAYERS", DEFAULT_MAX_PLAYERS_GLOBAL, binary_snapshot.MAX_PLAYERS);
     max_players_per_lobby = envUsize(init.minimal.environ, "SNEK_MAX_PLAYERS_PER_LOBBY", DEFAULT_MAX_PLAYERS_PER_LOBBY, binary_snapshot.MAX_PLAYERS);
     max_players_per_lobby = @min(max_players_per_lobby, max_players_global);
     max_lobbies = envUsize(init.minimal.environ, "SNEK_MAX_LOBBIES", DEFAULT_MAX_LOBBIES, 100_000);
@@ -3354,7 +3470,7 @@ pub fn main(init: std.process.Init) !void {
     {
         const def_id = try galloc.dupe(u8, DEFAULT_LOBBY_ID);
         errdefer galloc.free(def_id);
-        _ = try createLobbyLocked(def_id, "", .arcade_v1, @intCast(binary_snapshot.MAX_PLAYERS));
+        _ = try createLobbyLocked(def_id, "", .arcade_v1, 16, false, 16);
     }
 
     const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
@@ -3616,6 +3732,123 @@ test "all mode objectives avoid arena edges and the responsive HUD footprint" {
     }
 }
 
+test "join spawns stay central and clear of players and every pickup" {
+    galloc = std.testing.allocator;
+    var connection = Conn{ .fd = -1 };
+    var existing = Player{
+        .id = @constCast("existing"),
+        .name = @constCast("existing"),
+        .color_hex = @constCast("#abcdef"),
+        .conn = &connection,
+    };
+    defer existing.snake.deinit(galloc);
+    var lobby = Lobby{
+        .id = @constCast("spawn-test"),
+        .food = .{ .x = 0, .y = 0 },
+    };
+    lobby.rng = std.Random.DefaultPrng.init(0x5afe);
+    defer lobby.players.deinit(galloc);
+    defer lobby.bonus.deinit(galloc);
+    defer lobby.drops.deinit(galloc);
+    defer lobby.remains.deinit(galloc);
+    try lobby.players.append(galloc, &existing);
+
+    const candidate: CellPos = .{ .x = (COLS / 2) * CELL, .y = (ROWS / 2) * CELL };
+    try existing.snake.appendSlice(galloc, &.{
+        .{ .x = candidate.x + 9 * CELL, .y = candidate.y },
+        .{ .x = candidate.x + 3 * CELL, .y = candidate.y },
+    });
+    try std.testing.expect(spawnCellSafe(&lobby, candidate));
+
+    existing.snake.items[0].x = candidate.x + SPAWN_HEAD_CLEARANCE_CELLS * CELL;
+    try std.testing.expect(!spawnCellSafe(&lobby, candidate));
+    existing.snake.items[0].x = candidate.x + 9 * CELL;
+    existing.snake.items[1].x = candidate.x + SPAWN_BODY_CLEARANCE_CELLS * CELL;
+    try std.testing.expect(!spawnCellSafe(&lobby, candidate));
+    existing.snake.items[1].x = candidate.x + 3 * CELL;
+
+    lobby.food = candidate;
+    try std.testing.expect(!spawnCellSafe(&lobby, candidate));
+    lobby.food = .{ .x = 0, .y = 0 };
+    try lobby.bonus.append(galloc, .{ .pos = candidate });
+    try std.testing.expect(!spawnCellSafe(&lobby, candidate));
+    lobby.bonus.clearRetainingCapacity();
+    try lobby.drops.append(galloc, .{ .pos = candidate, .expires_at = 1 });
+    try std.testing.expect(!spawnCellSafe(&lobby, candidate));
+    lobby.drops.clearRetainingCapacity();
+    lobby.golden = .{ .pos = candidate, .expires_at = 1 };
+    try std.testing.expect(!spawnCellSafe(&lobby, candidate));
+    lobby.golden = null;
+    try lobby.remains.append(galloc, .{ .pos = candidate, .expires_at = 1 });
+    try std.testing.expect(!spawnCellSafe(&lobby, candidate));
+    lobby.remains.clearRetainingCapacity();
+
+    try std.testing.expect(!spawnCellSafe(&lobby, .{ .x = 0, .y = 0 }));
+    try std.testing.expect(!spawnCellSafe(&lobby, .{
+        .x = (COLS / 3) * CELL,
+        .y = (ROWS / 3) * CELL,
+    }));
+    const picked = pickSpawnCell(&lobby).?;
+    try std.testing.expect(spawnCellSafe(&lobby, picked));
+}
+
+test "join spawn fails safely when the central arena is saturated" {
+    galloc = std.testing.allocator;
+    var connection = Conn{ .fd = -1 };
+    var blocker = Player{
+        .id = @constCast("blocker"),
+        .name = @constCast("blocker"),
+        .color_hex = @constCast("#abcdef"),
+        .conn = &connection,
+    };
+    defer blocker.snake.deinit(galloc);
+    var cy: i32 = ROWS / 4;
+    while (cy < ROWS - ROWS / 4) : (cy += 1) {
+        var cx: i32 = COLS / 4;
+        while (cx < COLS - COLS / 4) : (cx += 1)
+            try blocker.snake.append(galloc, .{ .x = cx * CELL, .y = cy * CELL });
+    }
+    var lobby = Lobby{
+        .id = @constCast("saturated"),
+        .food = .{ .x = 0, .y = 0 },
+    };
+    lobby.rng = std.Random.DefaultPrng.init(0x5a7);
+    defer lobby.players.deinit(galloc);
+    try lobby.players.append(galloc, &blocker);
+    try std.testing.expectEqual(@as(?CellPos, null), pickSpawnCell(&lobby));
+}
+
+test "all 32 lobby slots receive visible unobstructed spawns" {
+    galloc = std.testing.allocator;
+    var connection = Conn{ .fd = -1 };
+    var players: [binary_snapshot.MAX_PLAYERS]Player = undefined;
+    var initialized: usize = 0;
+    defer for (players[0..initialized]) |*player| player.snake.deinit(galloc);
+
+    var lobby = Lobby{
+        .id = @constCast("full-spawn-test"),
+        .max_players = binary_snapshot.MAX_PLAYERS,
+        .food = .{ .x = 0, .y = 0 },
+    };
+    lobby.rng = std.Random.DefaultPrng.init(0x32afe);
+    defer lobby.players.deinit(galloc);
+
+    for (&players, 0..) |*player, index| {
+        player.* = .{
+            .id = @constCast("player"),
+            .name = @constCast("player"),
+            .color_hex = @constCast("#abcdef"),
+            .conn = &connection,
+        };
+        initialized += 1;
+        const spawn = pickSpawnCell(&lobby) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(spawnCellSafe(&lobby, spawn));
+        try player.snake.append(galloc, spawn);
+        try lobby.players.append(galloc, player);
+        try std.testing.expectEqual(index + 1, lobby.players.items.len);
+    }
+}
+
 test "classical lobby ticks never schedule special pickups" {
     galloc = std.testing.allocator;
     g_io = std.testing.io;
@@ -3733,16 +3966,85 @@ test "movement reports a wall crossing before snapshot publication" {
     };
     defer player.snake.deinit(galloc);
     try player.snake.append(galloc, .{ .x = GRID_W - model.CELL, .y = 10 * model.CELL });
+    var lobby = Lobby{ .id = @constCast("solid"), .food = .{ .x = 0, .y = 0 } };
     const players = [_]*Player{&player};
     var collision_index = collision.Index.build(&players);
-    try std.testing.expect(applyMoveAndCheckWall(&player, 0, &collision_index));
+    try std.testing.expect(applyMoveAndCheckWall(&lobby, &player, 0, &collision_index));
     try std.testing.expectEqual(GRID_W, player.snake.items[0].x);
 
     player.snake.items[0].x = 0;
     player.dir = .left;
     collision_index = collision.Index.build(&players);
-    try std.testing.expect(applyMoveAndCheckWall(&player, 0, &collision_index));
+    try std.testing.expect(applyMoveAndCheckWall(&lobby, &player, 0, &collision_index));
     try std.testing.expectEqual(-model.CELL, player.snake.items[0].x);
+}
+
+test "wrap walls transport heads across every arena edge" {
+    galloc = std.testing.allocator;
+    var connection = Conn{ .fd = -1 };
+    var player = Player{
+        .id = @constCast("sid"),
+        .name = @constCast("name"),
+        .color_hex = @constCast("#abcdef"),
+        .dir = .right,
+        .conn = &connection,
+    };
+    defer player.snake.deinit(galloc);
+    try player.snake.append(galloc, .{ .x = GRID_W - CELL, .y = 10 * CELL });
+    var lobby = Lobby{
+        .id = @constCast("wrap"),
+        .wrap_walls = true,
+        .food = .{ .x = 0, .y = 0 },
+    };
+    const players = [_]*Player{&player};
+    var collision_index = collision.Index.build(&players);
+    try std.testing.expect(!applyMoveAndCheckWall(&lobby, &player, 0, &collision_index));
+    try std.testing.expectEqual(@as(i32, 0), player.snake.items[0].x);
+
+    player.snake.items[0] = .{ .x = 0, .y = 10 * CELL };
+    player.dir = .left;
+    collision_index = collision.Index.build(&players);
+    try std.testing.expect(!applyMoveAndCheckWall(&lobby, &player, 0, &collision_index));
+    try std.testing.expectEqual(GRID_W - CELL, player.snake.items[0].x);
+
+    player.snake.items[0] = .{ .x = 10 * CELL, .y = 0 };
+    player.dir = .up;
+    collision_index = collision.Index.build(&players);
+    try std.testing.expect(!applyMoveAndCheckWall(&lobby, &player, 0, &collision_index));
+    try std.testing.expectEqual(GRID_H - CELL, player.snake.items[0].y);
+
+    player.snake.items[0] = .{ .x = 10 * CELL, .y = GRID_H - CELL };
+    player.dir = .down;
+    collision_index = collision.Index.build(&players);
+    try std.testing.expect(!applyMoveAndCheckWall(&lobby, &player, 0, &collision_index));
+    try std.testing.expectEqual(@as(i32, 0), player.snake.items[0].y);
+}
+
+test "Arcade v2 wraps before authoritative death classification" {
+    galloc = std.testing.allocator;
+    var connection = Conn{ .fd = -1 };
+    var player = Player{
+        .id = @constCast("sid"),
+        .name = @constCast("name"),
+        .color_hex = @constCast("#abcdef"),
+        .dir = .right,
+        .conn = &connection,
+    };
+    defer player.snake.deinit(galloc);
+    try player.snake.append(galloc, .{ .x = GRID_W - CELL, .y = 10 * CELL });
+    var lobby = Lobby{
+        .id = @constCast("wrap-v2"),
+        .mode = .arcade_v2,
+        .wrap_walls = true,
+        .food = .{ .x = 20 * CELL, .y = 20 * CELL },
+    };
+    defer lobby.players.deinit(galloc);
+    try lobby.players.append(galloc, &player);
+
+    simulateArcadeV2Locked(&lobby, 1000, std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), lobby.players.items.len);
+    try std.testing.expectEqual(@as(i32, 0), player.snake.items[0].x);
+    try std.testing.expectEqual(@as(i32, 10 * CELL), player.snake.items[0].y);
 }
 
 test "collision deaths belong to attackers rather than body owners" {
@@ -3846,14 +4148,33 @@ test "mode parsing preserves legacy fallback and rejects explicit unknown values
     try std.testing.expect(parseGameMode("future-mode", false) == null);
 }
 
+test "wall rule parsing defaults solid and rejects unknown values" {
+    try std.testing.expectEqual(@as(?bool, false), parseWrapWalls(null));
+    try std.testing.expectEqual(@as(?bool, false), parseWrapWalls("solid"));
+    try std.testing.expectEqual(@as(?bool, true), parseWrapWalls("wrap"));
+    try std.testing.expect(parseWrapWalls("portal") == null);
+}
+
 test "public Quick Join target is private by default and strictly bounded" {
     try std.testing.expectEqual(@as(?u8, 0), parsePublicTarget(null));
     try std.testing.expectEqual(@as(?u8, 0), parsePublicTarget("0"));
     try std.testing.expectEqual(@as(?u8, 2), parsePublicTarget("2"));
     try std.testing.expectEqual(@as(?u8, 16), parsePublicTarget("16"));
+    try std.testing.expectEqual(@as(?u8, 32), parsePublicTarget("32"));
     try std.testing.expect(parsePublicTarget("1") == null);
-    try std.testing.expect(parsePublicTarget("17") == null);
+    try std.testing.expect(parsePublicTarget("33") == null);
     try std.testing.expect(parsePublicTarget("many") == null);
+}
+
+test "lobby capacity defaults to 16 and accepts only supported sizes" {
+    try std.testing.expectEqual(binary_snapshot.MAX_PLAYERS, DEFAULT_MAX_PLAYERS_GLOBAL);
+    try std.testing.expectEqual(binary_snapshot.MAX_PLAYERS, DEFAULT_MAX_PLAYERS_PER_LOBBY);
+    try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity(null));
+    try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity(""));
+    try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity("16"));
+    try std.testing.expectEqual(@as(?u8, 32), parseLobbyCapacity("32"));
+    try std.testing.expect(parseLobbyCapacity("2") == null);
+    try std.testing.expect(parseLobbyCapacity("64") == null);
 }
 
 test "public landing status JSON is compact exact and bounded" {
@@ -4097,6 +4418,23 @@ test "quick join target counts active snakes and ignores chat spectators" {
     try lobby.spectators.append(galloc, &connection);
     try std.testing.expect(quickJoinEligibleLocked(&lobby));
     try lobby.players.append(galloc, &second);
+    try std.testing.expect(!quickJoinEligibleLocked(&lobby));
+}
+
+test "quick join respects the creator-selected lobby capacity" {
+    var connection = Conn{ .fd = -1 };
+    var first = Player{ .id = "one", .name = @constCast("one"), .color_hex = @constCast("#fff"), .conn = &connection };
+    var second = Player{ .id = "two", .name = @constCast("two"), .color_hex = @constCast("#eee"), .conn = &connection };
+    var lobby = Lobby{
+        .id = @constCast("capacity"),
+        .public_target = 32,
+        .max_players = 2,
+        .food = .{ .x = 0, .y = 0 },
+    };
+    defer lobby.players.deinit(std.testing.allocator);
+    try lobby.players.append(std.testing.allocator, &first);
+    try std.testing.expect(quickJoinEligibleLocked(&lobby));
+    try lobby.players.append(std.testing.allocator, &second);
     try std.testing.expect(!quickJoinEligibleLocked(&lobby));
 }
 

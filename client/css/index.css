@@ -480,7 +480,12 @@ input, button { font: inherit; }
     opacity: 0.72;
 }
 
-.public-target-field { margin-top: 14px; }
+.room-settings {
+    margin-top: 14px;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+}
 
 .field-help {
     display: block;
@@ -757,10 +762,11 @@ input, button { font: inherit; }
 @media (max-width: 560px) {
     body { padding-inline: 14px; }
     .site-header { min-height: 76px; }
-    .server-state { gap: 6px; font-size: 0.64rem; }
-    .server-state-label { font-size: 0.58rem; }
-    .server-count { min-width: 64px; gap: 3px; }
-    .server-count strong { min-width: 3.6ch; font-size: 0.74rem; }
+    .wordmark { flex: 0 0 auto; }
+    .server-state { min-width: 0; flex: 0 1 auto; gap: 7px; font-size: 0.64rem; }
+    .server-state-label { display: none; }
+    .server-count { min-width: 0; flex: 0 0 auto; gap: 3px; }
+    .server-count strong { min-width: 1.5ch; font-size: 0.74rem; }
     .landing { padding-block: 34px 48px; gap: 38px; }
     .intro-copy h1 { font-size: clamp(3.4rem, 17vw, 4.6rem); }
     .intro-copy p { margin-top: 19px; font-size: 0.94rem; }
@@ -783,6 +789,7 @@ input, button { font: inherit; }
     .form-error { margin-inline: 20px; }
     .console-divider { margin-inline: 20px; }
     .form-row { grid-template-columns: 1fr; }
+    .room-settings { grid-template-columns: 1fr; }
     .mode-options { grid-template-columns: 1fr; }
     .mode-surface { min-height: 0; }
     .site-footer { min-height: 60px; font-size: 0.62rem; }
@@ -842,9 +849,7 @@ input, button { font: inherit; }
 }
 
 @media (max-width: 370px) {
-    .server-state-label { display: none; }
     .server-state { gap: 5px; font-size: 0.59rem; }
-    .server-count { min-width: 59px; }
     .server-count strong { font-size: 0.7rem; }
     .game-notes { grid-template-columns: 1fr; text-align: left; }
     .game-notes li { display: grid; grid-template-columns: 72px 1fr; align-items: baseline; gap: 8px; }

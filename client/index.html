@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#11151d">
     <title>Snek — Multiplayer snake</title>
     <link rel="icon" href="/img/snek.png">
-    <link rel="stylesheet" href="/css/index.css">
+    <link rel="stylesheet" href="/css/index.css?v=20260824.3">
 </head>
 <body>
     <a class="skip-link" href="#play">Skip to game controls</a>
@@ -107,30 +107,27 @@
                     <legend>New lobby</legend>
                     <div class="field">
                         <label for="createPassword">Lobby password <span>optional</span></label>
-                        <input id="createPassword" name="password" type="password" maxlength="64" autocomplete="new-password" placeholder="Leave blank for open access" aria-describedby="publicTarget_help">
+                        <input id="createPassword" name="password" type="password" maxlength="64" autocomplete="new-password" placeholder="Leave blank for open access" aria-describedby="createPassword_help">
+                        <small class="field-help" id="createPassword_help">Passwordless lobbies appear in Quick Join until full.</small>
                     </div>
 
-                    <div class="field public-target-field">
-                        <label for="publicTarget">Quick Join fills to <span>optional</span></label>
-                        <select id="publicTarget" name="publicTarget" aria-describedby="publicTarget_help">
-                            <option value="0" selected>0 players — unlisted</option>
-                            <option value="2">2 players</option>
-                            <option value="3">3 players</option>
-                            <option value="4">4 players</option>
-                            <option value="5">5 players</option>
-                            <option value="6">6 players</option>
-                            <option value="7">7 players</option>
-                            <option value="8">8 players</option>
-                            <option value="9">9 players</option>
-                            <option value="10">10 players</option>
-                            <option value="11">11 players</option>
-                            <option value="12">12 players</option>
-                            <option value="13">13 players</option>
-                            <option value="14">14 players</option>
-                            <option value="15">15 players</option>
-                            <option value="16">16 players</option>
-                        </select>
-                        <small class="field-help" id="publicTarget_help">Set 2–16 to list this lobby until it reaches that many players. Password-protected lobbies are always unlisted.</small>
+                    <div class="room-settings">
+                        <div class="field">
+                            <label for="capacity">Arena size</label>
+                            <select id="capacity" name="capacity" aria-describedby="capacity_help">
+                                <option value="16" selected>16 players</option>
+                                <option value="32">32 players</option>
+                            </select>
+                            <small class="field-help" id="capacity_help">Maximum players.</small>
+                        </div>
+                        <div class="field">
+                            <label for="walls">Arena walls</label>
+                            <select id="walls" name="walls" aria-describedby="walls_help">
+                                <option value="solid" selected>Solid walls</option>
+                                <option value="wrap">Wraparound</option>
+                            </select>
+                            <small class="field-help" id="walls_help">Wrap crosses edges.</small>
+                        </div>
                     </div>
 
                     <fieldset class="mode-picker">
@@ -182,7 +179,7 @@
         (function () {
             var errors = {
                 'unknown-game': 'That lobby does not exist. Check the code or password, or create a new one.',
-                'no-open-lobby': 'No open Quick Join lobby is available yet. Create one and choose a player target to list it.'
+                'no-open-lobby': 'No open Quick Join lobby is available yet. Create a passwordless lobby or try again.'
             };
             var error = new URLSearchParams(window.location.search).get('error');
             var errorElement = document.getElementById('join_error');
@@ -196,7 +193,6 @@
             var gameId = document.getElementById('gameId');
             var joinPassword = document.getElementById('joinPassword');
             var createPassword = document.getElementById('createPassword');
-            var publicTarget = document.getElementById('publicTarget');
             var joinSubmitting = false;
             var createSubmitting = false;
             var handoffPrefix = 'snek-password-handoff:';
@@ -233,15 +229,6 @@
                 }
             }
 
-            function syncPublicTarget() {
-                var protectedLobby = createPassword.value.length > 0;
-                if (protectedLobby) publicTarget.value = '0';
-                publicTarget.disabled = protectedLobby;
-            }
-
-            createPassword.addEventListener('input', syncPublicTarget);
-            syncPublicTarget();
-
             gameId.addEventListener('change', function () {
                 var normalized = normalizedLobbyId(gameId.value);
                 if (normalized) gameId.value = normalized;
@@ -269,7 +256,6 @@
                     event.preventDefault();
                     return;
                 }
-                syncPublicTarget();
                 if (!passwordFits(createPassword)) {
                     event.preventDefault();
                     return;
@@ -281,6 +267,6 @@
             });
         })();
     </script>
-    <script src="/js/status.js"></script>
+    <script src="/js/status.js?v=20260824.3"></script>
 </body>
 </html>

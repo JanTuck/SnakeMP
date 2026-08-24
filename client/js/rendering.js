@@ -112,6 +112,7 @@ function ensureNameplate(id, displayName) {
         plate.displayName = displayName;
         plate.element.textContent = displayName;
     }
+    plate.element.classList.toggle('is-local', id === socket.id);
     plate.element.classList.toggle('is-bounty', id === world.bountyId && gameMode === 'arcade_v2');
 }
 
@@ -162,7 +163,7 @@ function placeNameplates(rect) {
 // Immutable identity metadata arrives only on membership changes. Binary
 // snapshots are positional records aligned to this roster.
 socket.on("r", (nextRoster) => {
-    if (!Array.isArray(nextRoster) || nextRoster.length > 16) return;
+    if (!Array.isArray(nextRoster) || nextRoster.length > 32) return;
     const ids = new Set();
     for (const meta of nextRoster) {
         if (!Array.isArray(meta) || meta.length !== 3 ||
@@ -231,8 +232,14 @@ socket.on("b", (payload) => {
                 const head = snake.snake[0];
                 const previousHead = snake.prevSnake[0];
                 if (head !== undefined && previousHead !== undefined) {
-                    const dx = head.x - previousHead.x;
-                    const dy = head.y - previousHead.y;
+                    let dx = head.x - previousHead.x;
+                    let dy = head.y - previousHead.y;
+                    // Wraparound keyframes cross the numeric board seam even
+                    // though the snake keeps moving in the same direction.
+                    if (dx > canvas.width / 2) dx -= canvas.width;
+                    else if (dx < -canvas.width / 2) dx += canvas.width;
+                    if (dy > canvas.height / 2) dy -= canvas.height;
+                    else if (dy < -canvas.height / 2) dy += canvas.height;
                     if (dx > 0 && dy === 0) syncDirection('ArrowRight');
                     else if (dx < 0 && dy === 0) syncDirection('ArrowLeft');
                     else if (dy > 0 && dx === 0) syncDirection('ArrowDown');
@@ -565,7 +572,7 @@ function frame(now) {
     drawWorld(now);
     const canvasRect = canvas.getBoundingClientRect();
     for (let snake of snakeList.values()) {
-        snake.draw(t);
+        snake.draw(t, snake.id === socket.id);
         prepareNameplate(snake, t, canvasRect);
     }
     drawDanger(t, now);

@@ -35,6 +35,7 @@ function request(base, method, route, body = '') {
       response.on('data', (chunk) => chunks.push(chunk));
       response.on('end', () => resolve({
         status: response.statusCode,
+        headers: response.headers,
         location: response.headers.location || '',
         body: Buffer.concat(chunks).toString('utf8'),
       }));
@@ -129,10 +130,36 @@ function connectPlayer(base, lobby, username, password = '') {
   try {
     await waitUntilReady(base, server);
 
+    const landing = await request(base, 'GET', '/');
+    assert.strictEqual(landing.status, 200);
+    assert.strictEqual(landing.headers['cache-control'], 'no-store', 'landing HTML must never pin an old asset graph');
+    assert.match(landing.body, /\/css\/index\.css\?v=20260824\.3/, 'landing CSS URL must bypass already-cached releases');
+    assert.match(landing.body, /\/js\/status\.js\?v=20260824\.3/, 'landing script URL must bypass already-cached releases');
+
+    const landingCss = await request(base, 'GET', '/css/index.css?v=20260824.3');
+    assert.strictEqual(landingCss.status, 200);
+    assert.strictEqual(landingCss.headers['cache-control'], 'no-cache, must-revalidate', 'static assets must revalidate before reuse');
+
+    const gamePage = await request(base, 'GET', '/game/12345');
+    assert.strictEqual(gamePage.status, 200);
+    assert.strictEqual(gamePage.headers['cache-control'], 'no-store', 'game HTML must never pin an old asset graph');
+    assert.match(gamePage.body, /\/css\/game\.css\?v=20260824\.3/, 'game CSS URL must bypass already-cached releases');
+    assert.match(gamePage.body, /\/js\/rendering\.js\?v=20260824\.3/, 'game module URL must bypass already-cached releases');
+
+    const indexAsset = await request(base, 'GET', '/index.html');
+    assert.strictEqual(indexAsset.status, 200);
+    assert.strictEqual(indexAsset.headers['cache-control'], 'no-store', 'direct HTML assets must not be cached');
+
     for (const publicTarget of ['1', '17', 'many', '-1']) {
       const invalid = await request(base, 'POST', '/generateid', `mode=arcade-v2&publicTarget=${encodeURIComponent(publicTarget)}`);
       assert.strictEqual(invalid.status, 400, `invalid publicTarget=${publicTarget} must be rejected`);
     }
+    for (const capacity of ['2', '24', '64', 'many']) {
+      const invalid = await request(base, 'POST', '/generateid', `mode=arcade-v2&publicTarget=0&capacity=${encodeURIComponent(capacity)}`);
+      assert.strictEqual(invalid.status, 400, `invalid capacity=${capacity} must be rejected`);
+    }
+    const largeProtected = await request(base, 'POST', '/generateid', 'mode=arcade-v2&publicTarget=17&capacity=32&password=secret');
+    assert.strictEqual(largeProtected.status, 303, '32-player lobbies must accept targets above the 16-player default');
 
     // HTTP redirects never reserve phantom seats. A burst with no WebSocket
     // joins must keep returning the same eligible default lobby.
@@ -145,8 +172,8 @@ function connectPlayer(base, lobby, username, password = '') {
     players.push(await connectPlayer(base, '12345', 'DefaultTwo'));
 
     const unlisted = generatedLobby(await request(base, 'POST', '/generateid', 'mode=arcade-v2&publicTarget=0'));
-    const protectedLobby = generatedLobby(await request(base, 'POST', '/generateid', 'mode=arcade-v2&publicTarget=2&password=secret'));
-    const listed = generatedLobby(await request(base, 'POST', '/generateid', 'mode=arcade-v2&publicTarget=2'));
+    const protectedLobby = generatedLobby(await request(base, 'POST', '/generateid', 'mode=arcade-v2&password=secret'));
+    const listed = generatedLobby(await request(base, 'POST', '/generateid', 'mode=arcade-v2'));
     assert.notStrictEqual(listed, unlisted);
     assert.notStrictEqual(listed, protectedLobby);
 

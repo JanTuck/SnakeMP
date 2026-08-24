@@ -87,10 +87,11 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
   this makes the 32-color live identity palette sufficient without reuse. The
   process-wide retained-identity cap may reject new membership before these
   per-lobby limits are reached.
-- `publicTarget` is discovery policy, not capacity. Value 0 is unlisted; values
-  2..16 advertise an open lobby to Quick Join until its active-snake count
-  reaches the target. Retained game-over chat spectators do not make a lobby
-  look full. Password-protected lobbies are always stored as unlisted. The
+- Passwordless lobbies are automatically advertised to Quick Join until their
+  active-snake count reaches the selected lobby capacity. Retained game-over
+  chat spectators do not make a lobby look full. Password-protected lobbies
+  are always stored as unlisted. Legacy clients may still submit `publicTarget`
+  0 or 2..32 explicitly, bounded by the selected capacity. The
   permanent `12345` lobby is an open Arcade v1 lobby advertised to 16 players.
 - Full-server rejection is `game_error: "Server is full, try again later"`.
 - Full-lobby rejection is `game_error: "This game is full"`.
@@ -394,8 +395,10 @@ kill resets the streak to one.
   identity cap.
 - `POST /generateid`: URL-encoded optional `password` and required `mode` value
   `classical`, `arcade-v1`, or `arcade-v2`; create the immutable-mode lobby and
-  return `303 /game/<id>`. Optional `publicTarget` is 0 or 2..16; any password
-  forces it to 0. The legacy `classical` checkbox remains accepted for
+  return `303 /game/<id>`. Without a `publicTarget`, passwordless lobbies are
+  listed through their selected capacity and passworded lobbies are unlisted.
+  The legacy `publicTarget` field remains accepted as 0 or 2..32. The legacy
+  `classical` checkbox remains accepted for
   compatibility when no `mode` is supplied. Invalid modes, targets, and invalid
   or oversized passwords return HTTP 400 without creating a lobby.
 - `POST /joingame`: URL-encoded or JSON `gameId` and optional `password`, then

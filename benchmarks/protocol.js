@@ -20,10 +20,10 @@ function decodeBinary(payload, roster, previous, lastSequence) {
   if (!view || !Array.isArray(roster) || view.byteLength < 7 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 5) return null;
   const sequence = view.getUint16(3, true);
   const header = view.getUint8(5);
-  if ((header & 0x60) !== 0) return null;
+  if ((header & 0x40) !== 0) return null;
   const kind = header >>> 7;
-  const count = header & 0x1f;
-  if (count !== roster.length || count > 16) return null;
+  const count = header & 0x3f;
+  if (count !== roster.length || count > 32) return null;
   if (kind === 1 && (!previous || !Array.isArray(previous.players) || previous.players.length !== count ||
       !Number.isInteger(lastSequence) || sequence !== ((lastSequence + 1) & 0xffff))) return null;
   let at = 6;
@@ -171,7 +171,7 @@ function attachWorld(socket, callback, metrics) {
   let previous = null;
   let lastSequence = null;
   socket.on('r', (value) => {
-    if (!Array.isArray(value) || value.length > 16) return;
+    if (!Array.isArray(value) || value.length > 32) return;
     roster = value;
     previous = null;
     lastSequence = null;

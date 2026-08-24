@@ -34,6 +34,9 @@ const vm = require('node:vm');
   const gameplayStates = [];
   const hudUpdates = [];
   const menus = [];
+  const snakeDraws = [];
+  const directions = [];
+  let wrapHeads = false;
   let decodeCalls = 0;
   let fillRects = 0;
   let strokes = 0;
@@ -80,11 +83,15 @@ const vm = require('node:vm');
       this.snake = [{ x: 0, y: 0 }]; this.prevSnake = [{ x: 0, y: 0 }];
     }
     updateKeyframe(meta) {
-      this.prevSnake = this.id === 'local' ? [{ x: 100, y: 100 }] : [{ x: 200, y: 100 }];
-      this.snake = this.id === 'local' ? [{ x: 116, y: 100 }] : [{ x: 184, y: 100 }];
+      this.prevSnake = this.id === 'local'
+        ? [{ x: wrapHeads ? 2032 : 100, y: 100 }]
+        : [{ x: 200, y: 100 }];
+      this.snake = this.id === 'local'
+        ? [{ x: wrapHeads ? 0 : 116, y: 100 }]
+        : [{ x: 184, y: 100 }];
     }
     updateDelta(meta) { this.updateKeyframe(meta); }
-    draw() {}
+    draw(_t, isLocal) { snakeDraws.push({ id: this.id, isLocal }); }
   }
 
   function decodedFrame() {
@@ -112,7 +119,7 @@ const vm = require('node:vm');
     resetDirection() {},
     setGameMode(mode) { inputModes.push(mode); },
     setGameplayEnabled(enabled) { gameplayStates.push(enabled); },
-    syncDirection() {},
+    syncDirection(direction) { directions.push(direction); },
     document: {
       getElementById(id) { return elements[id]; },
       querySelector() { return {}; },
@@ -166,19 +173,30 @@ const vm = require('node:vm');
   assert.equal(decodeCalls, 1);
   assert.equal(hudUpdates.at(-1).state.feastTtl, 2200);
   assert.equal(hudUpdates.at(-1).state.bountyId, 'remote');
+  assert.equal(directions.at(-1), 'ArrowRight', 'ordinary movement synchronizes the local heading');
+  assert.equal(nameplateChildren.at(-2)._classes.has('is-local'), true, 'the local nameplate is explicitly identified');
+  assert.equal(nameplateChildren.at(-1)._classes.has('is-local'), false, 'remote nameplates never receive the local marker');
   assert.equal(nameplateChildren.at(-1)._classes.has('is-bounty'), true, 'bounty slot marks the matching unique-id nameplate');
 
   queuedFrames.shift()(100);
   assert.equal(queuedFrames.length, 1, 'active play must continuously schedule frames');
   assert.ok(fillRects >= 2, 'Arcade v2 renders one matte remain as a base and highlight');
   assert.ok(strokes >= 1, 'nearest approaching head receives one restrained danger chevron');
+  assert.deepEqual(snakeDraws.slice(-2), [
+    { id: 'local', isLocal: true },
+    { id: 'remote', isLocal: false },
+  ], 'only the local snake receives the resolution-independent head locator');
+
+  wrapHeads = true;
+  socket.emitEvent('b', 'valid-frame');
+  assert.equal(directions.at(-1), 'ArrowRight', 'crossing the right seam preserves rightward steering');
 
   socket.emitEvent('death', { score: 7, focus: { x: 140, y: 120 } });
   assert.equal(menus.at(-1).compact, true, 'Arcade v2 uses the compact spectator retry state');
   assert.equal(elements.nameplates.hidden, false, 'Arcade v2 preserves remote nameplates and the full live board');
   assert.equal(gameplayStates.at(-1), false, 'death disables gameplay input without disabling chat');
   socket.emitEvent('b', 'valid-frame');
-  assert.equal(decodeCalls, 2, 'spectators continue applying authoritative snapshots');
+  assert.equal(decodeCalls, 3, 'spectators continue applying authoritative snapshots');
   assert.equal(queuedFrames.length, 1, 'death reuses the already pending live-arena frame');
   queuedFrames.shift()(116);
   assert.equal(particleUpdates, 2);

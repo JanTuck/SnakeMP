@@ -1,4 +1,4 @@
-//! Allocation-free collision index for the canonical <=16-player lobby.
+//! Allocation-free collision index for the canonical <=32-player lobby.
 //!
 //! Each board cell stores a bit per player. Bits are assigned in the lobby's
 //! stable insertion order, so `otherAt` preserves the old scan's first-match
@@ -9,11 +9,11 @@ const std = @import("std");
 const config = @import("config.zig");
 const model = @import("model.zig");
 
-pub const max_indexed_players: usize = 16;
+pub const max_indexed_players: usize = 32;
 const cols: usize = @intCast(config.GRID_COLS);
 const rows: usize = @intCast(config.GRID_ROWS);
 const cell_count = config.MAX_CELLS;
-const Mask = u16;
+const Mask = u32;
 // Below this estimated scan work, the tiny direct loops beat clearing 9,216
 // grid cells. This keeps one-cell/short-snake mass workloads on the lean path.
 const min_estimated_comparisons: usize = 16_384;
@@ -47,7 +47,7 @@ pub const Index = struct {
     tracked: bool = false,
     enabled: bool = false,
 
-    /// Build the current-tick view. Above 16 players, methods transparently
+    /// Build the current-tick view. Above 32 players, methods transparently
     /// use the exact scan fallback. Short-snake lobbies also keep the direct
     /// scan, which is faster than clearing the board-sized index.
     pub fn build(players: []const *model.Player) Index {
@@ -284,7 +284,11 @@ test "short lobbies retain the exact lower-cost scan path" {
 }
 
 test "index stays comfortably within the 128 KiB worker stack" {
-    try std.testing.expect(@sizeOf(Index) <= config.GAME_WORKER_STACK / 4);
+    // A u32 occupancy mask is required for 32 active roster slots. The full
+    // canonical board still consumes less than half of the dedicated worker
+    // stack, leaving bounded room for tick-local roster/death scratch arrays.
+    try std.testing.expect(@sizeOf(Index) <= config.GAME_WORKER_STACK / 2);
+    try std.testing.expectEqual(@as(Mask, 0x80000000), bit(31));
 }
 
 test "index covers the full 128 by 72 canonical board" {

@@ -67,7 +67,7 @@ function landing(overrides = {}) {
     gameId: control(),
     joinPassword: control(),
     createPassword: control(),
-    publicTarget: control('0'),
+    capacity: control('16'),
   };
   const session = overrides.session || storage();
   const window = {
@@ -107,19 +107,7 @@ function submitEvent() {
 {
   const page = landing({ search: '?error=no-open-lobby' });
   assert.match(page.elements.join_error.textContent, /No open Quick Join lobby/, 'empty matchmaking has a specific recovery message');
-  assert.match(page.elements.join_error.textContent, /Create one/, 'empty matchmaking tells the player how to recover');
-}
-
-{
-  const page = landing();
-  page.elements.publicTarget.value = '8';
-  page.elements.createPassword.value = 'protected';
-  page.elements.createPassword.fire('input');
-  assert.equal(page.elements.publicTarget.value, '0', 'adding a password forces the lobby to be unlisted');
-  assert.equal(page.elements.publicTarget.disabled, true, 'protected lobbies cannot opt into Quick Join');
-  page.elements.createPassword.value = '';
-  page.elements.createPassword.fire('input');
-  assert.equal(page.elements.publicTarget.disabled, false, 'clearing the password re-enables public target selection');
+  assert.match(page.elements.join_error.textContent, /Create a passwordless lobby/, 'empty matchmaking tells the player how to recover');
 }
 
 {
@@ -146,12 +134,9 @@ function submitEvent() {
 {
   const page = landing();
   page.elements.createPassword.value = 'create once';
-  page.elements.publicTarget.value = '10';
   const first = submitEvent();
   page.createForm.fire('submit', first);
   assert.equal(first.prevented, false);
-  assert.equal(page.elements.publicTarget.value, '0', 'submit-time password autofill still forces an unlisted lobby');
-  assert.equal(page.elements.publicTarget.disabled, true);
   assert.equal(page.session.values.get('snek:create-password'), 'create once');
   const duplicate = submitEvent();
   page.createForm.fire('submit', duplicate);

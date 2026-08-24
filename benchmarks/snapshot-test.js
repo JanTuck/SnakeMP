@@ -34,6 +34,17 @@ function frame(bytes, prefix = 0) {
   assert.ok(benchmarkKeyframe, 'benchmark decoder must accept the production keyframe layout');
   assert.deepEqual(benchmarkKeyframe.world.players[0].snake, [{ x: 32, y: 48 }]);
 
+  const maximumRoster = Array.from({ length: 32 }, (_, index) => [`id-${index}`, `Player ${index}`, '#123456']);
+  const maximumKeyframe = [0x53, 0x4e, 5, 1, 0, 32];
+  for (let index = 0; index < 32; index++) {
+    maximumKeyframe.push(0, 0, 0, 0, 1, 0x80, index, index);
+  }
+  maximumKeyframe.push(0);
+  assert.equal(decodeSnapshot(frame(maximumKeyframe), 32, null, []).playerCount, 32,
+    'browser decoder must accept the full 32-player roster');
+  assert.equal(decodeBinary(frame(maximumKeyframe), maximumRoster, null, null)?.world.players.length, 32,
+    'benchmark decoder must accept the full 32-player roster');
+
   const boardEdge = frame([
     0x53, 0x4e, 5, 1, 0, 1,
     0, 0, 0, 0, 1, 0x80, 127, 71, 0,
@@ -101,7 +112,7 @@ function frame(bytes, prefix = 0) {
   const reservedDirection = frame([0x53, 0x4e, 5, 2, 0, 0x81, 0x08, 0]);
   assert.equal(decodeSnapshot(reservedDirection, 1, 1, current), null, 'unchanged rows must not carry movement bits');
 
-  const reservedHeader = frame([0x53, 0x4e, 5, 2, 0, 0xa1, 0, 0]);
+  const reservedHeader = frame([0x53, 0x4e, 5, 2, 0, 0xc1, 0, 0]);
   assert.equal(decodeSnapshot(reservedHeader, 1, 1, current), null, 'header padding bits must be zero');
   const emptyArcadeExtension = frame([0x53, 0x4e, 5, 2, 0, 0x81, 0, 0x80, 0]);
   assert.ok(decodeSnapshot(emptyArcadeExtension, 1, 1, current), 'world bit 7 selects the bounded Arcade v2 extension');

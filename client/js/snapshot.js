@@ -1,4 +1,4 @@
-const MAX_PLAYERS = 16;
+const MAX_PLAYERS = 32;
 const MAX_BONUS = 12;
 const MAX_DROPS = 2;
 const MAX_REMAINS = 63;
@@ -44,9 +44,9 @@ export function decodeSnapshot(payload, expectedPlayers, lastSequence, currentPl
     if (!need(3)) return null;
     const sequence = view.getUint16(at, true); at += 2;
     const header = view.getUint8(at++);
-    if ((header & 0x60) !== 0) return null;
+    if ((header & 0x40) !== 0) return null;
     const kind = header >>> 7;
-    const playerCount = header & 0x1f;
+    const playerCount = header & 0x3f;
     if (playerCount !== expectedPlayers || playerCount > MAX_PLAYERS) return null;
     if (kind === 1 && (!Number.isInteger(lastSequence) || sequence !== ((lastSequence + 1) & 0xffff))) return null;
 

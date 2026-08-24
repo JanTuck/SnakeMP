@@ -110,7 +110,7 @@ export default class Snake {
     }
 
     // t in [0, 1]: interpolation between the previous and current tick.
-    draw(t) {
+    draw(t, isLocal = false) {
         const cur = this.snake;
         const prev = this.interpolate && this.prevSnake !== undefined && this.prevSnake.length > 0 ? this.prevSnake : cur;
         const ctx = this.ctx;
@@ -123,6 +123,21 @@ export default class Snake {
             const y = p.y + (c.y - p.y) * t;
 
             if (i === 0) {
+                // The arena scales as a single 128 x 72 world at every
+                // resolution. A quiet, world-space locator keeps the local
+                // head findable without changing its hitbox or game geometry.
+                if (isLocal) {
+                    ctx.save();
+                    ctx.globalAlpha = 0.96;
+                    ctx.strokeStyle = '#fffaf1';
+                    ctx.lineWidth = 2.4;
+                    ctx.shadowColor = 'rgba(10, 12, 17, 0.48)';
+                    ctx.shadowBlur = 5;
+                    ctx.beginPath();
+                    ctx.arc(x + s / 2, y + s / 2, s / 2 + 5, 0, Math.PI * 2);
+                    ctx.stroke();
+                    ctx.restore();
+                }
                 // Head: slightly larger, full colour, with eyes.
                 ctx.fillStyle = this.color;
                 ctx.save();

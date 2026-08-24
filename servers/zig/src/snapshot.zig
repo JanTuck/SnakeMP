@@ -2,8 +2,8 @@
 //!
 //! Frame header (little endian):
 //!   "SN", version:u8, sequence:u16, kind_and_players:u8
-//! `kind_and_players` bit 7 selects a delta, bits 0..4 hold the player count,
-//! and bits 5..6 are zero. Sequence continuity names the delta base implicitly.
+//! `kind_and_players` bit 7 selects a delta, bits 0..5 hold the player count,
+//! and bit 6 is zero. Sequence continuity names the delta base implicitly.
 //!
 //! Keyframe player:
 //!   score:i32, cells:u16, body
@@ -31,11 +31,11 @@ const model = @import("model.zig");
 
 pub const VERSION: u8 = 5;
 pub const KEYFRAME_INTERVAL: u8 = 30;
-pub const MAX_PLAYERS: usize = 16;
+pub const MAX_PLAYERS: usize = 32;
 pub const PACKED_BIT: u16 = 0x8000;
 pub const CELL_COUNT_MASK: u16 = 0x7fff;
 const HEADER_KIND_BIT: u8 = 0x80;
-const HEADER_PLAYER_MASK: u8 = 0x1f;
+const HEADER_PLAYER_MASK: u8 = 0x3f;
 const WORLD_BONUS_MASK: u8 = 0x0f;
 const WORLD_DROP_MASK: u8 = 0x03;
 const WORLD_DROP_SHIFT: u3 = 4;
@@ -329,6 +329,79 @@ pub fn buildInto(buffer: *std.ArrayListUnmanaged(u8), lobby: *model.Lobby, now: 
 
 pub fn build(buffer: *std.ArrayListUnmanaged(u8), lobby: *model.Lobby, now: i64, allocator: std.mem.Allocator) !BuildResult {
     return buildInto(buffer, lobby, now, allocator);
+}
+
+test "v5 header represents all 32 roster slots without colliding with delta bit" {
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendHeader(&wire, std.testing.allocator, .keyframe, 7, MAX_PLAYERS);
+    try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', VERSION, 7, 0, 0x20 }, wire.items);
+    wire.clearRetainingCapacity();
+    try appendHeader(&wire, std.testing.allocator, .delta, 8, MAX_PLAYERS);
+    try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', VERSION, 8, 0, 0xa0 }, wire.items);
+}
+
+test "v5 builder retains and deltas a complete 32-player roster" {
+    const allocator = std.testing.allocator;
+    var connection = model.Conn{ .fd = -1 };
+    var storage: [MAX_PLAYERS]model.Player = undefined;
+    var initialized: usize = 0;
+    defer for (storage[0..initialized]) |*player| player.snake.deinit(allocator);
+
+    var lobby = model.Lobby{ .id = @constCast("large"), .food = .{ .x = 0, .y = 0 } };
+    defer lobby.players.deinit(allocator);
+    for (&storage, 0..) |*player, index| {
+        player.* = .{
+            .id = @constCast("player"),
+            .name = @constCast("player"),
+            .color_hex = @constCast("#123456"),
+            .conn = &connection,
+        };
+        initialized += 1;
+        try player.snake.append(allocator, .{ .x = @as(i32, @intCast(index)) * model.CELL, .y = 3 * model.CELL });
+        try lobby.players.append(allocator, player);
+    }
+
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(allocator);
+    const keyframe = try buildInto(&wire, &lobby, 0, allocator);
+    try std.testing.expectEqual(Kind.keyframe, keyframe.kind);
+    try std.testing.expectEqual(@as(u8, 0x20), keyframe.bytes[5]);
+    try std.testing.expectEqual(@as(u8, 32), lobby.snapshot_player_count);
+    try std.testing.expect(lobby.snapshot_valid);
+
+    const delta = try buildInto(&wire, &lobby, 0, allocator);
+    try std.testing.expectEqual(Kind.delta, delta.kind);
+    try std.testing.expectEqual(@as(u8, 0xa0), delta.bytes[5]);
+}
+
+test "wall wrapping falls back to an absolute keyframe" {
+    const allocator = std.testing.allocator;
+    var connection = model.Conn{ .fd = -1 };
+    var player = model.Player{
+        .id = @constCast("wrap-player"),
+        .name = @constCast("wrap-player"),
+        .color_hex = @constCast("#123456"),
+        .conn = &connection,
+    };
+    defer player.snake.deinit(allocator);
+    try player.snake.append(allocator, .{
+        .x = (config.GRID_COLS - 1) * model.CELL,
+        .y = 10 * model.CELL,
+    });
+    var lobby = model.Lobby{ .id = @constCast("wrap"), .food = .{ .x = 0, .y = 0 } };
+    defer lobby.players.deinit(allocator);
+    try lobby.players.append(allocator, &player);
+
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(allocator);
+    try std.testing.expectEqual(Kind.keyframe, (try buildInto(&wire, &lobby, 0, allocator)).kind);
+
+    player.snake.items[0].x = 0;
+    const wrapped = try buildInto(&wire, &lobby, 0, allocator);
+    try std.testing.expectEqual(Kind.keyframe, wrapped.kind);
+    try std.testing.expectEqual(@as(u8, 0), wrapped.bytes[12]);
+    try std.testing.expectEqual(@as(u8, 10), wrapped.bytes[13]);
 }
 
 test "v5 keyframes and direction deltas have stable golden bytes" {

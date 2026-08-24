@@ -117,9 +117,9 @@ capacity is full; idle non-default lobbies free slots when they are reaped.
 
 ## Discovery and invites
 
-Quick Join is an explicit `POST /quickjoin`. Open lobby creators may advertise
-a fill target from 2 through 16; target 0 is unlisted, and any password makes a
-lobby unlisted regardless of the submitted target. Redirect selection is
+Quick Join is an explicit `POST /quickjoin`. Passwordless lobbies are listed
+automatically until their selected capacity is full; adding a password keeps a
+lobby private. Redirect selection is
 read-only and intentionally race-tolerant: it reserves no seat, and the final
 WebSocket join authoritatively checks per-lobby and process-wide retained-member
 capacity.

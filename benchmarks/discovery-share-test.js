@@ -12,10 +12,10 @@ const gameHtml = fs.readFileSync(path.join(root, 'client', 'game.html'), 'utf8')
 const shareSource = fs.readFileSync(path.join(root, 'client', 'js', 'share.js'), 'utf8');
 
 assert.match(indexHtml, /<form\b[^>]*method="post"[^>]*action="\/quickjoin"/, 'Quick Join must use the POST endpoint');
-const targetSelect = indexHtml.match(/<select\b[^>]*name="publicTarget"[\s\S]*?<\/select>/)?.[0];
-assert(targetSelect, 'lobby creation must expose a publicTarget select');
-const targetValues = [...targetSelect.matchAll(/<option\b[^>]*value="(\d+)"/g)].map((match) => Number(match[1]));
-assert.deepEqual(targetValues, [0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], 'publicTarget must only offer unlisted or the 2–16 player bounds');
+assert.doesNotMatch(indexHtml, /name="publicTarget"/, 'Quick Join eligibility must be automatic');
+assert.match(indexHtml, /Passwordless lobbies appear in Quick Join until full\./, 'automatic discovery must be explained');
+assert.match(indexHtml, /<select\b[^>]*name="capacity"[\s\S]*?<option value="16" selected>[\s\S]*?<option value="32">/, 'lobby creation must offer 16- and 32-player capacities');
+assert.match(indexHtml, /<select\b[^>]*name="walls"[\s\S]*?<option value="solid" selected>[\s\S]*?<option value="wrap">/, 'lobby creation must offer solid and wraparound walls');
 assert.match(indexHtml, /'no-open-lobby':\s*'No open Quick Join lobby/, 'the empty Quick Join state must explain what failed');
 
 for (const id of ['invite_url', 'share_link', 'copy_link', 'invite_status']) {

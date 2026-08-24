@@ -55,9 +55,10 @@ failed refresh restores and checks the previous runtime; explicit
 `./refresh-docker.sh rollback` performs the same guarded promotion without
 requiring Zig. Cleanup is label-scoped to dangling SnakeMP runtime images.
 
-Lobby discovery is opt-in: `publicTarget=0` is unlisted, 2..16 advertises an
-open lobby until its target is reached, and passworded lobbies are always
-unlisted. `POST /quickjoin` performs a read-only, race-tolerant redirect; it
+Passwordless lobbies are automatically discoverable until their selected
+capacity is reached, while passworded lobbies are always unlisted. The legacy
+`publicTarget` field remains accepted for compatibility. `POST /quickjoin`
+performs a read-only, race-tolerant redirect; it
 reserves no seat, while the WebSocket join remains the sole capacity authority.
 The cache-disabled `GET`/`HEAD /status` returns
 `{"players":<active>,"lobbies":<retained>}` for the landing header, whose

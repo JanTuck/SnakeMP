@@ -97,8 +97,30 @@ canvas {
     transform: translate3d(-50%, 12px, 0);
 }
 
+.player-nameplate.is-local {
+    color: #11151b;
+    background: #fffaf1;
+    box-shadow: 0 0 0 1px rgba(10, 12, 17, 0.64), 0 4px 14px rgba(4, 6, 11, 0.32);
+}
+
+.player-nameplate.is-local::before {
+    margin-right: 0.55em;
+    display: inline-block;
+    color: #14734a;
+    content: "YOU";
+    direction: ltr;
+    font-size: 0.68em;
+    font-weight: 850;
+    letter-spacing: 0.08em;
+    unicode-bidi: isolate;
+}
+
 .player-nameplate.is-bounty {
     box-shadow: 0 0 0 1px rgba(242, 203, 69, 0.9), 0 4px 12px rgba(4, 6, 11, 0.3);
+}
+
+.player-nameplate.is-local.is-bounty {
+    box-shadow: 0 0 0 2px rgba(242, 203, 69, 0.96), 0 4px 14px rgba(4, 6, 11, 0.34);
 }
 
 img { display: block; }
