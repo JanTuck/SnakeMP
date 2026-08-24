@@ -1,0 +1,59 @@
+'use strict';
+
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+
+const root = path.resolve(__dirname, '..');
+const clientRoot = path.join(root, 'client');
+const manifest = fs.readFileSync(path.join(root, 'servers/zig/src/assets_manifest.zig'), 'utf8');
+const importPattern = /^\s*import(?:[\s\S]*?\sfrom\s*)?["']([^"']+)["'];?\s*$/gm;
+
+function collectModuleGraph(entry) {
+  const pending = [entry];
+  const visited = new Set();
+  while (pending.length !== 0) {
+    const filename = pending.pop();
+    if (visited.has(filename)) continue;
+    visited.add(filename);
+    const source = fs.readFileSync(filename, 'utf8');
+    importPattern.lastIndex = 0;
+    for (let match; (match = importPattern.exec(source)) !== null;) {
+      assert(match[1].startsWith('.'), `browser module uses an unexpected bare import: ${match[1]}`);
+      const dependency = path.resolve(path.dirname(filename), match[1]);
+      assert(fs.existsSync(dependency), `browser module import is missing: ${dependency}`);
+      pending.push(dependency);
+    }
+  }
+  return visited;
+}
+
+const graph = collectModuleGraph(path.join(clientRoot, 'js/rendering.js'));
+assert.strictEqual(graph.size, 9, 'rendering module graph changed; update the production asset expectation deliberately');
+for (const filename of graph) {
+  const route = '/' + path.relative(clientRoot, filename).split(path.sep).join('/');
+  assert(manifest.includes(`.path = "${route}"`), `browser dependency is not embedded: ${route}`);
+}
+
+const removed = [
+  ['js/box.js', '/js/box.js'],
+  ['js/food.js', '/js/food.js'],
+  ['js/gameObject.js', '/js/gameObject.js'],
+  ['js/resourceHandler.js', '/js/resourceHandler.js'],
+  ['img/swords.png', '/img/swords.png'],
+];
+for (const [relative, route] of removed) {
+  assert(!fs.existsSync(path.join(clientRoot, relative)), `obsolete client asset still exists: ${relative}`);
+  assert(!manifest.includes(`.path = "${route}"`), `obsolete client asset is still embedded: ${route}`);
+}
+
+const rendering = fs.readFileSync(path.join(clientRoot, 'js/rendering.js'), 'utf8');
+assert(!/\b(?:Food|ResourceHandler)\b/.test(rendering), 'rendering still depends on obsolete wrapper classes');
+assert.strictEqual(
+  (rendering.match(/food = \{ x: [^,;]+, y: [^};]+ \};/g) || []).length,
+  2,
+  'initial and updated food coordinates must remain plain position objects',
+);
+assert(!/swords\.png/.test(fs.readFileSync(path.join(clientRoot, 'img/CREDITS.md'), 'utf8')), 'removed image remains in credits');
+
+console.log(`client asset test passed (${graph.size} rendering modules; 4 modules and 1 image removed)`);

@@ -77,6 +77,7 @@ const MAX_HTTP_INPUT = config.MAX_HTTP_INPUT;
 const MAX_WS_INPUT = config.MAX_WS_INPUT;
 const MAX_QUEUE_BYTES = config.MAX_QUEUE_BYTES;
 const MAX_QUEUE_ITEMS: usize = 4096;
+const MAX_OUTPUT_IOVECS: usize = 64;
 const OUTPUT_COMPACT_MIN_HEAD: usize = 64;
 const OUTPUT_RETAINED_ITEMS: usize = 256;
 const HTTP_IDLE_MS = config.HTTP_IDLE_MS;
@@ -495,17 +496,19 @@ fn connQueueResponse(c: *Conn, header: []const u8, body: []const u8, body_static
 
     const queueSuffix = struct {
         fn append(connection: *Conn, header_suffix: []const u8, body_suffix: []const u8, static: bool) void {
+            if (!static) {
+                if (header_suffix.len > 0 or body_suffix.len > 0) {
+                    _ = appendOwnedOutput(connection, header_suffix, body_suffix);
+                }
+                return;
+            }
             if (header_suffix.len > 0 and !appendOwnedOutput(connection, header_suffix, "")) return;
             if (body_suffix.len == 0) return;
-            if (static) {
-                _ = appendBorrowedOutput(connection, body_suffix);
-            } else {
-                _ = appendOwnedOutput(connection, body_suffix, "");
-            }
+            _ = appendBorrowedOutput(connection, body_suffix);
         }
     }.append;
 
-    if (!outputEmpty(c)) {
+    if (c.http_batching or !outputEmpty(c)) {
         queueSuffix(c, header, body, body_static);
         return;
     }
@@ -646,53 +649,100 @@ fn connEnqueueText(c: *Conn, payload: []const u8) void {
     connEnqueueFrame(c, 0x1, payload);
 }
 
+fn outputVectors(c: *const Conn, vectors: *[MAX_OUTPUT_IOVECS]posix.iovec_const) usize {
+    var count: usize = 0;
+    var index = c.output_head;
+    while (index < c.output.items.len and count < vectors.len) : (index += 1) {
+        const offset = if (index == c.output_head) c.output_offset else 0;
+        switch (c.output.items[index]) {
+            .owned => |bytes| {
+                if (offset < bytes.len) {
+                    vectors[count] = .{ .base = bytes[offset..].ptr, .len = bytes.len - offset };
+                    count += 1;
+                }
+            },
+            .borrowed => |bytes| {
+                if (offset < bytes.len) {
+                    vectors[count] = .{ .base = bytes[offset..].ptr, .len = bytes.len - offset };
+                    count += 1;
+                }
+            },
+            .shared => |frame| {
+                const header_len: usize = frame.header_len;
+                if (offset < header_len) {
+                    vectors[count] = .{ .base = frame.header[offset..header_len].ptr, .len = header_len - offset };
+                    count += 1;
+                    if (count == vectors.len) break;
+                    if (frame.payload.items.len > 0) {
+                        vectors[count] = .{ .base = frame.payload.items.ptr, .len = frame.payload.items.len };
+                        count += 1;
+                    }
+                } else {
+                    const payload_offset = offset - header_len;
+                    if (payload_offset < frame.payload.items.len) {
+                        vectors[count] = .{
+                            .base = frame.payload.items[payload_offset..].ptr,
+                            .len = frame.payload.items.len - payload_offset,
+                        };
+                        count += 1;
+                    }
+                }
+            },
+        }
+    }
+    return count;
+}
+
+/// Advance across a completed or partial scatter/gather write, releasing every
+/// fully consumed queue item exactly once. Caller holds output_mutex.
+fn consumeOutputBytes(c: *Conn, sent: usize) void {
+    std.debug.assert(sent <= c.output_bytes);
+    var remaining = sent;
+    while (remaining > 0) {
+        std.debug.assert(!outputEmpty(c));
+        const output = c.output.items[c.output_head];
+        const available = output.len() - c.output_offset;
+        if (remaining < available) {
+            c.output_offset += remaining;
+            remaining = 0;
+        } else {
+            remaining -= available;
+            releasePending(output);
+            c.output_head += 1;
+            c.output_offset = 0;
+        }
+    }
+    c.output_bytes -= sent;
+}
+
 fn flushOutput(c: *Conn) bool {
     c.output_mutex.lockUncancelable(g_io);
     defer c.output_mutex.unlock(g_io);
     while (!outputEmpty(c)) {
-        const output = c.output.items[c.output_head];
-        const total = output.len();
-        const rc = switch (output) {
-            .owned => |bytes| linux.write(c.fd, bytes[c.output_offset..].ptr, total - c.output_offset),
-            .borrowed => |bytes| linux.write(c.fd, bytes[c.output_offset..].ptr, total - c.output_offset),
-            .shared => |frame| writeSharedFrame(c.fd, frame, c.output_offset),
-        };
+        var vectors: [MAX_OUTPUT_IOVECS]posix.iovec_const = undefined;
+        const vector_count = outputVectors(c, &vectors);
+        std.debug.assert(vector_count > 0);
+        const rc = linux.writev(c.fd, &vectors, vector_count);
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 const sent: usize = @intCast(rc);
-                c.output_offset += sent;
-                c.output_bytes -= sent;
+                consumeOutputBytes(c, sent);
                 if (debug_enabled) _ = network_bytes_sent.fetchAdd(sent, .monotonic);
-                if (c.output_offset == total) {
-                    releasePending(output);
-                    c.output_head += 1;
-                    c.output_offset = 0;
-                }
             },
             .INTR => continue,
             .AGAIN => {
                 compactOutputPrefix(c);
                 return true;
             },
-            else => return false,
+            else => {
+                c.poisoned = true;
+                return false;
+            },
         }
     }
     resetOutputStorage(c);
     updateConnInterest(c, false);
     return !c.close_after_write;
-}
-
-fn writeSharedFrame(fd: posix.fd_t, frame: *model.SharedFrame, offset: usize) usize {
-    const hlen: usize = frame.header_len;
-    if (offset >= hlen) {
-        const payload_offset = offset - hlen;
-        return linux.write(fd, frame.payload.items[payload_offset..].ptr, frame.payload.items.len - payload_offset);
-    }
-    const vec = [2]posix.iovec_const{
-        .{ .base = frame.header[offset..hlen].ptr, .len = hlen - offset },
-        .{ .base = frame.payload.items.ptr, .len = frame.payload.items.len },
-    };
-    return linux.writev(fd, &vec, vec.len);
 }
 
 fn connPoisoned(c: *Conn) bool {
@@ -2057,7 +2107,13 @@ fn processHttpInput(c: *Conn, aa: Allocator, peer_eof: bool) bool {
     // Parse a complete pipeline with an offset and compact once on exit. The
     // previous per-request memmove made an N-request batch copy O(N²) bytes.
     var consumed: usize = 0;
-    defer consumeInput(c, consumed);
+    defer {
+        consumeInput(c, consumed);
+        if (c.http_batching) {
+            c.http_batching = false;
+            _ = flushOutput(c);
+        }
+    }
     while (c.mode == .http and !c.close_after_write) {
         const input = c.input.items[consumed..];
         const head_at = std.mem.indexOf(u8, input, CRLF ++ CRLF) orelse {
@@ -2175,6 +2231,11 @@ fn processHttpInput(c: *Conn, aa: Allocator, peer_eof: bool) bool {
         const final_half_closed_request = peer_eof and input.len == request_len;
         const keep_alive = (if (http10) connection_keep and !connection_close else !connection_close) and
             !final_half_closed_request;
+        // If another request is already coalesced in this read, retain this
+        // response so all complete responses can share bounded writev calls.
+        // A standalone request continues to use connQueueResponse's direct
+        // zero-copy syscall path.
+        c.http_batching = c.http_batching or input.len > request_len;
         routeAndRespond(c, aa, method, target, body, body_is_json, keep_alive);
         consumed += request_len;
         if (connPoisoned(c)) return false;
@@ -2478,6 +2539,49 @@ test "output queue compacts released prefixes and drops oversized idle storage" 
     try connection.output.ensureTotalCapacity(galloc, OUTPUT_RETAINED_ITEMS + 1);
     resetOutputStorage(&connection);
     try std.testing.expectEqual(@as(usize, 0), connection.output.capacity);
+}
+
+test "batched output vectors preserve order and partial-write accounting" {
+    galloc = std.testing.allocator;
+    defer drainSnapshotPool();
+    var connection = Conn{ .fd = -1 };
+    defer connection.output.deinit(galloc);
+
+    try connection.output.append(galloc, .{ .borrowed = "abcd" });
+    const owned = try galloc.dupe(u8, "EFGH");
+    try connection.output.append(galloc, .{ .owned = owned });
+    const shared = try galloc.create(model.SharedFrame);
+    shared.* = .{};
+    try shared.payload.appendSlice(galloc, "snap");
+    shared.header_len = @intCast(wsHeader(&shared.header, 0x2, shared.payload.items.len));
+    try connection.output.append(galloc, .{ .shared = shared });
+    try connection.output.append(galloc, .{ .borrowed = "ij" });
+    connection.output_offset = 2;
+    connection.output_bytes = 2 + owned.len + shared.len() + 2;
+
+    var vectors: [MAX_OUTPUT_IOVECS]posix.iovec_const = undefined;
+    const vector_count = outputVectors(&connection, &vectors);
+    try std.testing.expectEqual(@as(usize, 5), vector_count);
+    try std.testing.expectEqualStrings("cd", vectors[0].base[0..vectors[0].len]);
+    try std.testing.expectEqualStrings("EFGH", vectors[1].base[0..vectors[1].len]);
+    try std.testing.expectEqualSlices(u8, shared.header[0..shared.header_len], vectors[2].base[0..vectors[2].len]);
+    try std.testing.expectEqualStrings("snap", vectors[3].base[0..vectors[3].len]);
+    try std.testing.expectEqualStrings("ij", vectors[4].base[0..vectors[4].len]);
+
+    consumeOutputBytes(&connection, 3);
+    try std.testing.expectEqual(@as(usize, 1), connection.output_head);
+    try std.testing.expectEqual(@as(usize, 1), connection.output_offset);
+    try std.testing.expectEqual(@as(usize, 11), connection.output_bytes);
+
+    consumeOutputBytes(&connection, 5);
+    try std.testing.expectEqual(@as(usize, 2), connection.output_head);
+    try std.testing.expectEqual(@as(usize, shared.header_len), connection.output_offset);
+    try std.testing.expectEqual(@as(usize, 6), connection.output_bytes);
+
+    consumeOutputBytes(&connection, 6);
+    try std.testing.expect(outputEmpty(&connection));
+    try std.testing.expectEqual(@as(usize, 0), connection.output_offset);
+    try std.testing.expectEqual(@as(usize, 0), connection.output_bytes);
 }
 
 test "websocket close seals output after all earlier frames" {

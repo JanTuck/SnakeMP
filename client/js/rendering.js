@@ -1,7 +1,5 @@
 import Snake from "./snake.js";
 import GameOverMenu from "./menu/gameOverMenu.js";
-import Food from "./food.js";
-import ResourceHandler from "./resourceHandler.js";
 import { Sprites } from "./sprites.js";
 import { Sfx } from "./audio.js";
 import { Particles } from "./particles.js";
@@ -35,9 +33,6 @@ let lastTickAt = 0;
 let shakeUntil = 0;
 let lastFrameAt = 0;
 const prevScores = new Map();
-
-let resourceHandler = new ResourceHandler();
-resourceHandler.loadImages();
 
 function showError(message) {
     let domError = document.getElementById('game_error');
@@ -198,7 +193,7 @@ socket.on("b", (payload) => {
 socket.on('init', (initData) => {
     document.getElementById('game_popup').style.display = 'none';
 
-    food = new Food(ctx, initData.food.x, initData.food.y);
+    food = { x: initData.food.x, y: initData.food.y };
     gameOver = false;
     gameOverMenu = null;
     isSetup = true;
@@ -211,7 +206,7 @@ socket.on('game_error', (errorMessage) => {
 
 socket.on('updateFood', (data) => {
     if (!isSetup || gameOver) return;
-    food = new Food(ctx, data.x, data.y);
+    food = { x: data.x, y: data.y };
 });
 
 socket.on('feed', (item) => {

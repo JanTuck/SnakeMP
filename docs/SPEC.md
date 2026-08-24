@@ -23,7 +23,8 @@ transport.
   retained and copied into only when the socket applies backpressure. Consumed
   queue prefixes are compacted incrementally, oversized idle descriptor arrays
   are released, and WebSocket queues are bounded by both four MiB of live bytes
-  and 4,096 live items.
+  and 4,096 live items. Coalesced HTTP pipelines batch up to 64 queued segments
+  per `writev`; standalone responses retain the direct-write path.
 
 The worker packing threshold is configurable with `SNEK_LOBBIES_PER_WORKER`.
 The default of 128 was validated at 750 active lobbies: six game workers held

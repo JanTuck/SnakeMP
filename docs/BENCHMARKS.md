@@ -216,16 +216,16 @@ loopback connection, validates the exact number and ordering of responses, and
 reports the median of three ReleaseFast samples. The client write-half-closes
 after the batch, so the harness also verifies that a normal TCP FIN does not
 discard buffered requests. Timing includes response I/O; the smallest batch is
-correspondingly noisy. The paired measurements were:
+correspondingly noisy. The staged measurements were:
 
-| Requests in one pipeline | Before | After | Change |
+| Requests | Original | One input compaction | + 64-iovec output batches |
 |---:|---:|---:|---:|
-| 64 | 0.833 ms | 1.602 ms | noise-scale regression |
-| 256 | 2.976 ms | 1.828 ms | 38.6% faster |
-| 1,024 | 11.302 ms | 6.531 ms | 42.2% faster |
-| 2,048 | 23.063 ms | 13.181 ms | 42.8% faster |
-| 4,096 | 65.380 ms | 24.696 ms | 62.2% faster |
-| 6,240 | 129.133 ms | 39.096 ms | **69.7% faster** |
+| 64 | 0.833 ms | 1.602 ms | 0.543 ms |
+| 256 | 2.976 ms | 1.828 ms | 0.646 ms |
+| 1,024 | 11.302 ms | 6.531 ms | 1.257 ms |
+| 2,048 | 23.063 ms | 13.181 ms | 1.919 ms |
+| 4,096 | 65.380 ms | 24.696 ms | 4.462 ms |
+| 6,240 | 129.133 ms | 39.096 ms | **7.289 ms** |
 
 At 6,240 minimal 21-byte requests, the old parser moved about 390 MiB of buffer
 contents. The offset parser performs one final compaction and returned all
@@ -233,6 +233,28 @@ contents. The offset parser performs one final compaction and returned all
 trailing requests, request bodies followed by another request, `Connection:
 close`, headerless HTTP/1.0 requests, and a WebSocket frame coalesced with its
 upgrade request.
+
+Pipelined responses now retain their copied headers and borrowed static bodies
+until the input batch is parsed, then drain up to 64 owned, borrowed, or shared
+segments per `writev`. Standalone HTTP requests and WebSocket publication keep
+their direct zero-copy fast paths. At 6,240 requests, output batching is 81.4%
+faster than input compaction alone and 94.4% faster than the original parser.
+The harness also returned all 6,240 responses after the client deliberately
+paused reads for 500 ms (508.260 ms total), while unit tests exercise partial
+writes across every output ownership type with exact byte/refcount accounting.
+
+## Browser startup dependency cleanup
+
+The production rendering graph previously imported four wrapper/preload
+modules that did not contribute behavior, including an unused 3,656-byte swords
+image. Food state is now represented by the two coordinates the renderer uses,
+and the dead modules, image, embedded routes, and credit entry are removed.
+
+The exact graph test walks every relative import from `rendering.js`, verifies
+all nine remaining modules are embedded, and rejects reintroduction of the five
+obsolete routes. The change removes five browser requests, four JavaScript
+modules, 4,880 bytes of startup payload, and 4,944 bytes of embedded asset
+bodies. It does not change visuals or game behavior.
 
 Backpressured output queues now compact released descriptor prefixes after 64
 items once the prefix is at least half the array, retain at most 256 descriptors

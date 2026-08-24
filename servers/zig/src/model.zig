@@ -176,6 +176,9 @@ pub const Conn = struct {
     output_head: usize = 0,
     output_offset: usize = 0,
     output_bytes: usize = 0,
+    /// Reactor-only hint: retain complete HTTP responses until the current
+    /// pipelined input batch can be emitted with one bounded writev.
+    http_batching: bool = false,
     mode: enum { http, websocket } = .http,
     want_write: bool = false,
     close_after_write: bool = false,
