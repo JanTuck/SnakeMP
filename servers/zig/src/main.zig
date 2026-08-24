@@ -230,6 +230,44 @@ fn randomCell(l: *Lobby) CellPos {
     return .{ .x = cx * CELL, .y = cy * CELL };
 }
 
+const CLASSICAL_FOOD_EDGE_CELLS: i32 = 6;
+const CLASSICAL_HUD_TOP_ROWS: i32 = ROWS / 6;
+const CLASSICAL_HUD_LEFT_COLS: i32 = COLS * 2 / 3;
+const CLASSICAL_HUD_LEFT_ROWS: i32 = ROWS / 2;
+const CLASSICAL_HUD_MUTE_COL: i32 = COLS * 5 / 6;
+const CLASSICAL_HUD_MUTE_ROW: i32 = ROWS * 5 / 6;
+
+/// Classical mode has one permanent objective, so keep it comfortably inside
+/// the playable field and out of the responsive HUD's conservative top-left
+/// footprint. A shallow full-width band covers score/feed notifications, the
+/// larger top-left block covers compact/mobile standings, and the bottom-right
+/// corner covers the sound control without client-dependent spawn rules.
+fn classicalFoodCellSafe(cell: CellPos) bool {
+    const cx = @divExact(cell.x, CELL);
+    const cy = @divExact(cell.y, CELL);
+    if (cx < CLASSICAL_FOOD_EDGE_CELLS or cx >= COLS - CLASSICAL_FOOD_EDGE_CELLS or
+        cy < CLASSICAL_FOOD_EDGE_CELLS or cy >= ROWS - CLASSICAL_FOOD_EDGE_CELLS)
+    {
+        return false;
+    }
+    if (cy < CLASSICAL_HUD_TOP_ROWS) return false;
+    if (cx < CLASSICAL_HUD_LEFT_COLS and cy < CLASSICAL_HUD_LEFT_ROWS) return false;
+    if (cx >= CLASSICAL_HUD_MUTE_COL and cy >= CLASSICAL_HUD_MUTE_ROW) return false;
+    return true;
+}
+
+fn randomFoodCell(l: *Lobby) CellPos {
+    if (!l.classical) return randomCell(l);
+    var attempt: usize = 0;
+    while (attempt < 100) : (attempt += 1) {
+        const cx = l.rng.random().intRangeLessThan(i32, CLASSICAL_FOOD_EDGE_CELLS, COLS - CLASSICAL_FOOD_EDGE_CELLS);
+        const cy = l.rng.random().intRangeLessThan(i32, CLASSICAL_FOOD_EDGE_CELLS, ROWS - CLASSICAL_FOOD_EDGE_CELLS);
+        const cell: CellPos = .{ .x = cx * CELL, .y = cy * CELL };
+        if (classicalFoodCellSafe(cell)) return cell;
+    }
+    return .{ .x = (COLS / 2) * CELL, .y = (ROWS / 2) * CELL };
+}
+
 /// Keep new players in the central half of the arena. They still spawn at a
 /// random free cell, but always have enough reaction room to choose an initial
 /// direction before a wall can become an immediate hazard.
@@ -1248,7 +1286,7 @@ fn createLobbyLocked(id: []u8, password: []const u8, classical: bool) !*Lobby {
         .food = undefined,
     };
     l.rng = std.Random.DefaultPrng.init(seed);
-    l.food = randomCell(l);
+    l.food = randomFoodCell(l);
     lobbies.put(galloc, id, l) catch |e| {
         galloc.destroy(l);
         return e;
@@ -1487,7 +1525,7 @@ fn handleVisibility(c: *Conn, visible: bool) void {
 fn respawnFood(l: *Lobby) void {
     var attempt: usize = 0;
     while (attempt < 100) : (attempt += 1) {
-        l.food = randomCell(l);
+        l.food = randomFoodCell(l);
         if (!snakeOccupies(l, l.food)) return;
     }
 }
@@ -2839,6 +2877,40 @@ test "lobby passwords are bounded, validated, and authenticated exactly" {
 
     protected.password_protected = false;
     try std.testing.expect(lobbyAcceptsPassword(&protected, ""));
+}
+
+test "classical food avoids arena edges and the responsive HUD footprint" {
+    try std.testing.expect(!classicalFoodCellSafe(.{ .x = 0, .y = 0 }));
+    try std.testing.expect(!classicalFoodCellSafe(.{
+        .x = CLASSICAL_FOOD_EDGE_CELLS * CELL,
+        .y = CLASSICAL_FOOD_EDGE_CELLS * CELL,
+    }));
+    try std.testing.expect(!classicalFoodCellSafe(.{
+        .x = (COLS - CLASSICAL_FOOD_EDGE_CELLS) * CELL,
+        .y = (ROWS / 2) * CELL,
+    }));
+    try std.testing.expect(!classicalFoodCellSafe(.{
+        .x = (COLS / 2) * CELL,
+        .y = CLASSICAL_FOOD_EDGE_CELLS * CELL,
+    }));
+    try std.testing.expect(!classicalFoodCellSafe(.{
+        .x = CLASSICAL_HUD_MUTE_COL * CELL,
+        .y = CLASSICAL_HUD_MUTE_ROW * CELL,
+    }));
+    try std.testing.expect(classicalFoodCellSafe(.{
+        .x = (COLS * 3 / 4) * CELL,
+        .y = (ROWS / 3) * CELL,
+    }));
+
+    var lobby = Lobby{
+        .id = @constCast("classical-food"),
+        .classical = true,
+        .food = undefined,
+    };
+    lobby.rng = std.Random.DefaultPrng.init(0x5eed);
+    for (0..10_000) |_| {
+        try std.testing.expect(classicalFoodCellSafe(randomFoodCell(&lobby)));
+    }
 }
 
 test "classical lobby ticks never schedule special pickups" {
