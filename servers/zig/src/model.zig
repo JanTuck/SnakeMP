@@ -32,7 +32,7 @@ pub const Player = struct {
     id: []u8,
     name: []u8,
     color_hex: []u8,
-    snake: std.ArrayListUnmanaged(CellPos) = .{},
+    snake: std.ArrayListUnmanaged(CellPos) = .empty,
     body_length: usize = 1,
     score: i64 = 0,
     dir: ?Direction = null,
@@ -72,8 +72,14 @@ pub const Player = struct {
             .left => head.x -= CELL,
             .right => head.x += CELL,
         }
-        if (player.pending_growth > 0) player.pending_growth -= 1 else _ = player.snake.pop();
-        player.snake.insert(allocator, 0, head) catch return;
+        if (player.pending_growth > 0) {
+            const tail = player.snake.items[player.snake.items.len - 1];
+            player.snake.append(allocator, tail) catch return;
+            player.pending_growth -= 1;
+        }
+        var i = player.snake.items.len - 1;
+        while (i > 0) : (i -= 1) player.snake.items[i] = player.snake.items[i - 1];
+        player.snake.items[0] = head;
         player.body_length = player.snake.items.len;
     }
 };
@@ -86,34 +92,44 @@ pub const TickStats = struct {
     avg_tick_ms: f64 = 0,
     max_tick_ms: f64 = 0,
     ticks: u64 = 0,
+    serialize_ns: u64 = 0,
+    serialize_ns_total: u64 = 0,
+    wire_bytes: usize = 0,
 };
 
 pub const Lobby = struct {
     id: []u8,
     players: std.StringArrayHashMapUnmanaged(*Player) = .{},
     food: CellPos,
-    bonus: std.ArrayListUnmanaged(BonusApple) = .{},
-    drops: std.ArrayListUnmanaged(Drop) = .{},
+    bonus: std.ArrayListUnmanaged(BonusApple) = .empty,
+    drops: std.ArrayListUnmanaged(Drop) = .empty,
     golden: ?Golden = null,
     next_drop_at: i64 = 0,
     next_golden_at: i64 = 0,
     drop_seq: u64 = 1,
     last_empty_at: i64 = 0,
+    wire: std.ArrayListUnmanaged(u8) = .empty,
+    roster_dirty: bool = true,
     stats: TickStats = .{},
 };
 
 pub const Conn = struct {
     fd: posix.fd_t,
     sid: [SID_LEN]u8 = undefined,
-    qmtx: std.Thread.Mutex = .{},
-    qcond: std.Thread.Condition = .{},
-    chunks: std.ArrayListUnmanaged([]u8) = .{},
-    queued_bytes: usize = 0,
+    input: std.ArrayListUnmanaged(u8) = .empty,
+    output: std.ArrayListUnmanaged(u8) = .empty,
+    output_offset: usize = 0,
+    fragment: std.ArrayListUnmanaged(u8) = .empty,
+    fragment_opcode: u8 = 0,
+    mode: enum { http, websocket } = .http,
+    want_write: bool = false,
+    close_after_write: bool = false,
     closing: bool = false,
     poisoned: bool = false,
+    next_ping_ms: i64 = 0,
+    awaiting_pong_since: ?i64 = null,
     player: ?*Player = null,
     lobby: ?*Lobby = null,
-    wr_thread: ?std.Thread = null,
 
     pub fn sidSlice(connection: *Conn) []const u8 {
         return connection.sid[0..SID_LEN];

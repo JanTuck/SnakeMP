@@ -1,140 +1,170 @@
-# SnakeMP server benchmark report
+# Zig optimization and benchmark report
 
-Generated 2026-08-24T10:37:21.327Z from the exact release artifacts in this repository.
+Measured 2026-08-24 on the same local Linux host and workload used by the
+preserved multi-runtime benchmark. The final server was built with the newest
+installed compiler, Zig 0.16.0, using `-O ReleaseFast -fstrip`.
 
-## Test environment
+## Result
 
-- Hardware: AMD Ryzen 7 5700G with Radeon Graphics; 16 logical CPUs; 30.70 GiB RAM.
-- OS: Fedora Linux 44 (Workstation Edition); kernel 7.1.9-200.fc44.x86_64; x64.
-- Toolchains: Node v24.18.0; Bun 1.3.14; go version go1.26.6-X:nodwarf5 linux/amd64; rustc 1.97.1 (8bab26f4f 2026-07-14); cargo 1.97.1 (c980f4866 2026-06-30); Zig 0.13.0.
-- File-descriptor soft limit: 65,535 for benchmark server and client processes.
+**Overall performance winner: optimized Zig.** Historical Bun remains slightly
+better in median connection establishment and sampled peak CPU, but optimized
+Zig matches its rate-limited message throughput while using 87.7% fewer bytes
+per tick, 89.1% less memory at 4,000 connections, 92.3% less peak RSS, one
+thread instead of 12, and slightly better HTTP and connection-tail latency.
 
-## Builds and benchmark architecture
+The Bun numbers below are the preserved same-machine benchmark history. Bun was
+deleted at the user's request, so it was not rerun after the Zig-only compact
+wire protocol was introduced. This is an honest historical comparison, not a
+claim that the final two binaries were run side by side in this revision.
 
-- Node runs the reference entry point directly; compile time is not included in runtime measurements.
-- Bun: `bun build --target=bun --minify`. Go: `go build -trimpath -ldflags="-s -w"`. Rust: release profile with opt-level 3, LTO, one codegen unit, abort-on-panic, and stripping. Zig: `-O ReleaseFast -fstrip`.
-- `benchmarks/build-release.js` builds all artifacts before any server is started. Reported build time is a warm-cache build and excludes dependency/toolchain download.
-- One server runs at a time on loopback. The Node Socket.IO v2 benchmark client uses WebSocket transport only. The same payloads, lobby distribution, durations, and concurrency targets are used for every implementation.
-- Server RSS/CPU/thread/FD samples are taken every 200 ms from `/proc`. In-band `/debug/stats` captures idle and phase-specific RSS. Build time is never mixed into runtime data.
+## Methodology
 
-## Workload and repetition policy
+- WebSocket-only Socket.IO v2 / Engine.IO v3 connections over loopback.
+- Three normal-load repetitions after equal 5-second warm-ups.
+- Active-player tiers: 5, 10, 20, 40, and 80 bots; 6-second samples per tier.
+- Connection test: 100 connections at concurrency 25, repeated three times.
+- HTTP test: 300 requests at concurrency 50 per endpoint and repetition.
+- One server process at a time; process RSS, CPU, threads, and FDs sampled every
+  200 ms. Throughput counts messages actually received by clients.
+- Stress suite: caps, 100→4,000 idle connections, 200-lobby flood, oversized
+  and malformed traffic, 200 connection churn cycles, throttled clients, and
+  five-second recovery. Full final sampled duration was 312.4 seconds.
+- Wire candidates were compared for bytes plus 100,000 encode and parse
+  iterations before choosing the protocol.
 
-- Equal 5-second warm-up for every implementation, including Node and Bun JIT/runtime warm-up.
-- Three repetitions per baseline, connection-establishment, normal-load, and HTTP phase. Tables aggregate combined samples; connection rates are medians of runs.
-- Baseline: idle server, then one joined observer. Normal load: 5, 10, 20, 40, and 80 moving/rejoining bots for 6 seconds per repetition after warm-up.
-- Connection establishment is measured separately: 100 WebSocket connections, concurrency 25. Normal-load message rate counts actual `gameTick` messages received by bots, so the metric represents server fan-out rather than a synthetic request loop.
-- Stress: protocol cap enforcement, idle WebSocket ramp to 4,000, lobby flood, malformed/oversized input, rapid churn, slow clients, then a 5-second recovery observation.
-- The load generator records its own CPU in every normal-load run. It remained well below one full CPU core; values are included below so client saturation is visible.
+## Zig before and after
 
-## Runtime summary
+| Metric | Zig 0.13 baseline | Zig 0.16 port baseline | Optimized Zig 0.16 |
+|---|---:|---:|---:|
+| Connection rate, median | 1,724/s | 1,923/s | 1,852/s |
+| 80-bot messages | 1,096.5/s | 1,098.7/s | 1,119.4/s |
+| 80-bot wire rate | 1.88 MiB/s | 1.87 MiB/s | 231.2 KiB/s |
+| Average 80-bot tick | 2,123 B | 2,059.7 B | 267.6 B |
+| 80-bot RSS | 7.09 MiB | 72.22 MiB | 1.56 MiB |
+| RSS at 4,000 sockets | 132.61 MiB | 2.02 GiB | 6.39 MiB |
+| Sampled peak RSS | 135.50 MiB | 2.07 GiB | 6.51 MiB |
+| Sampled peak CPU | 288.6% | 185.0% | 30.0% |
+| Maximum threads | 8,006 | 8,006 | 1 |
 
-| implementation | conn/s median | connect p50 / p95 / p99 | 80-bot msg/s | tick p50 / p95 / p99 | input p50 / p95 / p99 | idle RSS | 80-bot RSS | peak RSS | peak CPU |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| node | 1,852 | 13.6 ms / 20.3 ms / 20.6 ms | 1,115 | 66.0 ms / 69.0 ms / 69.0 ms | 66.0 ms / 67.0 ms / 67.0 ms | 71.72 MiB | 98.58 MiB | 218.64 MiB | 130.0% |
-| bun | 1,923 | 11.3 ms / 20.6 ms / 21.5 ms | 1,118 | 66.0 ms / 67.0 ms / 67.0 ms | 66.0 ms / 67.0 ms / 67.0 ms | 49.39 MiB | 57.80 MiB | 84.14 MiB | 25.0% |
-| go | 1,786 | 13.1 ms / 17.7 ms / 18.5 ms | 1,113 | 67.0 ms / 68.0 ms / 68.0 ms | 67.0 ms / 67.0 ms / 68.0 ms | 9.93 MiB | 18.02 MiB | 93.19 MiB | 65.0% |
-| rust | 1,266 | 13.8 ms / 27.1 ms / 30.7 ms | 1,108 | 67.0 ms / 67.0 ms / 68.0 ms | 67.0 ms / 67.0 ms / 67.0 ms | 2.66 MiB | 8.48 MiB | 117.89 MiB | 295.0% |
-| zig | 1,724 | 12.1 ms / 18.3 ms / 19.5 ms | 1,097 | 67.0 ms / 67.0 ms / 68.0 ms | 67.0 ms / 67.0 ms / 67.0 ms | 620.00 KiB | 7.09 MiB | 135.50 MiB | 288.6% |
+Against the original Zig 0.13 implementation, the final server increased the
+median connection rate by 7.4%, reduced 80-bot wire traffic by 88.0%, reduced
+4,000-socket RSS and peak RSS by 95.2%, and reduced sampled peak CPU by 89.6%.
+The direct Zig 0.16 port exposed an especially severe thread-stack cost; the
+reactor reduced its 4,000-socket RSS by 99.7%.
 
-## Conclusions and performance winners
+## Wire-format decision
 
-**Overall performance winner: Bun.** It had the highest median connection-establishment rate (1,923 connections/s), the highest observed 80-bot message rate (1,118 messages/s), the lowest stress CPU peak (25.0%), fast HTTP responses, zero unexpected failures, and full recovery. Its loaded/stress memory was also much lower than Node while avoiding the thread explosion seen in Rust and Zig.
+Representative test lobby: 16 players, 18 segments each, three bonus apples,
+one drop, and one golden apple.
 
-- **Connection establishment:** bun won at a median 1,923 connections/s.
-- **Sustained message fan-out:** bun was narrowly highest at 1,118 received game-tick messages/s. The spread is small because all implementations are deliberately rate-limited by the same 15 Hz game loop.
-- **Idle and representative-load memory:** zig used the least idle RSS (620.00 KiB), and zig remained lowest at 80 bots (7.09 MiB).
-- **Stress memory:** bun had the lowest sampled stress peak (84.14 MiB).
-- **Standalone native binary:** zig was smallest at 476.27 KiB. Bun's 12.88 KiB bundle is smaller but requires the external Bun runtime, so it is not directly comparable to a native executable.
-- **Gameplay latency:** effectively a tie. All p95/p99 tick intervals stayed around 67–69 ms, which is the intended 15 Hz cadence; input-to-visible-movement was likewise one tick.
-- **Connection capacity:** a tie at the tested ceiling. Every server held 4,000 idle WebSocket connections with zero connection failures; the actual failure point is above the tested practical ceiling.
-- **Recovery:** all five remained alive and returned to normal tick cadence. Node and Go retained most of their stress-allocated RSS after five seconds, while Rust and Zig released substantially more; retained RSS alone is not proof of a leak, but longer soak testing would be appropriate.
-- **Architecture caveat:** Rust and Zig use two threads per connected transport in these ports. At 4,000 connections they reached roughly 8,000 threads; Bun, Node, and Go scale the same connection count without that thread count, making Bun the safer overall operational choice from this run.
+| JSON layout | Tick bytes | One-time roster | Encode CPU/op | Parse CPU/op |
+|---|---:|---:|---:|---:|
+| Legacy objects | 7,164 B | — | 21.4 µs | 33.2 µs |
+| Compact self-contained arrays | 2,704 B | — | 6.2 µs | 7.9 µs |
+| Separate roster + compact tick | **1,952 B** | 785 B | **5.2 µs** | **6.0 µs** |
 
-## Load curve
+The winning layout sends `r = [[id,name,color],...]` only when membership
+changes. Each `tick` sends scores, body lengths, flattened cell coordinates,
+pickups, and TTLs as positional arrays. Coordinates use grid cells rather than
+pixel multiples. The result retains all required information without repeating
+identity keys or object field names 15 times per second.
 
-| implementation | bots | msg/s | wire throughput | tick p50 | tick p95 | tick p99 | RSS | load-client CPU peak |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| node | 5 | 70 | 61.41 KiB/s | 66.0 ms | 67.0 ms | 67.0 ms | 79.35 MiB | 0.9% |
-| node | 10 | 139 | 203.78 KiB/s | 66.0 ms | 67.0 ms | 67.0 ms | 80.40 MiB | 1.5% |
-| node | 20 | 276 | 389.26 KiB/s | 66.0 ms | 67.0 ms | 67.0 ms | 74.82 MiB | 1.7% |
-| node | 40 | 559 | 1002.72 KiB/s | 66.0 ms | 67.0 ms | 68.0 ms | 81.19 MiB | 3.4% |
-| node | 80 | 1,115 | 1.91 MiB/s | 66.0 ms | 69.0 ms | 69.0 ms | 98.58 MiB | 5.5% |
-| bun | 5 | 72 | 65.79 KiB/s | 66.0 ms | 67.0 ms | 67.0 ms | 53.04 MiB | 1.1% |
-| bun | 10 | 144 | 231.66 KiB/s | 66.0 ms | 67.0 ms | 67.0 ms | 53.82 MiB | 1.4% |
-| bun | 20 | 280 | 408.83 KiB/s | 66.0 ms | 67.0 ms | 67.0 ms | 54.33 MiB | 1.9% |
-| bun | 40 | 562 | 1.03 MiB/s | 66.0 ms | 67.0 ms | 67.0 ms | 55.79 MiB | 3.2% |
-| bun | 80 | 1,118 | 1.99 MiB/s | 66.0 ms | 67.0 ms | 67.0 ms | 57.80 MiB | 5.4% |
-| go | 5 | 70 | 64.34 KiB/s | 67.0 ms | 68.0 ms | 68.0 ms | 14.88 MiB | 1.0% |
-| go | 10 | 138 | 221.57 KiB/s | 67.0 ms | 68.0 ms | 68.0 ms | 15.68 MiB | 1.3% |
-| go | 20 | 280 | 404.45 KiB/s | 67.0 ms | 68.0 ms | 68.0 ms | 15.89 MiB | 2.2% |
-| go | 40 | 560 | 1.01 MiB/s | 67.0 ms | 68.0 ms | 69.0 ms | 16.09 MiB | 3.7% |
-| go | 80 | 1,113 | 1.93 MiB/s | 67.0 ms | 68.0 ms | 68.0 ms | 18.02 MiB | 5.6% |
-| rust | 5 | 69 | 61.18 KiB/s | 67.0 ms | 67.0 ms | 67.0 ms | 7.59 MiB | 1.1% |
-| rust | 10 | 141 | 222.70 KiB/s | 67.0 ms | 67.0 ms | 67.0 ms | 7.72 MiB | 1.4% |
-| rust | 20 | 278 | 391.18 KiB/s | 67.0 ms | 67.0 ms | 67.0 ms | 7.80 MiB | 2.0% |
-| rust | 40 | 550 | 976.79 KiB/s | 67.0 ms | 67.0 ms | 68.0 ms | 8.03 MiB | 3.4% |
-| rust | 80 | 1,108 | 1.91 MiB/s | 67.0 ms | 67.0 ms | 68.0 ms | 8.48 MiB | 5.5% |
-| zig | 5 | 72 | 65.40 KiB/s | 67.0 ms | 67.0 ms | 67.0 ms | 2.11 MiB | 1.2% |
-| zig | 10 | 141 | 211.77 KiB/s | 67.0 ms | 67.0 ms | 67.0 ms | 2.44 MiB | 1.5% |
-| zig | 20 | 282 | 398.69 KiB/s | 67.0 ms | 67.0 ms | 67.0 ms | 3.10 MiB | 2.2% |
-| zig | 40 | 559 | 1011.00 KiB/s | 67.0 ms | 67.0 ms | 67.0 ms | 4.45 MiB | 3.4% |
-| zig | 80 | 1,097 | 1.88 MiB/s | 67.0 ms | 67.0 ms | 68.0 ms | 7.09 MiB | 6.2% |
+Under the real 80-bot load, average tick size fell from the Zig 0.16 baseline's
+2,059.7 B to 267.6 B (87.0%). The main lobby's measured Zig serialization cost
+at that tier averaged 138.3 µs, while total average tick work was about 0.2 ms.
+The compatibility normalizer used by the benchmark client averaged 2.22 µs
+(p95 5.27 µs, p99 12.20 µs) after Socket.IO parsing.
 
-## Stress, limits, and recovery
+## Final load results
 
-| implementation | player-cap result | highest stable idle connections | approximate failure point | churn failures | survived hostile input | recovery p95 | recovery RSS | recovered |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| node | 99 joined / 21 rejected | 4,000 | >4,000 not established | 0 | yes | 67.0 ms | 216.81 MiB | yes |
-| bun | 99 joined / 21 rejected | 4,000 | >4,000 not established | 0 | yes | 67.0 ms | 64.41 MiB | yes |
-| go | 99 joined / 21 rejected | 4,000 | >4,000 not established | 0 | yes | 67.0 ms | 92.96 MiB | yes |
-| rust | 99 joined / 21 rejected | 4,000 | >4,000 not established | 0 | yes | 67.0 ms | 58.12 MiB | yes |
-| zig | 99 joined / 21 rejected | 4,000 | >4,000 not established | 0 | yes | 67.0 ms | 21.16 MiB | yes |
+| Bots | Messages/s | Run-to-run rates | Wire rate | Avg tick | Tick p50/p95/p99 | RSS | Client CPU peak |
+|---:|---:|---|---:|---:|---|---:|---:|
+| 5 | 68.6 | 69.5 / 67.0 / 69.2 | 9.23 KiB/s | 137.0 B | 67/68/68 ms | 1.34 MiB | 1.1% |
+| 10 | 142.9 | 142.0 / 142.1 / 144.7 | 31.35 KiB/s | 224.0 B | 67/68/68 ms | 1.35 MiB | 1.4% |
+| 20 | 277.9 | 273.3 / 275.5 / 285.0 | 49.27 KiB/s | 205.0 B | 67/68/68 ms | 1.38 MiB | 2.1% |
+| 40 | 545.6 | 549.8 / 539.2 / 547.8 | 114.54 KiB/s | 259.0 B | 67/68/68 ms | 1.44 MiB | 2.4% |
+| 80 | **1,119.4** | 1,114.2 / 1,121.5 / 1,122.7 | 231.20 KiB/s | 267.6 B | 67/68/68 ms | 1.56 MiB | 4.8% |
 
-Expected cap rejections are protocol behavior, not benchmark errors. Unexpected HTTP failures, connection failures, timeouts, and crashes are reported in the phase data and server logs under `.scratch/results/`.
+The 15 Hz loop caps useful fan-out throughput, so stable cadence and resource
+cost matter more here than an artificial unbounded request counter.
 
-## HTTP operation latency
+### Latency
 
-| implementation | operation | p50 | p95 | p99 | failures |
-|---|---|---:|---:|---:|---:|
-| node | GET / | 9.0 ms | 14.0 ms | 20.0 ms | 0 |
-| node | POST /joingame | 7.0 ms | 12.0 ms | 15.0 ms | 0 |
-| bun | GET / | 5.0 ms | 9.0 ms | 12.0 ms | 0 |
-| bun | POST /joingame | 4.0 ms | 8.0 ms | 11.0 ms | 0 |
-| go | GET / | 5.0 ms | 9.0 ms | 12.0 ms | 0 |
-| go | POST /joingame | 4.0 ms | 7.0 ms | 10.0 ms | 0 |
-| rust | GET / | 5.0 ms | 9.0 ms | 11.0 ms | 0 |
-| rust | POST /joingame | 5.0 ms | 9.0 ms | 10.0 ms | 0 |
-| zig | GET / | 5.0 ms | 8.0 ms | 12.0 ms | 0 |
-| zig | POST /joingame | 4.0 ms | 8.0 ms | 9.0 ms | 0 |
+| Measurement | p50 | p95 | p99 | Failures |
+|---|---:|---:|---:|---:|
+| Connection establishment | 12.15 ms | 17.72 ms | 19.65 ms | 0/300 |
+| Input-to-observed-tick | 67 ms | 68 ms | 68 ms | 0 |
+| GET `/` | 5 ms | 8 ms | 11 ms | 0/900 |
+| POST `/joingame` | 4 ms | 7 ms | 9 ms | 0/900 |
 
-## Static project metrics
+Connection-rate repetitions were 1,449, 1,852, and 2,273/s. The range is why
+the median, complete percentiles, and all run rates are reported instead of a
+single best run.
 
-| implementation | source LOC | release artifact | clean implementation folder | folder incl. build output | warm-cache build |
-|---|---:|---:|---:|---:|---:|
-| node | 678 | — | 25.28 KiB | 25.28 KiB | 61.7 ms |
-| bun | 907 | 12.88 KiB | 31.89 KiB | 44.77 KiB | 7.4 ms |
-| go | 1,673 | 6.18 MiB | 40.07 KiB | 6.40 MiB | 55.8 ms |
-| rust | 2,390 | 724.45 KiB | 75.17 KiB | 149.62 MiB | 38.4 ms |
-| zig | 2,060 | 476.27 KiB | 75.72 KiB | 128.12 MiB | 5908.6 ms |
+## Stress and break-it behavior
 
-Go, Rust, and Zig artifacts are already stripped, so the release-artifact and stripped-binary sizes are identical. Bun reports its minified bundle; Node has no standalone build artifact. Generated client staging, dependency caches, and build output are excluded from clean-folder and LOC totals.
+| Check | Result |
+|---|---|
+| Player caps | 99 joined, 21 cleanly rejected |
+| Idle connections | 4,000/4,000 held; 6.39 MiB server RSS |
+| 4,000-socket open time | 2.20 s total ramp step |
+| Lobby flood | 200 created in 17 ms |
+| Malformed/oversized traffic | 100 raw cases; server stayed alive; tick p95 67 ms |
+| Connection churn | 200 cycles in 1.58 s; zero failures |
+| Throttled clients | tick average 66.7 ms, p95/max 68 ms |
+| Recovery | recovered in the 5 s window; p50/p95/p99 67/68/68 ms |
+| Process peak | 6.51 MiB RSS, 30% CPU, 1 thread, 4,007 FDs |
 
-## Caveats and interpretation
+Across the full normal plus stress run the server recorded 32,468,490 bytes
+sent, 5,201,119 bytes received, 138,679 outbound WebSocket frames, 31,920
+inbound frames, and 21,567 input events. Average measured input event handling
+was 5.77 µs. No sustained memory growth or post-overload tick degradation was
+observed; final RSS was 6.51 MiB with only two live connections.
 
-- The game intentionally caps active players at 100 and each lobby at 16. The idle-connection break test exercises transport capacity beyond that gameplay cap.
-- Loopback removes real network variance; results compare server/runtime overhead on this machine, not internet performance.
-- A single Node load-generator process was sufficient at these targets based on recorded client CPU. For substantially larger active-message tests, shard the generator across processes or hosts.
-- Message rates count received game ticks across load clients. Other low-rate feed/init/death events are not included, so this is a conservative protocol-message rate.
-- No implementation receives implementation-specific warm-up, payloads, or durations. Random spawn/collision timing still introduces ordinary run-to-run variance, which is why repeated runs are aggregated.
-- Highest throughput, lowest latency, smallest memory footprint, smallest artifact, and highest connection capacity are separate outcomes; no single “fastest” label is implied.
+## Optimized Zig versus historical Bun
 
-## Reproduction
+| Metric | Optimized Zig | Historical Bun | Winner |
+|---|---:|---:|---|
+| Median connection rate | 1,852/s | 1,923/s | Bun by 3.7% |
+| Connection p95 / p99 | 17.72 / 19.65 ms | 20.64 / 21.45 ms | Zig |
+| 80-bot messages | 1,119.4/s | 1,118.2/s | Tie (Zig +0.1%) |
+| Average tick | 267.6 B | 2,170.8 B | Zig, 87.7% smaller |
+| 80-bot wire rate | 231.2 KiB/s | 1.99 MiB/s | Zig, 88.7% lower |
+| 80-bot RSS | 1.56 MiB | 57.80 MiB | Zig, 97.3% lower |
+| RSS at 4,000 sockets | 6.39 MiB | 58.65 MiB | Zig, 89.1% lower |
+| Peak RSS | 6.51 MiB | 84.14 MiB | Zig, 92.3% lower |
+| Peak CPU | 30% | 25% | Bun by 5 points |
+| Maximum threads | 1 | 12 | Zig |
+| GET p95 / p99 | 8 / 11 ms | 9 / 12 ms | Zig |
+| Join p95 / p99 | 7 / 9 ms | 8 / 11 ms | Zig |
 
-```bash
-npm ci
-ZIG_BIN=/path/to/zig-0.13.0/zig node benchmarks/build-release.js
-BENCH_REPETITIONS=3 bash benchmarks/run-benchmarks.sh node bun go rust zig
-node benchmarks/report.js node bun go rust zig
-```
+### Why each wins where it does
 
-Run on an otherwise idle Linux machine. Keep the same CPU governor, file-descriptor limit, runtime/compiler versions, and concurrency targets. Raw JSON and logs are intentionally ignored; archive them separately when independently reproducing a run.
+- Zig's largest gains come from architectural work: epoll, one reactor/game
+  loop, nonblocking incremental parsers, direct `writev`, retained buffers, and
+  copying only under socket backpressure. Eliminating two threads per socket is
+  responsible for most of the concurrency memory and scheduler improvement.
+- The compact roster/tick protocol is responsible for most of the bandwidth
+  and client JSON parse improvement.
+- Bun still has the best sampled CPU peak and a slightly better median connect
+  rate. Zig's one-millisecond tick/input difference is timer phase at a fixed
+  15 Hz, not a meaningful simulation slowdown.
+- Remaining Zig work is mostly diminishing-return territory: spatial collision
+  indexing for much larger per-lobby caps, `sendmmsg` experiments for much
+  larger fan-out, and browser-profiler validation of rendering work. None is
+  justified by the current cap-16 lobby profile without new measurements.
+
+## Validation completed
+
+- Zig compilation and two Zig unit tests on 0.16.0.
+- Go tests/vet and Zig formatting/test checks via `npm run check`.
+- Full HTTP, Socket.IO, lifecycle, validation, lobby isolation, movement,
+  reversal, chained-turn, death, and rejoin parity.
+- Compact wire-format tests and legacy client compatibility.
+- Split/partial HTTP request assembly and malformed-request recovery.
+- Oversized WebSocket/events, malformed raw TCP, connection/disconnection,
+  high concurrency, throttling, churn, overload, and recovery.
+- Three repeated load iterations and a 312.4-second sampled run.
+
+Raw local evidence is retained in ignored `.scratch/final/`, with pre-change
+Zig baselines in `.scratch/baseline-013/` and `.scratch/baseline-016/`.

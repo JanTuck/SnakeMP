@@ -12,11 +12,8 @@ fs.mkdirSync(resultsDir, { recursive: true });
 
 const zig = process.env.ZIG_BIN || 'zig';
 const builds = [
-  ['node', 'node', ['--check', 'servers/node/app.js'], root],
-  ['bun', 'bun', ['build', 'servers/bun/src/main.ts', '--outfile', 'servers/bun/dist/main.min.js', '--target=bun', '--minify'], root],
   ['go-assets', 'bash', ['servers/go/build-assets.sh'], root],
   ['go', 'go', ['build', '-trimpath', '-ldflags=-s -w', '-o', 'snek-go', '.'], path.join(root, 'servers', 'go')],
-  ['rust', 'cargo', ['build', '--offline', '--release'], path.join(root, 'servers', 'rust')],
   ['zig-assets', 'bash', ['servers/zig/build-assets.sh'], root],
   ['zig', zig, ['build-exe', '-O', 'ReleaseFast', '-fstrip', 'src/main.zig', '-femit-bin=snek-zig', '--cache-dir', '.zig-cache', '--global-cache-dir', '.zig-global-cache'], path.join(root, 'servers', 'zig')],
 ];
@@ -35,10 +32,7 @@ const result = {
     kernel: os.release(),
     arch: os.arch(),
     node: process.version,
-    bun: version('bun', ['--version']),
     go: version('go', ['version']),
-    rust: version('rustc', ['--version']),
-    cargo: version('cargo', ['--version']),
     zig: version(zig, ['version']),
   },
 };

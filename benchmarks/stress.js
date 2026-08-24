@@ -7,6 +7,7 @@ const path = require('path');
 const io = require('socket.io-client');
 const http = require('http');
 const fs = require('fs');
+const { attachWorld } = require('./protocol');
 
 try { delete globalThis.WebSocket; } catch (e) {}
 
@@ -66,7 +67,7 @@ function rawSocket(port, payload) {
   let obsLast = 0;
   obs.on('connect', () => obs.emit('clientReady', 'stress-observer', '12345'));
   obs.on('death', () => setTimeout(() => obs.emit('clientReady', 'stress-observer', '12345'), 300));
-  obs.on('gameTick', () => { const n = Date.now(); if (obsLast) obsDeltas.push(n - obsLast); obsLast = n; });
+  attachWorld(obs, () => { const n = Date.now(); if (obsLast) obsDeltas.push(n - obsLast); obsLast = n; });
   await wait(700);
 
   // S0: cap enforcement — 120 join attempts must hit the caps gracefully.

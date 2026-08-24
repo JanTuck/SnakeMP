@@ -38,14 +38,11 @@ run_one() {
 }
 
 if (( $# == 0 )); then
-  set -- node bun go rust zig
+  set -- go zig
 fi
 for name in "$@"; do
   case "$name" in
-    node) run_one node 4000 node "$REPO/servers/node/app.js" ;;
-    bun) run_one bun 4101 bun run "$REPO/servers/bun/dist/main.min.js" ;;
     go) run_one go 4102 "$REPO/servers/go/snek-go" ;;
-    rust) run_one rust 4103 "$REPO/servers/rust/target/release/snek-rust" ;;
     zig) run_one zig 4104 "$REPO/servers/zig/snek-zig" ;;
     *) echo "unknown implementation: $name" >&2; exit 2 ;;
   esac

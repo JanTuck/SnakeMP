@@ -26,6 +26,9 @@ let gameOverMenu = null;
 
 // World pickups (supply drops, bonus apples, golden apple).
 let world = { bonus: [], drops: [], golden: null };
+let roster = [];
+let compactPlayers = [];
+const compactById = new Map();
 let lastTickAt = 0;
 let shakeUntil = 0;
 let lastFrameAt = 0;
@@ -115,6 +118,104 @@ socket.on("gameTick", (data) => {
     world = data;
     lastTickAt = performance.now();
     Hud.update(data.players, socket.id);
+});
+
+// Zig protocol v2: immutable identity metadata arrives only on membership
+// changes. The following compact ticks are positional arrays aligned to it.
+socket.on("r", (nextRoster) => {
+    if (!Array.isArray(nextRoster)) return;
+    const live = new Set();
+    const nextPlayers = new Array(nextRoster.length);
+    for (let i = 0; i < nextRoster.length; i++) {
+        const meta = nextRoster[i];
+        if (!Array.isArray(meta) || meta.length < 3) return;
+        const id = meta[0];
+        live.add(id);
+        let state = compactById.get(id);
+        if (state === undefined) {
+            state = { id, displayName: meta[1], color: meta[2], score: 0, bodyLength: 0, snake: [] };
+            compactById.set(id, state);
+        } else {
+            state.displayName = meta[1];
+            state.color = meta[2];
+        }
+        nextPlayers[i] = state;
+    }
+    for (const id of compactById.keys()) {
+        if (!live.has(id)) {
+            compactById.delete(id);
+            snakeList.delete(id);
+            prevScores.delete(id);
+        }
+    }
+    roster = nextRoster;
+    compactPlayers = nextPlayers;
+});
+
+function resizeObjects(array, length) {
+    while (array.length < length) array.push({ x: 0, y: 0 });
+    array.length = length;
+}
+
+socket.on("tick", (tick) => {
+    if (!isSetup || gameOver || !Array.isArray(tick) || tick.length < 4) return;
+    const rows = tick[0];
+    if (!Array.isArray(rows) || rows.length !== roster.length) return;
+
+    for (let i = 0; i < rows.length; i++) {
+        const meta = roster[i];
+        const row = rows[i];
+        if (!Array.isArray(row) || !Array.isArray(row[2])) return;
+        const state = compactPlayers[i];
+        const before = state.score;
+        let snake = snakeList.get(meta[0]);
+        if (snake === undefined) {
+            snake = new Snake(ctx, [meta, row], true);
+            snakeList.set(meta[0], snake);
+        } else snake.updateCompact(meta, row);
+        state.score = row[0];
+        state.bodyLength = row[1];
+        state.snake = snake.snake;
+        if (state.score > before && snake.snake.length > 0) {
+            const head = snake.snake[0];
+            Particles.burst(head.x + 8, head.y + 8, state.color, state.id === socket.id ? 18 : 8);
+            if (state.id === socket.id) {
+                Sfx.eat();
+                Hud.popScore();
+            }
+        }
+    }
+
+    const bonus = tick[1];
+    if (!Array.isArray(bonus) || (bonus.length & 1) !== 0) return;
+    resizeObjects(world.bonus, bonus.length >> 1);
+    for (let i = 0, c = 0; i < bonus.length; i += 2, c++) {
+        world.bonus[c].x = bonus[i] * 16;
+        world.bonus[c].y = bonus[i + 1] * 16;
+    }
+
+    const drops = tick[2];
+    if (!Array.isArray(drops)) return;
+    resizeObjects(world.drops, drops.length);
+    for (let i = 0; i < drops.length; i++) {
+        const row = drops[i];
+        const drop = world.drops[i];
+        drop.id = row[0];
+        drop.x = row[1] * 16;
+        drop.y = row[2] * 16;
+        drop.ttl = row[3];
+    }
+    const golden = tick[3];
+    if (golden === null) world.golden = null;
+    else {
+        if (world.golden === null) world.golden = { x: 0, y: 0, ttl: 0 };
+        world.golden.x = golden[0] * 16;
+        world.golden.y = golden[1] * 16;
+        world.golden.ttl = golden[2];
+    }
+    world.players = compactPlayers;
+    lastTickAt = performance.now();
+    Hud.update(compactPlayers, socket.id);
 });
 
 socket.on('init', (initData) => {

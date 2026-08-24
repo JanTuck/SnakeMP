@@ -1,11 +1,12 @@
 export default class Snake {
-    constructor(ctx, data) {
+    constructor(ctx, data, compact = false) {
         this.scale = 16;
         this.ctx = ctx;
         this.canvas = ctx.canvas;
         this.snake = [];
         this.prevSnake = [];
-        this.update(data);
+        if (compact) this.updateCompact(data[0], data[1]);
+        else this.update(data);
     }
 
     // Refresh the mutable state of an already existing snake. The previous
@@ -18,6 +19,29 @@ export default class Snake {
         this.displayName = data.displayName;
         this.bodyLength = data.bodyLength;
         this.score = data.score;
+    }
+
+    // Compact wire update. Reuse two cell-object buffers so a tick allocates
+    // only the arrays produced by JSON.parse; interpolation still has both
+    // the previous and current coordinates.
+    updateCompact(meta, row) {
+        const next = this.prevSnake;
+        this.prevSnake = this.snake;
+        this.snake = next;
+        const coords = row[2];
+        const cells = coords.length >> 1;
+        this.snake.length = cells;
+        for (let i = 0, c = 0; c < cells; c++, i += 2) {
+            let cell = this.snake[c];
+            if (cell === undefined) cell = this.snake[c] = { x: 0, y: 0 };
+            cell.x = coords[i] * this.scale;
+            cell.y = coords[i + 1] * this.scale;
+        }
+        this.id = meta[0];
+        this.displayName = meta[1];
+        this.color = meta[2];
+        this.score = row[0];
+        this.bodyLength = row[1];
     }
     setDirection(direction) {
         // Direction is authoritative on the server; kept for future use.

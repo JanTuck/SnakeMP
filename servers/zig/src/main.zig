@@ -3,16 +3,15 @@
 //! socket.io v2 frames, per docs/SPEC.md. Standard library only.
 //!
 //! Architecture:
-//!   - thread-per-connection accept loop; each connection gets a reader
-//!     thread (owns the connection) plus a companion writer thread that
-//!     drains a per-connection outbound frame queue, so slow clients can
-//!     never stall the ticker.
-//!   - shared game state behind one mutex; a dedicated ticker thread steps
-//!     every lobby at 66.67ms.
+//!   - one edge-triggered epoll reactor owns HTTP, WebSocket, and game state;
+//!   - direct writev on the ready-socket path, retained buffers only for
+//!     backpressure, and reusable per-lobby serialization buffers;
+//!   - one 66.67ms reactor deadline steps every lobby;
 //!   - all public assets embedded at compile time via @embedFile.
 
 const std = @import("std");
 const posix = std.posix;
+const linux = std.os.linux;
 const builtin = @import("builtin");
 const assets = @import("assets_manifest.zig");
 const model = @import("model.zig");
@@ -64,16 +63,42 @@ const HTTP_IDLE_MS: i32 = 65_000;
 
 // ------------------------------------------------------------------ state
 
-var gpa_state = std.heap.GeneralPurposeAllocator(.{ .thread_safe = true }){};
-const galloc = gpa_state.allocator();
+var galloc: Allocator = undefined;
+var tick_arena: std.heap.ArenaAllocator = undefined;
 
-var state_mtx: std.Thread.Mutex = .{};
+var g_io: std.Io = undefined;
 var rng_prng: std.Random.DefaultPrng = undefined;
-var lobbies: std.StringArrayHashMapUnmanaged(*Lobby) = .{};
+var lobbies: std.StringArrayHashMapUnmanaged(*Lobby) = .empty;
 var start_ms: i64 = 0;
 var debug_enabled = false;
 var shutting_down = false;
 var listen_fd: posix.fd_t = -1;
+var epoll_fd: posix.fd_t = -1;
+var connections: std.AutoHashMapUnmanaged(posix.fd_t, *Conn) = .empty;
+var network_bytes_sent: u64 = 0;
+var network_bytes_received: u64 = 0;
+var websocket_frames_sent: u64 = 0;
+var websocket_frames_received: u64 = 0;
+var input_event_ns_total: u64 = 0;
+var input_events: u64 = 0;
+
+inline fn clockNanos(clock: linux.clockid_t) i64 {
+    var ts: linux.timespec = undefined;
+    _ = linux.clock_gettime(clock, &ts);
+    return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
+}
+
+inline fn monoNanos() i64 {
+    return clockNanos(.MONOTONIC);
+}
+
+inline fn unixMillis() i64 {
+    return @divTrunc(clockNanos(.REALTIME), std.time.ns_per_ms);
+}
+
+inline fn closeFd(fd: posix.fd_t) void {
+    _ = linux.close(fd);
+}
 
 const Direction = model.Direction;
 const CellPos = model.CellPos;
@@ -230,8 +255,8 @@ fn jsString(b: *Buf, aa: Allocator, s: []const u8) !void {
 }
 
 fn jnum(b: *Buf, aa: Allocator, v: anytype) !void {
-    const s = try std.fmt.allocPrint(aa, "{d}", .{v});
-    defer aa.free(s);
+    var tmp: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&tmp, "{d}", .{v}) catch unreachable;
     try b.appendSlice(aa, s);
 }
 
@@ -249,12 +274,6 @@ fn eventFrame(aa: Allocator, event: []const u8, args_json: []const u8) ![]u8 {
 
 // ------------------------------------------------------------------ connection
 
-fn freeChunksLocked(c: *Conn) void {
-    for (c.chunks.items) |ch| galloc.free(ch);
-    c.chunks.clearRetainingCapacity();
-    c.queued_bytes = 0;
-}
-
 fn wsHeader(hdr: *[10]u8, opcode: u8, len: usize) usize {
     hdr[0] = 0x80 | opcode; // FIN + opcode, unmasked (server -> client)
     if (len < 126) {
@@ -271,102 +290,133 @@ fn wsHeader(hdr: *[10]u8, opcode: u8, len: usize) usize {
     return 10;
 }
 
-/// Queue a websocket frame (header + payload copied into one allocation).
-fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
-    var hdr: [10]u8 = undefined;
-    const hlen = wsHeader(&hdr, opcode, payload.len);
+fn updateConnInterest(c: *Conn, want_write: bool) void {
+    if (c.want_write == want_write or epoll_fd < 0) return;
+    c.want_write = want_write;
+    var ev = linux.epoll_event{
+        .events = linux.EPOLL.IN | linux.EPOLL.RDHUP | linux.EPOLL.ET |
+            @as(u32, if (want_write) linux.EPOLL.OUT else 0),
+        .data = .{ .ptr = @intFromPtr(c) },
+    };
+    const rc = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_MOD, c.fd, &ev);
+    if (linux.errno(rc) != .SUCCESS) c.poisoned = true;
+}
 
-    c.qmtx.lock();
-    defer c.qmtx.unlock();
-    if (c.closing or c.poisoned) return;
-    if (c.queued_bytes + payload.len + hlen > MAX_QUEUE_BYTES) {
+fn appendOutput(c: *Conn, bytes: []const u8) bool {
+    const pending = c.output.items.len - c.output_offset;
+    if (pending + bytes.len > MAX_QUEUE_BYTES) {
         c.poisoned = true;
-        c.qcond.signal();
-        posix.shutdown(c.fd, .recv) catch {};
+        return false;
+    }
+    if (pending == 0) {
+        c.output.clearRetainingCapacity();
+        c.output_offset = 0;
+    }
+    c.output.appendSlice(galloc, bytes) catch {
+        c.poisoned = true;
+        return false;
+    };
+    updateConnInterest(c, true);
+    return true;
+}
+
+/// Write immediately when the socket is ready; retain only the unsent suffix.
+fn connQueueRaw(c: *Conn, bytes: []const u8) void {
+    if (c.closing or c.poisoned or bytes.len == 0) return;
+    if (c.output.items.len != c.output_offset) {
+        _ = appendOutput(c, bytes);
         return;
     }
-    const buf = galloc.alloc(u8, hlen + payload.len) catch {
-        c.poisoned = true;
-        c.qcond.signal();
-        posix.shutdown(c.fd, .recv) catch {};
+    while (true) {
+        const rc = linux.write(c.fd, bytes.ptr, bytes.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const sent: usize = @intCast(rc);
+                network_bytes_sent +%= sent;
+                if (sent < bytes.len) _ = appendOutput(c, bytes[sent..]);
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => {
+                _ = appendOutput(c, bytes);
+                return;
+            },
+            else => {
+                c.poisoned = true;
+                return;
+            },
+        }
+    }
+}
+
+/// Fast path uses one writev syscall and performs no allocation or copy.
+/// Backpressure copies only the unsent suffix into the retained output buffer.
+fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
+    if (c.closing or c.poisoned) return;
+    websocket_frames_sent +%= 1;
+    var hdr: [10]u8 = undefined;
+    const hlen = wsHeader(&hdr, opcode, payload.len);
+    if (c.output.items.len != c.output_offset) {
+        if (appendOutput(c, hdr[0..hlen])) _ = appendOutput(c, payload);
         return;
+    }
+
+    const vec = [2]posix.iovec_const{
+        .{ .base = hdr[0..hlen].ptr, .len = hlen },
+        .{ .base = payload.ptr, .len = payload.len },
     };
-    @memcpy(buf[0..hlen], hdr[0..hlen]);
-    @memcpy(buf[hlen..], payload);
-    c.chunks.append(galloc, buf) catch {
-        galloc.free(buf);
-        c.poisoned = true;
-        c.qcond.signal();
-        posix.shutdown(c.fd, .recv) catch {};
-        return;
-    };
-    c.queued_bytes += buf.len;
-    c.qcond.signal();
+    while (true) {
+        const rc = linux.writev(c.fd, &vec, vec.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const sent: usize = @intCast(rc);
+                network_bytes_sent +%= sent;
+                if (sent < hlen) {
+                    if (appendOutput(c, hdr[sent..hlen])) _ = appendOutput(c, payload);
+                } else if (sent < hlen + payload.len) {
+                    _ = appendOutput(c, payload[sent - hlen ..]);
+                }
+                return;
+            },
+            .INTR => continue,
+            .AGAIN => {
+                if (appendOutput(c, hdr[0..hlen])) _ = appendOutput(c, payload);
+                return;
+            },
+            else => {
+                c.poisoned = true;
+                return;
+            },
+        }
+    }
 }
 
 fn connEnqueueText(c: *Conn, payload: []const u8) void {
     connEnqueueFrame(c, 0x1, payload);
 }
 
-fn writerMain(c: *Conn) void {
-    var scratch: Buf = .{};
-    defer scratch.deinit(galloc);
-
-    while (true) {
-        c.qmtx.lock();
-        while (!(c.poisoned or c.closing or c.chunks.items.len > 0)) {
-            c.qcond.wait(&c.qmtx);
-        }
-        if (c.poisoned or (c.closing and c.chunks.items.len == 0)) {
-            freeChunksLocked(c);
-            c.qmtx.unlock();
-            break;
-        }
-        scratch.clearRetainingCapacity();
-        var ok = true;
-        for (c.chunks.items) |ch| {
-            scratch.appendSlice(galloc, ch) catch {
-                ok = false;
-                break;
-            };
-        }
-        freeChunksLocked(c);
-        c.qmtx.unlock();
-
-        if (!ok) {
-            c.qmtx.lock();
-            c.poisoned = true;
-            freeChunksLocked(c);
-            c.qmtx.unlock();
-            posix.shutdown(c.fd, .recv) catch {};
-            break;
-        }
-
-        var off: usize = 0;
-        var failed = false;
-        while (off < scratch.items.len) {
-            const n = posix.write(c.fd, scratch.items[off..]) catch {
-                failed = true;
-                break;
-            };
-            if (n == 0) {
-                failed = true;
-                break;
-            }
-            off += n;
-        }
-        if (failed) {
-            c.qmtx.lock();
-            c.poisoned = true;
-            freeChunksLocked(c);
-            c.qmtx.unlock();
-            posix.shutdown(c.fd, .recv) catch {}; // wake the reader
-            break;
+fn flushOutput(c: *Conn) bool {
+    while (c.output_offset < c.output.items.len) {
+        const pending = c.output.items[c.output_offset..];
+        const rc = linux.write(c.fd, pending.ptr, pending.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const sent: usize = @intCast(rc);
+                c.output_offset += sent;
+                network_bytes_sent +%= sent;
+            },
+            .INTR => continue,
+            .AGAIN => return true,
+            else => return false,
         }
     }
+    c.output.clearRetainingCapacity();
+    c.output_offset = 0;
+    updateConnInterest(c, false);
+    return !c.close_after_write;
 }
 
-// ------------------------------------------------------- room ops (state_mtx held)
+// ------------------------------------------------------- room operations
 
 fn totalPlayersLocked() usize {
     var n: usize = 0;
@@ -380,6 +430,7 @@ fn broadcastLobby(l: *Lobby, frame: []const u8) void {
 
 fn detachPlayer(l: *Lobby, p: *Player) void {
     _ = l.players.orderedRemove(p.id);
+    l.roster_dirty = true;
     p.conn.player = null; // allows same-socket rejoin (Retry without reload)
     p.conn.lobby = null;
 }
@@ -396,6 +447,7 @@ fn destroyLobby(l: *Lobby) void {
     for (l.drops.items) |d| galloc.free(d.id);
     l.drops.deinit(galloc);
     l.bonus.deinit(galloc);
+    l.wire.deinit(galloc);
     l.players.deinit(galloc);
     galloc.free(l.id);
     galloc.destroy(l);
@@ -412,7 +464,7 @@ fn createLobbyLocked(id: []u8) !*Lobby {
 }
 
 fn feedDeath(l: *Lobby, p: *Player, aa: Allocator) void {
-    var args: Buf = .{};
+    var args: Buf = .empty;
     defer args.deinit(aa);
     args.appendSlice(aa, ",{\"type\":\"death\",\"who\":") catch return;
     jsString(&args, aa, p.name) catch return;
@@ -425,7 +477,7 @@ fn feedDeath(l: *Lobby, p: *Player, aa: Allocator) void {
 }
 
 fn sendDeathEvent(c: *Conn, score: i64, aa: Allocator) void {
-    var args: Buf = .{};
+    var args: Buf = .empty;
     defer args.deinit(aa);
     args.append(aa, ',') catch return;
     jnum(&args, aa, score) catch return;
@@ -435,7 +487,7 @@ fn sendDeathEvent(c: *Conn, score: i64, aa: Allocator) void {
 }
 
 fn sendGameError(c: *Conn, msg: []const u8, aa: Allocator) void {
-    var args: Buf = .{};
+    var args: Buf = .empty;
     defer args.deinit(aa);
     args.append(aa, ',') catch return;
     jsString(&args, aa, msg) catch return;
@@ -445,7 +497,7 @@ fn sendGameError(c: *Conn, msg: []const u8, aa: Allocator) void {
 }
 
 fn broadcastUpdateFood(l: *Lobby, aa: Allocator) void {
-    var args: Buf = .{};
+    var args: Buf = .empty;
     defer args.deinit(aa);
     pf(&args, aa, ",{{\"x\":{d},\"y\":{d}}}", .{ l.food.x, l.food.y }) catch return;
     const frame = eventFrame(aa, "updateFood", args.items) catch return;
@@ -454,7 +506,7 @@ fn broadcastUpdateFood(l: *Lobby, aa: Allocator) void {
 }
 
 fn broadcastGoldenFeed(l: *Lobby, p: *Player, aa: Allocator) void {
-    var args: Buf = .{};
+    var args: Buf = .empty;
     defer args.deinit(aa);
     args.appendSlice(aa, ",{\"type\":\"golden\",\"who\":") catch return;
     jsString(&args, aa, p.name) catch return;
@@ -524,8 +576,6 @@ fn checkUsername(raw: []const u8) UsernameCheck {
 }
 
 fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_arg: ?[]const u8) void {
-    state_mtx.lock();
-    defer state_mtx.unlock();
 
     // Already playing on this socket: silently ignore (rejoin guard).
     if (c.player != null) return;
@@ -553,7 +603,7 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
 
     // init goes to the joining socket only, before the join feed.
     {
-        var args: Buf = .{};
+        var args: Buf = .empty;
         defer args.deinit(aa);
         pf(&args, aa, ",{{\"scale\":16,\"food\":{{\"x\":{d},\"y\":{d}}}}}", .{ target.food.x, target.food.y }) catch return;
         const frame = eventFrame(aa, "init", args.items) catch return;
@@ -599,9 +649,10 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
         destroyPlayer(p);
         return;
     };
+    target.roster_dirty = true;
 
     // feed join to everyone in the room (including the joiner).
-    var args: Buf = .{};
+    var args: Buf = .empty;
     defer args.deinit(aa);
     args.appendSlice(aa, ",{\"type\":\"join\",\"who\":") catch return;
     jsString(&args, aa, p.name) catch return;
@@ -612,8 +663,6 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
 }
 
 fn handleKeyPress(c: *Conn, d: Direction) void {
-    state_mtx.lock();
-    defer state_mtx.unlock();
     if (c.player) |p| _ = p.pushTurn(d);
 }
 
@@ -653,7 +702,7 @@ fn openDropLocked(l: *Lobby, p: *Player, aa: Allocator) void {
         l.bonus.append(galloc, .{ .pos = cell }) catch break;
         spawned += 1;
     }
-    var args: Buf = .{};
+    var args: Buf = .empty;
     defer args.deinit(aa);
     args.appendSlice(aa, ",{\"type\":\"drop-open\",\"who\":") catch return;
     jsString(&args, aa, p.name) catch return;
@@ -663,72 +712,87 @@ fn openDropLocked(l: *Lobby, p: *Player, aa: Allocator) void {
     broadcastLobby(l, frame);
 }
 
-fn buildGameTick(l: *Lobby, now: i64, aa: Allocator) ![]u8 {
-    const WirePlayer = struct {
-        id: []const u8,
-        displayName: []const u8,
-        color: []const u8,
-        snake: []const CellPos,
-        score: i64,
-        bodyLength: usize,
-    };
-    const WireDrop = struct { id: []const u8, x: i32, y: i32, ttl: i64 };
-    const WireGolden = struct { x: i32, y: i32, ttl: i64 };
-    const WireWorld = struct {
-        players: []const WirePlayer,
-        bonus: []const CellPos,
-        drops: []const WireDrop,
-        golden: ?WireGolden,
-    };
+inline fn appendCellCoord(b: *Buf, value: i32) !void {
+    try jnum(b, galloc, @divTrunc(value, CELL));
+}
 
-    const players = try aa.alloc(WirePlayer, l.players.count());
+/// Membership metadata is sent only when players join or leave. Player order
+/// is then stable and acts as the key for compact snapshots.
+fn buildRoster(l: *Lobby) ![]const u8 {
+    l.wire.clearRetainingCapacity();
+    try l.wire.appendSlice(galloc, "42[\"r\",[");
     for (l.players.values(), 0..) |p, i| {
-        players[i] = .{
-            .id = p.id,
-            .displayName = p.name,
-            .color = p.color_hex,
-            .snake = p.snake.items,
-            .score = p.score,
-            .bodyLength = p.body_length,
-        };
+        if (i != 0) try l.wire.append(galloc, ',');
+        try l.wire.append(galloc, '[');
+        try jsString(&l.wire, galloc, p.id);
+        try l.wire.append(galloc, ',');
+        try jsString(&l.wire, galloc, p.name);
+        try l.wire.append(galloc, ',');
+        try jsString(&l.wire, galloc, p.color_hex);
+        try l.wire.append(galloc, ']');
     }
+    try l.wire.appendSlice(galloc, "]]\n");
+    return l.wire.items[0 .. l.wire.items.len - 1];
+}
 
-    const bonus = try aa.alloc(CellPos, l.bonus.items.len);
-    for (l.bonus.items, 0..) |apple, i| bonus[i] = apple.pos;
-
-    const drops = try aa.alloc(WireDrop, l.drops.items.len);
+/// Compact tick: [players, bonus, drops, golden]. Coordinates are grid-cell
+/// integers and the browser multiplies once by CELL while applying the tick.
+fn buildGameTick(l: *Lobby, now: i64) ![]const u8 {
+    l.wire.clearRetainingCapacity();
+    try l.wire.appendSlice(galloc, "42[\"tick\",[[");
+    for (l.players.values(), 0..) |p, pi| {
+        if (pi != 0) try l.wire.append(galloc, ',');
+        try l.wire.append(galloc, '[');
+        try jnum(&l.wire, galloc, p.score);
+        try l.wire.append(galloc, ',');
+        try jnum(&l.wire, galloc, p.body_length);
+        try l.wire.appendSlice(galloc, ",[");
+        for (p.snake.items, 0..) |cell, ci| {
+            if (ci != 0) try l.wire.append(galloc, ',');
+            try appendCellCoord(&l.wire, cell.x);
+            try l.wire.append(galloc, ',');
+            try appendCellCoord(&l.wire, cell.y);
+        }
+        try l.wire.appendSlice(galloc, "]]");
+    }
+    try l.wire.appendSlice(galloc, "],[");
+    for (l.bonus.items, 0..) |apple, i| {
+        if (i != 0) try l.wire.append(galloc, ',');
+        try appendCellCoord(&l.wire, apple.pos.x);
+        try l.wire.append(galloc, ',');
+        try appendCellCoord(&l.wire, apple.pos.y);
+    }
+    try l.wire.appendSlice(galloc, "],[");
     for (l.drops.items, 0..) |drop, i| {
-        drops[i] = .{
-            .id = drop.id,
-            .x = drop.pos.x,
-            .y = drop.pos.y,
-            .ttl = @max(0, drop.expires_at - now),
-        };
+        if (i != 0) try l.wire.append(galloc, ',');
+        try l.wire.append(galloc, '[');
+        try jsString(&l.wire, galloc, drop.id);
+        try l.wire.append(galloc, ',');
+        try appendCellCoord(&l.wire, drop.pos.x);
+        try l.wire.append(galloc, ',');
+        try appendCellCoord(&l.wire, drop.pos.y);
+        try l.wire.append(galloc, ',');
+        try jnum(&l.wire, galloc, @max(0, drop.expires_at - now));
+        try l.wire.append(galloc, ']');
     }
-
-    const golden: ?WireGolden = if (l.golden) |item| .{
-        .x = item.pos.x,
-        .y = item.pos.y,
-        .ttl = @max(0, item.expires_at - now),
-    } else null;
-
-    var b: Buf = .{};
-    errdefer b.deinit(aa);
-    try b.appendSlice(aa, "42[\"gameTick\",");
-    try std.json.stringify(WireWorld{
-        .players = players,
-        .bonus = bonus,
-        .drops = drops,
-        .golden = golden,
-    }, .{}, b.writer(aa));
-    try b.append(aa, ']');
-    return b.toOwnedSlice(aa);
+    try l.wire.appendSlice(galloc, "],");
+    if (l.golden) |golden| {
+        try l.wire.append(galloc, '[');
+        try appendCellCoord(&l.wire, golden.pos.x);
+        try l.wire.append(galloc, ',');
+        try appendCellCoord(&l.wire, golden.pos.y);
+        try l.wire.append(galloc, ',');
+        try jnum(&l.wire, galloc, @max(0, golden.expires_at - now));
+        try l.wire.append(galloc, ']');
+    } else try l.wire.appendSlice(galloc, "null");
+    try l.wire.appendSlice(galloc, "]]\n");
+    return l.wire.items[0 .. l.wire.items.len - 1];
 }
 
 // ------------------------------------------------------------------ tick
 
 fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
-    const t0 = std.time.nanoTimestamp();
+    const t0 = monoNanos();
 
     // 1. expire pickups past their TTL
     {
@@ -758,13 +822,13 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
 
     // 3. per-player simulation, insertion order. Deaths are tombstoned and
     //    destroyed after the broadcast (the snapshot keeps borrowing them).
-    var graveyard: std.ArrayListUnmanaged(*Player) = .{};
+    var graveyard: std.ArrayListUnmanaged(*Player) = .empty;
     defer {
         for (graveyard.items) |p| destroyPlayer(p);
         graveyard.deinit(galloc);
     }
 
-    var snapshot = std.ArrayListUnmanaged(*Player){};
+    var snapshot: std.ArrayListUnmanaged(*Player) = .empty;
     defer snapshot.deinit(aa);
     snapshot.appendSlice(aa, l.players.values()) catch return;
 
@@ -843,14 +907,25 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
         p.applyMove(galloc);
     }
 
-    // 5. broadcast world snapshot
-    if (buildGameTick(l, now, aa)) |frame| {
-        defer aa.free(frame);
+    // 5. broadcast membership metadata only when it changed, followed by the
+    // compact world snapshot. Ordered websocket delivery keeps them aligned.
+    const serialize_t0 = monoNanos();
+    if (l.roster_dirty) {
+        if (buildRoster(l)) |frame| {
+            broadcastLobby(l, frame);
+            l.roster_dirty = false;
+        } else |_| {}
+    }
+    if (buildGameTick(l, now)) |frame| {
+        l.stats.wire_bytes = frame.len;
         broadcastLobby(l, frame);
     } else |_| {}
+    const serialize_ns: u64 = @intCast(@max(0, monoNanos() - serialize_t0));
+    l.stats.serialize_ns = serialize_ns;
+    l.stats.serialize_ns_total +%= serialize_ns;
 
     // stats
-    const dur_ms = @as(f64, @floatFromInt(std.time.nanoTimestamp() - t0)) / 1_000_000.0;
+    const dur_ms = @as(f64, @floatFromInt(monoNanos() - t0)) / 1_000_000.0;
     l.stats.last_tick_ms = dur_ms;
     l.stats.ticks += 1;
     const window: f64 = @floatFromInt(@min(l.stats.ticks, 200));
@@ -859,17 +934,13 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
 }
 
 fn tickAll() void {
-    var arena = std.heap.ArenaAllocator.init(galloc);
-    defer arena.deinit();
-    const aa = arena.allocator();
+    _ = tick_arena.reset(.retain_capacity);
+    const aa = tick_arena.allocator();
 
-    state_mtx.lock();
-    defer state_mtx.unlock();
-
-    const now = std.time.milliTimestamp();
+    const now = unixMillis();
 
     // reap idle non-default lobbies (60s with zero players)
-    var doomed: std.ArrayListUnmanaged([]u8) = .{};
+    var doomed: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (doomed.items) |dz| galloc.free(dz);
         doomed.deinit(galloc);
@@ -893,36 +964,16 @@ fn tickAll() void {
     }
 }
 
-fn tickerMain() void {
-    var next_ns = std.time.nanoTimestamp();
-    while (!shutting_down) {
-        next_ns += TICK_NS;
-        const now = std.time.nanoTimestamp();
-        if (next_ns > now) {
-            const delta: u64 = @intCast(next_ns - now);
-            std.time.sleep(delta);
-        } else {
-            next_ns = now; // fell behind; resync
-        }
-        tickAll();
-    }
-}
-
 // ------------------------------------------------------------------ http plumbing
 
-fn writeAllFd(fd: posix.fd_t, bytes: []const u8) !void {
-    var off: usize = 0;
-    while (off < bytes.len) {
-        const n = try posix.write(fd, bytes[off..]);
-        if (n == 0) return error.WriteFailed;
-        off += n;
-    }
-}
-
 fn pf(b: *Buf, aa: Allocator, comptime fmt: []const u8, args: anytype) !void {
-    const s = try std.fmt.allocPrint(aa, fmt, args);
-    defer aa.free(s);
-    try b.appendSlice(aa, s);
+    var scratch: [256]u8 = undefined;
+    const rendered = std.fmt.bufPrint(&scratch, fmt, args) catch {
+        const allocated = try std.fmt.allocPrint(aa, fmt, args);
+        defer aa.free(allocated);
+        return b.appendSlice(aa, allocated);
+    };
+    try b.appendSlice(aa, rendered);
 }
 
 const SendOpts = struct {
@@ -936,7 +987,7 @@ const SendOpts = struct {
 };
 
 fn sendResponse(c: *Conn, aa: Allocator, o: SendOpts) void {
-    var b: Buf = .{};
+    var b: Buf = .empty;
     defer b.deinit(aa);
     pf(&b, aa, "HTTP/1.1 {d} {s}" ++ CRLF, .{ o.status, o.reason }) catch return;
     b.appendSlice(aa, "X-Content-Type-Options: nosniff" ++ CRLF) catch return;
@@ -957,7 +1008,8 @@ fn sendResponse(c: *Conn, aa: Allocator, o: SendOpts) void {
     b.appendSlice(aa, conn_hdr) catch return;
     b.appendSlice(aa, CRLF) catch return;
     if (!o.head_only) b.appendSlice(aa, o.body) catch return;
-    writeAllFd(c.fd, b.items) catch {};
+    connQueueRaw(c, b.items);
+    if (!o.keep_alive) c.close_after_write = true;
 }
 
 const CRLF = "\r\n";
@@ -1031,18 +1083,18 @@ fn decodeInto(out: *Buf, aa: Allocator, s: []const u8, plus_as_space: bool) []co
 }
 
 fn percentDecode(aa: Allocator, s: []const u8) []const u8 {
-    var out: Buf = .{};
+    var out: Buf = .empty;
     return decodeInto(&out, aa, s, false);
 }
 
 fn formDecode(aa: Allocator, s: []const u8) []const u8 {
-    var out: Buf = .{};
+    var out: Buf = .empty;
     return decodeInto(&out, aa, s, true);
 }
 
 /// encodeURIComponent equivalent.
 fn uriEncodeComponent(aa: Allocator, s: []const u8) []const u8 {
-    var out: Buf = .{};
+    var out: Buf = .empty;
     for (s) |ch| {
         const safe = (ch >= 'A' and ch <= 'Z') or (ch >= 'a' and ch <= 'z') or (ch >= '0' and ch <= '9') or
             ch == '-' or ch == '_' or ch == '.' or ch == '!' or ch == '~' or ch == '*' or
@@ -1096,48 +1148,51 @@ fn extractJsonField(aa: Allocator, body: []const u8, name: []const u8) ?[]const 
 
 // ------------------------------------------------------------------ lobby ids
 
-fn writeBase36(w: anytype, v_in: u64) void {
+fn writeBase36(out: []u8, v_in: u64) usize {
     const digits = "0123456789abcdefghijklmnopqrstuvwxyz";
     var v = v_in;
     var tmp: [16]u8 = undefined;
     var n: usize = 0;
     if (v == 0) {
-        w.writeAll("0") catch {};
-        return;
+        out[0] = '0';
+        return 1;
     }
     while (v > 0) : (v /= 36) {
         tmp[n] = digits[@intCast(v % 36)];
         n += 1;
     }
+    const len = n;
+    var at: usize = 0;
     while (n > 0) {
         n -= 1;
-        w.writeAll(tmp[n .. n + 1]) catch {};
+        out[at] = tmp[n];
+        at += 1;
     }
+    return len;
 }
 
 /// Mirrors server/generateId.js: 'id-' + rand base36 (8 chars) + base36(now ms).
 fn genLobbyId(buf: *[48]u8) []const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
-    w.writeAll("id-") catch {};
+    @memcpy(buf[0..3], "id-");
     const alpha = "0123456789abcdefghijklmnopqrstuvwxyz";
     var i: usize = 0;
     while (i < 8) : (i += 1) {
         const r = rng_prng.random().uintLessThan(usize, alpha.len);
-        w.writeByte(alpha[r]) catch {};
+        buf[3 + i] = alpha[r];
     }
-    writeBase36(w, @intCast(std.time.milliTimestamp()));
-    return fbs.getWritten();
+    const suffix_len = writeBase36(buf[11..], @intCast(unixMillis()));
+    return buf[0 .. 11 + suffix_len];
 }
 
 // ------------------------------------------------------------------ stats
 
 fn readRssBytes() u64 {
     blk: {
-        const f = std.fs.openFileAbsolute("/proc/self/status", .{}) catch break :blk;
-        defer f.close();
+        const f = std.Io.Dir.openFileAbsolute(g_io, "/proc/self/status", .{}) catch break :blk;
+        defer f.close(g_io);
         var buf: [4096]u8 = undefined;
-        const n = f.read(&buf) catch break :blk;
+        var bufs = [1][]u8{&buf};
+        const n = f.readStreaming(g_io, &bufs) catch break :blk;
         var lines = std.mem.splitScalar(u8, buf[0..n], '\n');
         while (lines.next()) |line| {
             if (std.mem.startsWith(u8, line, "VmRSS:")) {
@@ -1149,10 +1204,11 @@ fn readRssBytes() u64 {
         }
     }
     blk2: {
-        const f = std.fs.openFileAbsolute("/proc/self/statm", .{}) catch break :blk2;
-        defer f.close();
+        const f = std.Io.Dir.openFileAbsolute(g_io, "/proc/self/statm", .{}) catch break :blk2;
+        defer f.close(g_io);
         var buf: [256]u8 = undefined;
-        const n = f.read(&buf) catch break :blk2;
+        var bufs = [1][]u8{&buf};
+        const n = f.readStreaming(g_io, &bufs) catch break :blk2;
         var it = std.mem.tokenizeScalar(u8, buf[0..n], ' ');
         _ = it.next() orelse break :blk2;
         const pages_str = it.next() orelse break :blk2;
@@ -1163,18 +1219,30 @@ fn readRssBytes() u64 {
 }
 
 fn buildStats(aa: Allocator) ![]u8 {
-    state_mtx.lock();
-    defer state_mtx.unlock();
-
-    var b: Buf = .{};
+    var b: Buf = .empty;
     errdefer b.deinit(aa);
     try b.appendSlice(aa, "{\"rss\":");
     try jnum(&b, aa, readRssBytes());
     try b.appendSlice(aa, ",\"uptime\":");
-    const uptime = @as(f64, @floatFromInt(std.time.milliTimestamp() - start_ms)) / 1000.0;
+    const uptime = @as(f64, @floatFromInt(unixMillis() - start_ms)) / 1000.0;
     try pf(&b, aa, "{d:.3}", .{uptime});
     try b.appendSlice(aa, ",\"totalPlayers\":");
     try jnum(&b, aa, totalPlayersLocked());
+    try b.appendSlice(aa, ",\"connections\":");
+    try jnum(&b, aa, connections.count());
+    try b.appendSlice(aa, ",\"networkBytesSent\":");
+    try jnum(&b, aa, network_bytes_sent);
+    try b.appendSlice(aa, ",\"networkBytesReceived\":");
+    try jnum(&b, aa, network_bytes_received);
+    try b.appendSlice(aa, ",\"websocketFramesSent\":");
+    try jnum(&b, aa, websocket_frames_sent);
+    try b.appendSlice(aa, ",\"websocketFramesReceived\":");
+    try jnum(&b, aa, websocket_frames_received);
+    try b.appendSlice(aa, ",\"inputEvents\":");
+    try jnum(&b, aa, input_events);
+    try b.appendSlice(aa, ",\"avgInputEventUs\":");
+    const avg_input_ns = if (input_events == 0) 0.0 else @as(f64, @floatFromInt(input_event_ns_total)) / @as(f64, @floatFromInt(input_events));
+    try pf(&b, aa, "{d:.3}", .{avg_input_ns / 1000.0});
     try b.appendSlice(aa, ",\"lobbies\":[");
     var first = true;
     for (lobbies.values()) |l| {
@@ -1197,6 +1265,13 @@ fn buildStats(aa: Allocator) ![]u8 {
         try pf(&b, aa, "{d:.1}", .{l.stats.avg_tick_ms});
         try b.appendSlice(aa, ",\"maxTickMs\":");
         try pf(&b, aa, "{d}", .{l.stats.max_tick_ms});
+        try b.appendSlice(aa, ",\"serializeUs\":");
+        try pf(&b, aa, "{d:.3}", .{@as(f64, @floatFromInt(l.stats.serialize_ns)) / 1000.0});
+        try b.appendSlice(aa, ",\"avgSerializeUs\":");
+        const avg_serialize_ns = if (l.stats.ticks == 0) 0.0 else @as(f64, @floatFromInt(l.stats.serialize_ns_total)) / @as(f64, @floatFromInt(l.stats.ticks));
+        try pf(&b, aa, "{d:.3}", .{avg_serialize_ns / 1000.0});
+        try b.appendSlice(aa, ",\"wireBytes\":");
+        try jnum(&b, aa, l.stats.wire_bytes);
         try b.append(aa, '}');
     }
     try b.appendSlice(aa, "]}");
@@ -1245,9 +1320,7 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
                 return sendNotFound(c, aa, keep_alive, head_only);
             }
             const gid = percentDecode(aa, raw_id);
-            state_mtx.lock();
             const exists = lobbies.contains(gid);
-            state_mtx.unlock();
             if (exists) {
                 return sendResponse(c, aa, .{ .status = 200, .reason = "OK", .ctype = "text/html; charset=utf-8", .body = assets.game_html, .keep_alive = keep_alive, .head_only = head_only });
             }
@@ -1283,22 +1356,18 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
     if (is_post) {
         if (std.mem.eql(u8, dec_path, "/generateid")) {
             var idbuf: [48]u8 = undefined;
-            state_mtx.lock();
             var new_id: []const u8 = undefined;
             while (true) {
                 new_id = genLobbyId(&idbuf);
                 if (!lobbies.contains(new_id)) break;
             }
             const owned = galloc.dupe(u8, new_id) catch {
-                state_mtx.unlock();
                 return sendServerError(c, aa);
             };
             _ = createLobbyLocked(owned) catch {
                 galloc.free(owned);
-                state_mtx.unlock();
                 return sendServerError(c, aa);
             };
-            state_mtx.unlock();
             const enc = uriEncodeComponent(aa, new_id);
             const loc = std.fmt.allocPrint(aa, "/game/{s}", .{enc}) catch "/";
             return sendRedirect(c, aa, 303, loc, keep_alive, false);
@@ -1312,9 +1381,7 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
             var loc: []const u8 = "/?error=unknown-game";
             if (game_id) |raw| {
                 const trimmed = jsTrim(raw);
-                state_mtx.lock();
                 const exists = lobbies.contains(trimmed);
-                state_mtx.unlock();
                 if (exists) {
                     const enc = uriEncodeComponent(aa, trimmed);
                     loc = std.fmt.allocPrint(aa, "/game/{s}", .{enc}) catch "/?error=unknown-game";
@@ -1346,10 +1413,10 @@ fn doUpgrade(c: *Conn, aa: Allocator, key: []const u8) bool {
         .{acc},
     ) catch return false;
     defer aa.free(resp);
-    writeAllFd(c.fd, resp) catch return false;
+    connQueueRaw(c, resp);
 
     var raw: [16]u8 = undefined;
-    std.crypto.random.bytes(&raw);
+    g_io.random(&raw);
     _ = std.base64.url_safe_no_pad.Encoder.encode(&c.sid, &raw);
 
     // engine.io open packet followed immediately by the merged socket.io
@@ -1365,7 +1432,63 @@ fn doUpgrade(c: *Conn, aa: Allocator, key: []const u8) bool {
     return true;
 }
 
+fn plainStringArray(text: []const u8, out: *[3][]const u8) ?usize {
+    var at: usize = 0;
+    while (at < text.len and std.ascii.isWhitespace(text[at])) at += 1;
+    if (at >= text.len or text[at] != '[') return null;
+    at += 1;
+    var count: usize = 0;
+    while (true) {
+        while (at < text.len and std.ascii.isWhitespace(text[at])) at += 1;
+        if (at < text.len and text[at] == ']') {
+            at += 1;
+            while (at < text.len and std.ascii.isWhitespace(text[at])) at += 1;
+            return if (at == text.len) count else null;
+        }
+        if (count == out.len or at >= text.len or text[at] != '"') return null;
+        at += 1;
+        const start = at;
+        while (at < text.len and text[at] != '"') : (at += 1) {
+            if (text[at] == '\\' or text[at] < 0x20) return null;
+        }
+        if (at >= text.len) return null;
+        out[count] = text[start..at];
+        count += 1;
+        at += 1;
+        while (at < text.len and std.ascii.isWhitespace(text[at])) at += 1;
+        if (at >= text.len) return null;
+        if (text[at] == ',') {
+            at += 1;
+            continue;
+        }
+        if (text[at] != ']') return null;
+    }
+}
+
+fn handleParsedEvent(c: *Conn, aa: Allocator, ev: []const u8, uname: ?[]const u8, lid: ?[]const u8) void {
+    if (std.mem.eql(u8, ev, "clientReady")) {
+        handleClientReady(c, aa, uname, lid);
+    } else if (std.mem.eql(u8, ev, "keyPress")) {
+        const value = uname orelse return;
+        const d = model.directionFromString(value) orelse return;
+        handleKeyPress(c, d);
+    }
+}
+
 fn handleSioEvent(c: *Conn, aa: Allocator, json_text: []const u8) !void {
+    const parse_t0 = monoNanos();
+    defer {
+        input_event_ns_total +%= @intCast(@max(0, monoNanos() - parse_t0));
+        input_events +%= 1;
+    }
+    var strings: [3][]const u8 = undefined;
+    if (plainStringArray(json_text, &strings)) |count| {
+        if (count == 0) return;
+        return handleParsedEvent(c, aa, strings[0], if (count > 1) strings[1] else null, if (count > 2) strings[2] else null);
+    }
+
+    // Escaped strings and non-string hostile payloads take the general parser;
+    // the overwhelmingly common input path above is allocation-free.
     var parsed = std.json.parseFromSlice(std.json.Value, aa, json_text, .{}) catch return;
     defer parsed.deinit();
     const root = parsed.value;
@@ -1384,11 +1507,10 @@ fn handleSioEvent(c: *Conn, aa: Allocator, json_text: []const u8) !void {
         if (items.len >= 3) {
             if (items[2] == .string) lid = items[2].string;
         }
-        handleClientReady(c, aa, uname, lid);
+        handleParsedEvent(c, aa, ev, uname, lid);
     } else if (std.mem.eql(u8, ev, "keyPress")) {
         if (items.len >= 2 and items[1] == .string) {
-            const d = model.directionFromString(items[1].string) orelse return;
-            handleKeyPress(c, d);
+            handleParsedEvent(c, aa, ev, items[1].string, null);
         }
     }
 }
@@ -1404,14 +1526,12 @@ fn handleEngineText(c: *Conn, aa: Allocator, payload: []const u8) !bool {
             switch (payload[1]) {
                 '0' => {}, // namespace connect: we auto-connect on upgrade
                 '1' => {
-                    state_mtx.lock();
                     if (c.player) |p| {
                         const l = c.lobby.?;
                         feedDeath(l, p, aa);
                         detachPlayer(l, p);
                         destroyPlayer(p);
                     }
-                    state_mtx.unlock();
                 },
                 '2' => try handleSioEvent(c, aa, payload[2..]),
                 else => {},
@@ -1428,7 +1548,7 @@ const WsResult = struct {
     closed: bool,
 };
 
-fn parseWsFrames(c: *Conn, aa: Allocator, data: []const u8, frag: *Buf, frag_op: *u8) !WsResult {
+fn parseWsFrames(c: *Conn, aa: Allocator, data: []u8, frag: *Buf, frag_op: *u8) !WsResult {
     var off: usize = 0;
     while (data.len - off >= 2) {
         const b0 = data[off];
@@ -1453,14 +1573,10 @@ fn parseWsFrames(c: *Conn, aa: Allocator, data: []const u8, frag: *Buf, frag_op:
         if (data.len - off < hdr_len + 4 + len) break;
         const key = data[off + hdr_len ..][0..4].*;
         const pstart = off + hdr_len + 4;
-        var payload: []const u8 = data[pstart .. pstart + len];
-        if (len > 0) {
-            const tmp = try aa.alloc(u8, len);
-            @memcpy(tmp, payload);
-            for (tmp, 0..) |*ch, i| ch.* ^= key[i & 3];
-            payload = tmp;
-        }
+        const payload = data[pstart .. pstart + len];
+        for (payload, 0..) |*ch, i| ch.* ^= key[i & 3];
         off += hdr_len + 4 + len;
+        websocket_frames_received +%= 1;
 
         switch (opcode) {
             0x1 => { // text
@@ -1481,11 +1597,10 @@ fn parseWsFrames(c: *Conn, aa: Allocator, data: []const u8, frag: *Buf, frag_op:
                 if (fin) {
                     const was_text = frag_op.* == 1;
                     frag_op.* = 0;
-                    const whole = aa.dupe(u8, frag.items) catch return error.OutOfMemory;
-                    frag.clearRetainingCapacity();
                     if (was_text) {
-                        if (try handleEngineText(c, aa, whole)) return .{ .consumed = off, .closed = true };
+                        if (try handleEngineText(c, aa, frag.items)) return .{ .consumed = off, .closed = true };
                     }
+                    frag.clearRetainingCapacity();
                 }
             },
             0x8 => { // close
@@ -1501,267 +1616,261 @@ fn parseWsFrames(c: *Conn, aa: Allocator, data: []const u8, frag: *Buf, frag_op:
     return .{ .consumed = off, .closed = false };
 }
 
-fn wsLoop(c: *Conn, leftover: []const u8) void {
-    var arena = std.heap.ArenaAllocator.init(galloc);
-    defer arena.deinit();
-
-    var input: Buf = .{};
-    defer input.deinit(galloc);
-    input.appendSlice(galloc, leftover) catch return;
-
-    var frag: Buf = .{};
-    defer frag.deinit(galloc);
-    var frag_op: u8 = 0;
-
-    var next_ping_ms = std.time.milliTimestamp() + PING_INTERVAL_MS;
-    var awaiting_pong_since: ?i64 = null;
-    var rbuf: [16 * 1024]u8 = undefined;
-
-    while (true) {
-        const now = std.time.milliTimestamp();
-        if (awaiting_pong_since) |ps| {
-            if (now - ps > PING_TIMEOUT_MS) return; // no pong within pingTimeout
-        }
-        if (now >= next_ping_ms) {
-            connEnqueueText(c, "2"); // server-initiated engine.io ping
-            awaiting_pong_since = now;
-            next_ping_ms = now + PING_INTERVAL_MS;
-        }
-        var wait_ms: i64 = next_ping_ms - now;
-        if (wait_ms > 60_000) wait_ms = 60_000;
-        if (awaiting_pong_since) |ps| {
-            const dl = ps + PING_TIMEOUT_MS - now;
-            if (dl < wait_ms) wait_ms = dl;
-        }
-        if (wait_ms < 0) wait_ms = 0;
-
-        var fds = [1]posix.pollfd{.{ .fd = c.fd, .events = posix.POLL.IN, .revents = 0 }};
-        const nready = posix.poll(&fds, @intCast(wait_ms)) catch return;
-        if (shutting_down) return;
-        if (nready == 0) continue;
-
-        const rn = posix.read(c.fd, &rbuf) catch return;
-        if (rn == 0) return; // TCP EOF
-        awaiting_pong_since = null; // inbound traffic proves liveness
-
-        input.appendSlice(galloc, rbuf[0..rn]) catch return;
-        if (input.items.len > MAX_WS_INPUT) return;
-
-        _ = arena.reset(.retain_capacity);
-        const res = parseWsFrames(c, arena.allocator(), input.items, &frag, &frag_op) catch return;
-        if (res.consumed > 0) {
-            std.mem.copyForwards(u8, input.items[0 .. input.items.len - res.consumed], input.items[res.consumed..]);
-            input.shrinkRetainingCapacity(input.items.len - res.consumed);
-        }
-        if (res.closed) return;
-    }
-}
-
 // ------------------------------------------------------- connection lifecycle
 
-const HttpReader = struct {
-    fd: posix.fd_t,
-    buf: [16 * 1024]u8 = undefined,
-    start: usize = 0,
-    end: usize = 0,
+fn consumeInput(c: *Conn, count: usize) void {
+    if (count == 0) return;
+    const remain = c.input.items.len - count;
+    std.mem.copyForwards(u8, c.input.items[0..remain], c.input.items[count..]);
+    c.input.shrinkRetainingCapacity(remain);
+}
 
-    fn bufferedSlice(r: *HttpReader) []const u8 {
-        return r.buf[r.start..r.end];
-    }
+fn processWsInput(c: *Conn, aa: Allocator) bool {
+    const result = parseWsFrames(c, aa, c.input.items, &c.fragment, &c.fragment_opcode) catch return false;
+    consumeInput(c, result.consumed);
+    if (result.closed) c.close_after_write = true;
+    return true;
+}
 
-    fn fill(r: *HttpReader) !void {
-        if (r.start == r.end) {
-            r.start = 0;
-            r.end = 0;
-        } else if (r.end == r.buf.len) {
-            std.mem.copyForwards(u8, r.buf[0..], r.buf[r.start..r.end]);
-            r.end -= r.start;
-            r.start = 0;
-        }
-        if (r.end == r.buf.len) return error.HeadTooLarge;
-        var fds = [1]posix.pollfd{.{ .fd = r.fd, .events = posix.POLL.IN, .revents = 0 }};
-        const n = posix.poll(&fds, HTTP_IDLE_MS) catch return error.Io;
-        if (n == 0) return error.Timeout;
-        const got = posix.read(r.fd, r.buf[r.end..]) catch return error.Io;
-        if (got == 0) return error.Eof;
-        r.end += got;
-    }
-
-    /// Reads a CRLF-terminated line. The returned slice borrows the internal
-    /// buffer when the line fits (usual case), otherwise lives in `aa`.
-    fn readLine(r: *HttpReader, aa: Allocator, max: usize) ![]const u8 {
-        var acc: Buf = .{};
-        while (true) {
-            if (r.start < r.end) {
-                const window = r.buf[r.start..r.end];
-                if (std.mem.indexOfScalar(u8, window, '\n')) |idx| {
-                    var piece = window[0..idx];
-                    r.start += idx + 1;
-                    if (piece.len > 0 and piece[piece.len - 1] == '\r') piece = piece[0 .. piece.len - 1];
-                    if (acc.items.len == 0) return piece;
-                    try acc.appendSlice(aa, piece);
-                    if (acc.items.len > max) return error.HeadTooLarge;
-                    return acc.items;
-                }
-                try acc.appendSlice(aa, window);
-                r.start = r.end;
-                if (acc.items.len > max) return error.HeadTooLarge;
-            }
-            try r.fill();
-        }
-    }
-
-    fn readExact(r: *HttpReader, aa: Allocator, n: usize) ![]const u8 {
-        const out = try aa.alloc(u8, n);
-        var got: usize = 0;
-        while (got < n) {
-            const avail = r.end - r.start;
-            if (avail > 0) {
-                const take = @min(avail, n - got);
-                @memcpy(out[got .. got + take], r.buf[r.start .. r.start + take]);
-                r.start += take;
-                got += take;
-            } else {
-                try r.fill();
-            }
-        }
-        return out;
-    }
-};
-
-const HttpOutcome = union(enum) {
-    closed,
-    upgraded: []const u8, // owned copy of pipelined websocket bytes, if any
-};
-
-fn serveHttp(c: *Conn, arena_ptr: *std.heap.ArenaAllocator) HttpOutcome {
-    var rdr = HttpReader{ .fd = c.fd };
-    while (true) {
-        _ = arena_ptr.reset(.retain_capacity);
-        const aa = arena_ptr.allocator();
-
-        const req_line = rdr.readLine(aa, MAX_HTTP_HEAD_LINE) catch return .closed;
-        const sp1 = std.mem.indexOfScalar(u8, req_line, ' ') orelse return .closed;
-        const sp2 = std.mem.lastIndexOfScalar(u8, req_line, ' ') orelse return .closed;
-        if (sp2 <= sp1 + 1) return .closed;
-        const method = req_line[0..sp1];
-        const target = req_line[sp1 + 1 .. sp2];
-        const version = req_line[sp2 + 1 ..];
-        if (!std.mem.startsWith(u8, version, "HTTP/")) return .closed;
-        const http10 = std.mem.eql(u8, version, "HTTP/1.0");
+fn processHttpInput(c: *Conn, aa: Allocator) bool {
+    while (c.mode == .http and !c.close_after_write) {
+        const head_at = std.mem.indexOf(u8, c.input.items, CRLF ++ CRLF) orelse {
+            return c.input.items.len <= MAX_HTTP_HEAD_LINE;
+        };
+        const head = c.input.items[0..head_at];
+        const request_line_end = std.mem.indexOf(u8, head, CRLF) orelse return false;
+        const request_line = head[0..request_line_end];
+        const sp1 = std.mem.indexOfScalar(u8, request_line, ' ') orelse return false;
+        const sp2 = std.mem.lastIndexOfScalar(u8, request_line, ' ') orelse return false;
+        if (sp2 <= sp1 + 1) return false;
+        const method = request_line[0..sp1];
+        const target = request_line[sp1 + 1 .. sp2];
+        const version = request_line[sp2 + 1 ..];
+        if (!std.mem.startsWith(u8, version, "HTTP/")) return false;
 
         var content_length: usize = 0;
-        var conn_close_hdr = false;
-        var conn_keep_hdr = false;
+        var connection_close = false;
+        var connection_keep = false;
         var upgrade_ws = false;
         var ws_key: []const u8 = "";
         var ws_version_ok = false;
         var body_is_json = false;
-        var bad = false;
-
-        var lines: usize = 0;
-        while (true) {
-            lines += 1;
-            if (lines > 200) return .closed;
-            const line = rdr.readLine(aa, MAX_HTTP_HEAD_LINE) catch return .closed;
-            if (line.len == 0) break;
+        var header_count: usize = 0;
+        var lines = std.mem.splitSequence(u8, head[request_line_end + CRLF.len ..], CRLF);
+        while (lines.next()) |line| {
+            header_count += 1;
+            if (header_count > 200) return false;
             const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
             const name = line[0..colon];
-            const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
             if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                content_length = std.fmt.parseInt(usize, val, 10) catch {
-                    bad = true;
-                    break;
-                };
+                content_length = std.fmt.parseInt(usize, value, 10) catch return false;
             } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
-                if (std.ascii.indexOfIgnoreCase(val, "close") != null) conn_close_hdr = true;
-                if (std.ascii.indexOfIgnoreCase(val, "keep-alive") != null) conn_keep_hdr = true;
+                connection_close = std.ascii.indexOfIgnoreCase(value, "close") != null;
+                connection_keep = std.ascii.indexOfIgnoreCase(value, "keep-alive") != null;
             } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
-                if (std.ascii.indexOfIgnoreCase(val, "websocket") != null) upgrade_ws = true;
+                upgrade_ws = std.ascii.indexOfIgnoreCase(value, "websocket") != null;
             } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
-                ws_key = val;
+                ws_key = value;
             } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
-                ws_version_ok = std.mem.eql(u8, val, "13");
+                ws_version_ok = std.mem.eql(u8, value, "13");
             } else if (std.ascii.eqlIgnoreCase(name, "content-type")) {
-                if (std.ascii.indexOfIgnoreCase(val, "application/json") != null) body_is_json = true;
+                body_is_json = std.ascii.indexOfIgnoreCase(value, "application/json") != null;
             }
         }
-        if (bad) {
-            sendResponse(c, aa, .{ .status = 400, .reason = "Bad Request", .ctype = "text/html; charset=utf-8", .body = "<html><body><h1>Bad Request</h1></body></html>", .keep_alive = false });
-            return .closed;
+
+        if (content_length > MAX_HTTP_BODY) {
+            sendResponse(c, aa, .{ .status = 413, .reason = "Payload Too Large", .ctype = "text/html; charset=utf-8", .body = "<html><body><h1>Payload Too Large</h1></body></html>", .keep_alive = false });
+            return true;
         }
+        const body_at = head_at + 2 * CRLF.len;
+        const request_len = body_at + content_length;
+        if (c.input.items.len < request_len) return true;
+        const body = c.input.items[body_at..request_len];
 
         if (upgrade_ws) {
             const qpos = std.mem.indexOfScalar(u8, target, '?');
-            const upath = if (qpos) |i| target[0..i] else target;
-            const uquery = if (qpos) |i| target[i + 1 ..] else "";
-            if (std.mem.startsWith(u8, upath, "/socket.io/") and
-                queryHasParam(uquery, "transport", "websocket") and
-                ws_key.len > 0 and ws_version_ok)
+            const path = if (qpos) |i| target[0..i] else target;
+            const query = if (qpos) |i| target[i + 1 ..] else "";
+            if (!std.mem.startsWith(u8, path, "/socket.io/") or
+                !queryHasParam(query, "transport", "websocket") or
+                ws_key.len == 0 or !ws_version_ok or !doUpgrade(c, aa, ws_key))
             {
-                if (!doUpgrade(c, aa, ws_key)) return .closed;
-                const left = galloc.dupe(u8, rdr.bufferedSlice()) catch return .closed;
-                return .{ .upgraded = left };
+                sendResponse(c, aa, .{ .status = 400, .reason = "Bad Request", .ctype = "text/plain; charset=utf-8", .body = "websocket upgrade rejected", .keep_alive = false });
+                return true;
             }
-            sendResponse(c, aa, .{ .status = 400, .reason = "Bad Request", .ctype = "text/plain; charset=utf-8", .body = "websocket upgrade rejected", .keep_alive = false });
-            return .closed;
+            consumeInput(c, request_len);
+            c.mode = .websocket;
+            c.next_ping_ms = unixMillis() + PING_INTERVAL_MS;
+            return processWsInput(c, aa);
         }
 
-        const keep_alive = if (http10) (conn_keep_hdr and !conn_close_hdr) else !conn_close_hdr;
-
-        var body: []const u8 = "";
-        if (content_length > 0) {
-            if (content_length > MAX_HTTP_BODY) {
-                sendResponse(c, aa, .{ .status = 413, .reason = "Payload Too Large", .ctype = "text/html; charset=utf-8", .body = "<html><body><h1>Payload Too Large</h1></body></html>", .keep_alive = false });
-                return .closed;
-            }
-            body = rdr.readExact(aa, content_length) catch return .closed;
-        }
-
+        const http10 = std.mem.eql(u8, version, "HTTP/1.0");
+        const keep_alive = if (http10) connection_keep and !connection_close else !connection_close;
         routeAndRespond(c, aa, method, target, body, body_is_json, keep_alive);
-        if (!keep_alive) return .closed;
+        consumeInput(c, request_len);
     }
+    return true;
 }
 
-fn readerMain(c: *Conn) void {
-    var arena = std.heap.ArenaAllocator.init(galloc);
-    defer arena.deinit();
-
-    switch (serveHttp(c, &arena)) {
-        .closed => {},
-        .upgraded => |leftover| {
-            wsLoop(c, leftover);
-            galloc.free(leftover);
-        },
+fn readAvailable(c: *Conn, aa: Allocator) bool {
+    var scratch: [16 * 1024]u8 = undefined;
+    while (true) {
+        const rc = linux.read(c.fd, &scratch, scratch.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => {
+                const count: usize = @intCast(rc);
+                if (count == 0) return false;
+                network_bytes_received +%= count;
+                c.awaiting_pong_since = null;
+                c.input.appendSlice(galloc, scratch[0..count]) catch return false;
+                if (c.input.items.len > MAX_WS_INPUT) return false;
+            },
+            .INTR => continue,
+            .AGAIN => break,
+            else => return false,
+        }
     }
-    teardownConn(c);
+    return switch (c.mode) {
+        .http => processHttpInput(c, aa),
+        .websocket => processWsInput(c, aa),
+    };
 }
 
 fn teardownConn(c: *Conn) void {
-    c.qmtx.lock();
+    if (c.closing) return;
     c.closing = true;
-    c.qcond.signal();
-    c.qmtx.unlock();
-    if (c.wr_thread) |t| t.join();
-    posix.close(c.fd);
+    _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_DEL, c.fd, null);
+    _ = connections.remove(c.fd);
+    closeFd(c.fd);
 
-    // SPEC: on socket close, remove the player and announce feed death.
     var arena = std.heap.ArenaAllocator.init(galloc);
     defer arena.deinit();
-    state_mtx.lock();
     if (c.player) |p| {
         const l = c.lobby.?;
         feedDeath(l, p, arena.allocator());
         detachPlayer(l, p);
         destroyPlayer(p);
     }
-    state_mtx.unlock();
 
-    c.qmtx.lock();
-    freeChunksLocked(c);
-    c.qmtx.unlock();
-    c.chunks.deinit(galloc);
+    c.input.deinit(galloc);
+    c.output.deinit(galloc);
+    c.fragment.deinit(galloc);
     galloc.destroy(c);
+}
+
+fn setNonBlocking(fd: posix.fd_t) bool {
+    const current = linux.fcntl(fd, linux.F.GETFL, 0);
+    if (linux.errno(current) != .SUCCESS) return false;
+    const rc = linux.fcntl(fd, linux.F.SETFL, current | linux.SOCK.NONBLOCK);
+    return linux.errno(rc) == .SUCCESS;
+}
+
+fn registerConn(fd: posix.fd_t) void {
+    setSockOpts(fd);
+    const c = galloc.create(Conn) catch {
+        closeFd(fd);
+        return;
+    };
+    c.* = .{ .fd = fd };
+    connections.put(galloc, fd, c) catch {
+        closeFd(fd);
+        galloc.destroy(c);
+        return;
+    };
+    var ev = linux.epoll_event{
+        .events = linux.EPOLL.IN | linux.EPOLL.RDHUP | linux.EPOLL.ET,
+        .data = .{ .ptr = @intFromPtr(c) },
+    };
+    const rc = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, fd, &ev);
+    if (linux.errno(rc) != .SUCCESS) teardownConn(c);
+}
+
+fn acceptReady() void {
+    var accepted: usize = 0;
+    while (accepted < 256) : (accepted += 1) {
+        const rc = linux.accept4(listen_fd, null, null, linux.SOCK.NONBLOCK | linux.SOCK.CLOEXEC);
+        switch (linux.errno(rc)) {
+            .SUCCESS => registerConn(@intCast(rc)),
+            .INTR => continue,
+            .AGAIN => return,
+            else => return,
+        }
+    }
+}
+
+fn serviceHeartbeats(now: i64, arena: Allocator) void {
+    var doomed: std.ArrayListUnmanaged(*Conn) = .empty;
+    defer doomed.deinit(arena);
+    var connection_it = connections.valueIterator();
+    while (connection_it.next()) |connection_ptr| {
+        const c = connection_ptr.*;
+        if (c.poisoned) {
+            doomed.append(arena, c) catch {};
+            continue;
+        }
+        if (c.mode != .websocket) continue;
+        if (c.awaiting_pong_since) |started| {
+            if (now - started > PING_TIMEOUT_MS) {
+                doomed.append(arena, c) catch {};
+                continue;
+            }
+        }
+        if (now >= c.next_ping_ms) {
+            connEnqueueText(c, "2");
+            c.awaiting_pong_since = now;
+            c.next_ping_ms = now + PING_INTERVAL_MS;
+        }
+    }
+    for (doomed.items) |c| teardownConn(c);
+}
+
+fn reactorLoop() void {
+    var events: [256]linux.epoll_event = undefined;
+    var arena = std.heap.ArenaAllocator.init(galloc);
+    defer arena.deinit();
+    var next_tick = monoNanos() + @as(i64, @intCast(TICK_NS));
+    var next_heartbeat = unixMillis() + 1000;
+
+    while (!shutting_down) {
+        const before_wait = monoNanos();
+        const wait_ns = @max(0, next_tick - before_wait);
+        const timeout_ms: i32 = @intCast(@min(1000, @divTrunc(wait_ns + std.time.ns_per_ms - 1, std.time.ns_per_ms)));
+        const rc = linux.epoll_wait(epoll_fd, &events, events.len, timeout_ms);
+        const ready: usize = switch (linux.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            .INTR => 0,
+            else => break,
+        };
+
+        _ = arena.reset(.retain_capacity);
+        const aa = arena.allocator();
+        for (events[0..ready]) |event| {
+            if (event.data.ptr == 0) {
+                acceptReady();
+                continue;
+            }
+            const c: *Conn = @ptrFromInt(event.data.ptr);
+            var alive = (event.events & (linux.EPOLL.ERR | linux.EPOLL.HUP | linux.EPOLL.RDHUP)) == 0;
+            if (alive and (event.events & linux.EPOLL.IN) != 0) alive = readAvailable(c, aa);
+            if (alive and (event.events & linux.EPOLL.OUT) != 0) alive = flushOutput(c);
+            if (alive and c.poisoned) alive = false;
+            if (alive and c.close_after_write and c.output.items.len == c.output_offset) alive = false;
+            if (!alive) teardownConn(c);
+        }
+
+        const now_ns = monoNanos();
+        if (now_ns >= next_tick) {
+            tickAll();
+            next_tick += @as(i64, @intCast(TICK_NS));
+            if (next_tick <= now_ns) next_tick = now_ns + @as(i64, @intCast(TICK_NS));
+        }
+        const now_ms = unixMillis();
+        if (now_ms >= next_heartbeat) {
+            serviceHeartbeats(now_ms, aa);
+            next_heartbeat = now_ms + 1000;
+        }
+    }
 }
 
 fn setSockOpts(fd: posix.fd_t) void {
@@ -1773,98 +1882,98 @@ fn setSockOpts(fd: posix.fd_t) void {
     posix.setsockopt(fd, 1, 20, &tvb) catch {};
 }
 
-fn spawnConnThreads(fd: posix.fd_t) void {
-    setSockOpts(fd);
-    const c = galloc.create(Conn) catch {
-        posix.close(fd);
-        return;
-    };
-    c.* = .{ .fd = fd };
-
-    const wt = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, writerMain, .{c}) catch {
-        posix.close(fd);
-        galloc.destroy(c);
-        return;
-    };
-    c.wr_thread = wt;
-
-    const rt = std.Thread.spawn(.{ .stack_size = 512 * 1024 }, readerMain, .{c}) catch {
-        c.qmtx.lock();
-        c.closing = true;
-        c.qcond.signal();
-        c.qmtx.unlock();
-        wt.join();
-        posix.close(fd);
-        c.chunks.deinit(galloc);
-        galloc.destroy(c);
-        return;
-    };
-    rt.detach();
-}
-
 // ------------------------------------------------------------------ signals / main
 
-fn onSignal(_: i32) callconv(.C) void {
+fn onSignal(_: posix.SIG) callconv(.c) void {
     shutting_down = true;
     if (listen_fd >= 0) {
-        posix.shutdown(listen_fd, .both) catch {};
+        _ = linux.shutdown(listen_fd, linux.SHUT.RDWR);
     }
 }
 
 fn installSignalHandlers() void {
     var ign = posix.Sigaction{
         .handler = .{ .handler = posix.SIG.IGN },
-        .mask = posix.empty_sigset,
+        .mask = posix.sigemptyset(),
         .flags = 0,
     };
-    posix.sigaction(posix.SIG.PIPE, &ign, null) catch {}; // writes to dead sockets must not kill us
+    posix.sigaction(posix.SIG.PIPE, &ign, null); // writes to dead sockets must not kill us
 
     var term = posix.Sigaction{
         .handler = .{ .handler = onSignal },
-        .mask = posix.empty_sigset,
+        .mask = posix.sigemptyset(),
         .flags = 0,
     };
-    posix.sigaction(posix.SIG.TERM, &term, null) catch {};
-    posix.sigaction(posix.SIG.INT, &term, null) catch {};
+    posix.sigaction(posix.SIG.TERM, &term, null);
+    posix.sigaction(posix.SIG.INT, &term, null);
 }
 
-pub fn main() !void {
-    debug_enabled = if (std.posix.getenv("SNEK_DEBUG")) |v| std.mem.eql(u8, v, "1") else false;
-    const port: u16 = if (std.posix.getenv("PORT")) |v| (std.fmt.parseInt(u16, v, 10) catch 3000) else 3000;
+pub fn main(init: std.process.Init) !void {
+    g_io = init.io;
+    galloc = init.gpa;
+    tick_arena = std.heap.ArenaAllocator.init(galloc);
+    debug_enabled = if (init.minimal.environ.getPosix("SNEK_DEBUG")) |v| std.mem.eql(u8, v, "1") else false;
+    const port: u16 = if (init.minimal.environ.getPosix("PORT")) |v| (std.fmt.parseInt(u16, v, 10) catch 3000) else 3000;
 
-    start_ms = std.time.milliTimestamp();
-    const seed: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
+    start_ms = unixMillis();
+    const seed: u64 = @bitCast(monoNanos());
     rng_prng = std.Random.DefaultPrng.init(seed ^ @as(u64, @intCast(std.os.linux.getpid())));
 
     installSignalHandlers();
 
-    state_mtx.lock();
     const def_id = galloc.dupe(u8, DEFAULT_LOBBY_ID) catch unreachable;
     _ = createLobbyLocked(def_id) catch unreachable;
-    state_mtx.unlock();
 
-    const addr = try std.net.Address.parseIp("0.0.0.0", port);
-    var srv = addr.listen(.{ .reuse_address = true }) catch |e| {
+    const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
+    const srv = addr.listen(g_io, .{ .reuse_address = true }) catch |e| {
         std.debug.print("server error: {s}\n", .{@errorName(e)});
         return e;
     };
-    listen_fd = srv.stream.handle;
-
-    const tk = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, tickerMain, .{});
-    tk.detach();
-
-    const stdout = std.io.getStdOut().writer();
-    var bout = std.io.bufferedWriter(stdout);
-    bout.writer().print("listening on *:{d}\n", .{port}) catch {};
-    bout.flush() catch {};
-
-    while (!shutting_down) {
-        const inc = srv.accept() catch {
-            if (shutting_down) break;
-            std.time.sleep(10 * std.time.ns_per_ms);
-            continue;
-        };
-        spawnConnThreads(inc.stream.handle);
+    listen_fd = srv.socket.handle;
+    if (!setNonBlocking(listen_fd)) return error.NonBlockingSetupFailed;
+    const epoll_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
+    if (linux.errno(epoll_rc) != .SUCCESS) return error.EpollCreateFailed;
+    epoll_fd = @intCast(epoll_rc);
+    var listen_event = linux.epoll_event{
+        .events = linux.EPOLL.IN,
+        .data = .{ .ptr = 0 },
+    };
+    if (linux.errno(linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_ADD, listen_fd, &listen_event)) != .SUCCESS) {
+        return error.EpollRegisterFailed;
     }
+
+    std.debug.print("listening on *:{d}\n", .{port});
+    reactorLoop();
     std.process.exit(0);
+}
+
+test "plain input parser accepts hot-path events and rejects malformed JSON" {
+    var values: [3][]const u8 = undefined;
+    const count = plainStringArray(" [ \"clientReady\" , \"player-one\" , \"12345\" ] ", &values);
+    try std.testing.expectEqual(@as(?usize, 3), count);
+    try std.testing.expectEqualStrings("clientReady", values[0]);
+    try std.testing.expectEqualStrings("player-one", values[1]);
+    try std.testing.expect(plainStringArray("[\"keyPress\",\"ArrowUp\"] trailing", &values) == null);
+    try std.testing.expect(plainStringArray("[\"keyPress\",42]", &values) == null);
+    try std.testing.expect(plainStringArray("[\"unterminated]", &values) == null);
+}
+
+test "compact roster and tick preserve world information" {
+    galloc = std.testing.allocator;
+    var connection = Conn{ .fd = -1 };
+    var player = Player{
+        .id = @constCast("sid"),
+        .name = @constCast("name"),
+        .color_hex = @constCast("#abcdef"),
+        .conn = &connection,
+    };
+    defer player.snake.deinit(galloc);
+    try player.snake.append(galloc, .{ .x = 32, .y = 48 });
+    var lobby = Lobby{ .id = @constCast("test"), .food = .{ .x = 0, .y = 0 } };
+    defer lobby.players.deinit(galloc);
+    defer lobby.wire.deinit(galloc);
+    try lobby.players.put(galloc, player.id, &player);
+
+    try std.testing.expectEqualStrings("42[\"r\",[[\"sid\",\"name\",\"#abcdef\"]]]", try buildRoster(&lobby));
+    try std.testing.expectEqualStrings("42[\"tick\",[[[0,1,[2,3]]],[],[],null]]", try buildGameTick(&lobby, 0));
 }

@@ -11,7 +11,7 @@ input and embedded into the binary with `@embedFile`.
     zig build-exe -O ReleaseFast -fstrip src/main.zig -femit-bin=snek-zig \
         --cache-dir .zig-cache --global-cache-dir .zig-global-cache
 
-(Zig 0.13.0. The cache flags keep build caches inside this folder.)
+(Use the newest installed Zig. The cache flags keep build caches inside this folder.)
 
 ## Run
 
@@ -22,9 +22,9 @@ input and embedded into the binary with `@embedFile`.
 
 ## Layout
 
-- `src/main.zig` — server: HTTP routing, websocket transport, game logic,
-  66.67ms ticker thread, thread-per-connection accept loop (reader thread +
-  per-connection outbound writer queue).
+- `src/main.zig` — single-threaded Linux epoll reactor, incremental HTTP and
+  WebSocket parsing, compact JSON protocol, HTTP routing, and game loop.
+- `src/model.zig` — cache-friendly game and connection state transitions.
 - `src/assets_manifest.zig` — comptime table of embedded public assets.
 - `src/generated/client/` — ignored build input staged from canonical `client/`.
 - `ws_smoke_test.js` — 3-bot smoke test (needs repo node_modules).

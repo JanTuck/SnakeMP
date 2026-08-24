@@ -1,55 +1,54 @@
 # SnakeMP
 
-SnakeMP is one multiplayer snake server implemented five ways against one
-observable protocol. Node is the reference implementation; Bun, Go, Rust, and
-Zig are independent ports that serve the same embedded browser client.
+SnakeMP is a multiplayer snake game with one canonical browser client and two
+maintained servers: an aggressively optimized Zig implementation and an
+idiomatic Go implementation. The previous Node.js, Bun, and Rust servers were
+retired after their benchmark history was preserved in `docs/BENCHMARKS.md`.
 
 ## Repository layout
 
 ```text
 client/       canonical browser client and vendored browser bundles
-docs/         protocol specification and benchmark report
+docs/         protocol specification and benchmark history
 servers/
-  node/       Socket.IO reference implementation
-  bun/        Bun HTTP/WebSocket implementation
-  go/         idiomatic net/http implementation
-  rust/       std TCP/WebSocket server with typed serde wire payloads
-  zig/        standard-library server pinned to Zig 0.13
-benchmarks/   parity, load, stress, metrics, and report tooling
+  go/         net/http implementation
+  zig/        Linux epoll implementation on the newest installed Zig
+benchmarks/   parity, wire-format, load, stress, and metrics tooling
 ```
 
-The client exists only once in source control. Go and Zig stage it into ignored
-generated directories before compiling because their embedding mechanisms do
-not permit files outside the package root. Rust embeds `client/` directly at
-compile time. Bun loads the shared tree into memory at startup. Node serves it
-from its canonical location.
+Go and Zig stage `client/` into ignored generated directories before compiling
+so there is only one tracked client source tree.
 
 ## Build and verify
 
-Install the root Node dependencies, Bun, Go, Rust, and Zig 0.13.0. Then run:
+The production Zig server has no Node.js dependency. Install Node.js only for
+the parity/load drivers, plus Go if you want to build the secondary server.
+The build uses the `zig` found on `PATH`; set `ZIG_BIN` only to select a newer
+installed binary.
 
 ```bash
+npm install
 npm run build
 npm run check
 npm run parity
 ```
 
-If Zig 0.13 is not your default `zig`, set `ZIG_BIN`:
+Run Zig directly with:
 
 ```bash
-ZIG_BIN=/path/to/zig-0.13.0/zig npm run build:zig
+bash servers/zig/build-assets.sh
+(cd servers/zig && zig build-exe -O ReleaseFast -fstrip src/main.zig \
+  -femit-bin=snek-zig --cache-dir .zig-cache --global-cache-dir .zig-global-cache)
+PORT=3000 SNEK_DEBUG=1 servers/zig/snek-zig
 ```
-
-`npm run parity` starts every release implementation in turn and runs the same
-black-box HTTP, Socket.IO, lifecycle, validation, isolation, and movement checks.
 
 ## Benchmark
 
 ```bash
-npm run build
-BENCH_REPETITIONS=3 bash benchmarks/run-benchmarks.sh node bun go rust zig
-node benchmarks/report.js node bun go rust zig
+node benchmarks/wire-format-bench.js
+BENCH_REPETITIONS=3 bash benchmarks/run-benchmarks.sh zig
 ```
 
-Raw results are written under ignored `.scratch/`; the checked-in methodology
-and latest results live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+Raw measurements are written beneath ignored `.scratch/`. The methodology,
+before/after measurements, and historical Bun comparison are in
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).

@@ -1,7 +1,8 @@
 
 // Smoke test: 3 bots join lobby '12345' over websocket-only socket.io v2,
-// steer around, and we verify all three appear together in gameTick payloads.
+// steer around, and verify all three appear together in world snapshots.
 const io = require('socket.io-client');
+const { attachWorld } = require('../../benchmarks/protocol');
 try { delete globalThis.WebSocket; } catch (e) {}
 
 const BASE = process.env.SMOKE_BASE || 'http://127.0.0.1:4213';
@@ -13,7 +14,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
     const bot = await new Promise((resolve, reject) => {
       const s = io(BASE, { transports: ['websocket'], forceNew: true });
       const w = { ticks: 0, lastWorld: null, allThreeSeenAt: -1 };
-      s.on('gameTick', (world) => {
+      attachWorld(s, (world) => {
         w.ticks += 1;
         w.lastWorld = world;
         if (w.allThreeSeenAt < 0 && world.players && world.players.length >= 3) {
@@ -42,7 +43,7 @@ const wait = (ms) => new Promise((r) => setTimeout(r, ms));
   await wait(900);
 
   const last = bots[0].w.lastWorld;
-  if (!last || !last.players) { console.log('SMOKE: FAIL (no gameTick observed)'); process.exit(1); }
+  if (!last || !last.players) { console.log('SMOKE: FAIL (no world snapshot observed)'); process.exit(1); }
   const names = last.players.map((p) => p.displayName).sort();
   const idsOk = last.players.every((p) => typeof p.id === 'string' && p.snake.length >= 1 && typeof p.score === 'number');
   console.log('players in final tick:', JSON.stringify(names));

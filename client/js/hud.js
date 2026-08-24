@@ -6,6 +6,7 @@ const G = () => window.gsap; // GSAP is optional juice; everything degrades fine
 
 let els = null;
 let myId = null;
+let lastSignature = '';
 const feedTimers = [];
 
 function feedText(item) {
@@ -55,6 +56,13 @@ export const Hud = {
     update(players, meId) {
         if (els === null) return;
         myId = meId;
+        let signature = meId;
+        for (let i = 0; i < players.length; i++) {
+            const p = players[i];
+            signature += `|${p.id}:${p.score}:${p.bodyLength}`;
+        }
+        if (signature === lastSignature) return;
+        lastSignature = signature;
         if (players.length > 0) {
             els.score.style.display = 'flex';
             els.board.style.display = 'block';

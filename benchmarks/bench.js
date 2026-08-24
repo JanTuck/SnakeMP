@@ -7,6 +7,7 @@ const path = require('path');
 const io = require('socket.io-client');
 const http = require('http');
 const fs = require('fs');
+const { attachWorld } = require('./protocol');
 
 const BASE = process.env.BENCH_BASE || 'http://127.0.0.1:4000';
 const NAME = process.env.BENCH_NAME || 'server';
@@ -50,19 +51,22 @@ function connect() {
   });
 }
 function makeObserver() {
-  const obs = { deltas: [], bytes: [], last: 0 };
+  const obs = { deltas: [], bytes: [], last: 0, decodeUs: [], worldHandlers: new Set() };
   obs.socket = io(BASE, { transports: ['websocket'], forceNew: true });
   const join = () => obs.socket.emit('clientReady', 'bench-observer', '12345');
   obs.socket.on('connect', join);
   // Bots wander into the stationary observer and kill it - rejoin so the
   // observer keeps receiving ticks.
   obs.socket.on('death', () => setTimeout(join, 300));
-  obs.socket.on('gameTick', (w) => {
+  attachWorld(obs.socket, (w, wireBytes) => {
     const now = Date.now();
     if (obs.last) obs.deltas.push(now - obs.last);
     obs.last = now;
-    obs.bytes.push(JSON.stringify(w).length);
-  });
+    obs.bytes.push(wireBytes);
+    for (const handler of obs.worldHandlers) handler(w);
+  }, obs.decodeUs);
+  obs.onWorld = (handler) => obs.worldHandlers.add(handler);
+  obs.offWorld = (handler) => obs.worldHandlers.delete(handler);
   return obs;
 }
 async function cadence(obs, ms) {
@@ -83,9 +87,9 @@ function makeBot(i, lobbyId) {
   s.on('connect', joinOnce);
   s.on('death', () => { state.alive = false; setTimeout(joinOnce, 400); });
   s.on('disconnect', () => { state.alive = false; });
-  s.on('gameTick', (world) => {
+  attachWorld(s, (world, wireBytes) => {
     state.packets++;
-    state.bytes += Buffer.byteLength(JSON.stringify(world));
+    state.bytes += wireBytes;
   });
   state.close = () => { clearInterval(walk); s.close(); };
   return state;
@@ -254,9 +258,9 @@ async function ensureLobbies(nLobbies) {
   for (let i = 0; i < 60 && latencies.length < 30; i++) {
     const dir = latencyDirections[i % latencyDirections.length];
     const before = await new Promise((r) => {
-      const h = (w) => { const me = (w.players || []).find(p => p.id === bot.id); if (me) { obs.socket.off('gameTick', h); r(me.snake[0]); } };
-      obs.socket.on('gameTick', h);
-      setTimeout(() => { obs.socket.off('gameTick', h); r(null); }, 500);
+      const h = (w) => { const me = (w.players || []).find(p => p.id === bot.id); if (me) { obs.offWorld(h); r(me.snake[0]); } };
+      obs.onWorld(h);
+      setTimeout(() => { obs.offWorld(h); r(null); }, 500);
     });
     if (!before) { await wait(200); continue; }
     const t0 = Date.now();
@@ -266,10 +270,10 @@ async function ensureLobbies(nLobbies) {
         const me = (w.players || []).find(p => p.id === bot.id);
         if (!me) return;
         const moved = dir === 'ArrowRight' ? me.snake[0].x > before.x : me.snake[0].x < before.x;
-        if (moved) { obs.socket.off('gameTick', h); r(Date.now() - t0); }
+        if (moved) { obs.offWorld(h); r(Date.now() - t0); }
       };
-      obs.socket.on('gameTick', h);
-      setTimeout(() => { obs.socket.off('gameTick', h); r(-1); }, 600);
+      obs.onWorld(h);
+      setTimeout(() => { obs.offWorld(h); r(-1); }, 600);
     });
     if (applied >= 0) latencies.push(applied);
     await wait(150);
@@ -319,6 +323,14 @@ async function ensureLobbies(nLobbies) {
     join: { avgMs: avg(joinLat), p50Ms: pct(joinLat, 0.50), p95Ms: pct(joinLat, 0.95), p99Ms: pct(joinLat, 0.99), fails: httpRuns.join.reduce((n, run) => n + run.fail, 0) },
   };
   console.log('F http: ' + JSON.stringify({ home: metrics.phases.http.home, join: metrics.phases.http.join }));
+
+  metrics.phases.protocolNormalizeUs = {
+    samples: obs.decodeUs.length,
+    avg: avg(obs.decodeUs),
+    p50: pct(obs.decodeUs, 0.50),
+    p95: pct(obs.decodeUs, 0.95),
+    p99: pct(obs.decodeUs, 0.99),
+  };
 
   metrics.rssEnd = (await getStats())?.rss ?? null;
   const alive = await get('/');

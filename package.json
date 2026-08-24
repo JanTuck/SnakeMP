@@ -3,29 +3,19 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "start": "node servers/node/app.js",
-    "build": "npm run build:bun && npm run build:go && npm run build:rust && npm run build:zig",
-    "build:bun": "bun build servers/bun/src/main.ts --outfile servers/bun/dist/main.min.js --target=bun --minify",
+    "start": "npm run build:zig && servers/zig/snek-zig",
+    "build": "npm run build:go && npm run build:zig",
     "build:go": "bash servers/go/build-assets.sh && cd servers/go && GOCACHE=$PWD/../../.scratch/.gocache go build -trimpath -ldflags='-s -w' -o snek-go .",
-    "build:rust": "cargo build --release --manifest-path servers/rust/Cargo.toml",
     "build:zig": "bash servers/zig/build-assets.sh && cd servers/zig && ${ZIG_BIN:-zig} build-exe -O ReleaseFast -fstrip src/main.zig -femit-bin=snek-zig --cache-dir .zig-cache --global-cache-dir .zig-global-cache",
-    "format": "gofmt -w servers/go/*.go && cargo fmt --manifest-path servers/rust/Cargo.toml && zig fmt servers/zig/src/*.zig",
-    "check": "npm run check:bun && npm run check:go && npm run check:rust && npm run check:zig",
-    "check:bun": "bun build servers/bun/src/main.ts --outfile /tmp/snek-bun-check.js --target=bun --minify",
+    "format": "gofmt -w servers/go/*.go && zig fmt servers/zig/src/*.zig",
+    "check": "npm run check:go && npm run check:zig",
     "check:go": "bash servers/go/build-assets.sh && cd servers/go && GOCACHE=$PWD/../../.scratch/.gocache go test ./... && GOCACHE=$PWD/../../.scratch/.gocache go vet ./...",
-    "check:rust": "cargo fmt --manifest-path servers/rust/Cargo.toml -- --check && cargo test --release --manifest-path servers/rust/Cargo.toml && cargo clippy --manifest-path servers/rust/Cargo.toml --all-targets --all-features -- -D warnings",
     "check:zig": "bash servers/zig/build-assets.sh && cd servers/zig && ${ZIG_BIN:-zig} fmt --check src/*.zig && ${ZIG_BIN:-zig} test src/main.zig --cache-dir .zig-cache --global-cache-dir .zig-global-cache",
     "parity": "bash benchmarks/run-parity.sh",
     "benchmark:build": "node benchmarks/build-release.js",
     "bench": "bash benchmarks/run-benchmarks.sh"
   },
   "dependencies": {
-    "express": "~4.17.3",
-    "gsap": "^3.15.0",
-    "http-errors": "~1.6.3",
-    "morgan": "~1.9.1",
-    "pug": "^3.0.2",
-    "rcolor": "^1.0.1",
-    "socket.io": "^2.5.0"
+    "socket.io-client": "2.5.0"
   }
 }

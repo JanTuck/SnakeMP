@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Full benchmark + stress suite for every Snek server implementation.
+# Full benchmark + stress suite for the maintained Snek servers.
 # Usage: ./benchmarks/run-benchmarks.sh <name> [<name> ...]
-#   names: node | zig | rust | go | bun
+#   names: zig | go
 # Results land in .scratch/results/<name>.* plus .scratch/{bench,stress}-<name>.json
 set -u
 cd "$(dirname "$0")/.."
@@ -10,7 +10,7 @@ ulimit -n 65535 2>/dev/null || true
 REPO="$(pwd)"
 
 if (( $# == 0 )); then
-  set -- node bun go rust zig
+  set -- go zig
 fi
 
 start_server() { # name port cmd...
@@ -64,22 +64,12 @@ size_report() { # name dir
   {
     echo "=== $name size report ==="
     bash "$REPO/benchmarks/collect-metrics.sh" "$dir" "$name" || true
-    if [ "$name" = "node" ]; then
-      echo "-- node server footprint: repo incl node_modules, excl .scratch and the port folders --"
-      du -sh "$REPO/servers/node" 2>/dev/null
-      echo "-- node_modules alone --"; du -sh "$REPO/node_modules" 2>/dev/null
-      echo "-- reference server LOC --"
-      wc -l "$REPO/servers/node/app.js" "$REPO"/servers/node/src/*.js | tail -1
-    fi
   } > ".scratch/results/$name.sizes.txt" 2>&1
 }
 
 for name in "$@"; do
   case "$name" in
-    node) run_suite node 4000 node "$REPO/servers/node/app.js"; size_report node "$REPO/servers/node" ;;
-    bun)  run_suite bun  4101 bun run "$REPO/servers/bun/dist/main.min.js"; size_report bun "$REPO/servers/bun" ;;
     go)   run_suite go   4102 "$REPO/servers/go/snek-go"; size_report go "$REPO/servers/go" ;;
-    rust) run_suite rust 4103 "$REPO/servers/rust/target/release/snek-rust"; size_report rust "$REPO/servers/rust" ;;
     zig)  run_suite zig  4104 "$REPO/servers/zig/snek-zig"; size_report zig "$REPO/servers/zig" ;;
     *) echo "unknown suite: $name" ;;
   esac

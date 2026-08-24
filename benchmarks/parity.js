@@ -4,6 +4,8 @@
  */
 const io = require('socket.io-client');
 const http = require('http');
+const net = require('net');
+const { attachWorld } = require('./protocol');
 
 // Node 22 ships a global WebSocket (undici) that engine.io-client prefers but
 // which fails the engine.io v3 handshake in some environments; hide it so the
@@ -35,11 +37,26 @@ function post(path, body, type) {
     req.end(payload);
   });
 }
+function rawParts(parts) {
+  const port = Number(new URL(BASE).port || 80);
+  return new Promise((resolve) => {
+    let response = '';
+    const socket = net.connect(port, '127.0.0.1');
+    const finish = () => { socket.destroy(); resolve(response); };
+    socket.setTimeout(1500, finish);
+    socket.on('data', (chunk) => { response += chunk.toString('utf8'); });
+    socket.on('error', finish);
+    socket.on('end', finish);
+    socket.on('connect', async () => {
+      for (const part of parts) { socket.write(part); await wait(10); }
+    });
+  });
+}
 function connect() {
   return new Promise((resolve, reject) => {
     const s = io(BASE, { transports: ['websocket'], forceNew: true });
     const events = [];
-    s.on('gameTick', (w) => events.push(w));
+    attachWorld(s, (w) => events.push(w));
     s.on('updateFood', (f) => events.push({ updateFood: f }));
     s.on('feed', (f) => events.push({ feed: f }));
     s.on('death', (sc) => events.push({ death: sc }));
@@ -95,6 +112,10 @@ const moved = (samples, axis, sign) => {
   check('GET /debug/stats JSON', stats.status === 200 && statsOk, statsEv);
   const hdrs = home.headers;
   check('security headers', String(hdrs['x-content-type-options']).toLowerCase() === 'nosniff' && String(hdrs['x-frame-options']).toLowerCase() === 'deny', JSON.stringify({ n: hdrs['x-content-type-options'], f: hdrs['x-frame-options'] }));
+  const partial = await rawParts(['GET / HTTP/1.1\r\nHo', 'st: 127.0.0.1\r\nConnection: close\r\n', '\r\n']);
+  check('partial HTTP request is assembled incrementally', partial.startsWith('HTTP/1.1 200'), partial.slice(0, 32));
+  await rawParts(['POST /joingame HTTP/1.1\r\nHost: x\r\nContent-Length: nope\r\n\r\n']);
+  check('malformed HTTP closes safely and server remains healthy', (await get('/')).status === 200);
 
   // ---- WS: join, init, movement, input semantics ----
   const a = await connect();

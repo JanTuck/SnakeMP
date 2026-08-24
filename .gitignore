@@ -8,6 +8,8 @@ target/
 zig-cache/
 .zig-cache/
 .zig-global-cache/
+.zig-cache-*/
+.zig-global-cache-*/
 zig-out/
 .gocache/
 server-zig/snek-zig
@@ -18,5 +20,6 @@ servers/go/internal/generated/
 servers/go/snek-go
 servers/zig/src/generated/
 servers/zig/snek-zig
+servers/zig/snek-zig-*
 *.o
 *.pdb

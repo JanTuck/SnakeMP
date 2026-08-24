@@ -1,7 +1,8 @@
 # Snek server specification (parity target)
 
-All implementations under `servers/` implement this spec. The reference is
-`servers/node/`. When in doubt, match observable behaviour, not implementation.
+The maintained implementations under `servers/` implement this observable
+protocol. Zig uses the compact v2 snapshot below; Go and the client retain
+legacy `gameTick` compatibility.
 
 ## Runtime model
 
@@ -67,7 +68,7 @@ All implementations under `servers/` implement this spec. The reference is
       bonus apples (cap 12 total), feed `drop-open`.
    g. apply one queued turn, then move (grow by consuming pendingGrowth
      instead of popping the tail).
-5. Broadcast `gameTick` (see wire format).
+5. Broadcast the world snapshot (see wire format).
 
 ## Growth model
 
@@ -95,12 +96,32 @@ Each tick: if pendingGrowth > 0, keep the tail (pendingGrowth--) else pop it.
 - Server MUST send `2` every pingInterval ms; any `3` from the client resets
   the timer. If no pong within pingTimeout, close the connection.
 - Server->client events (message frames `42["<event>",<args...>]`):
-  `init`, `gameTick`, `updateFood`, `death` (score), `game_error` (message),
+  `init`, `r`, `tick`, `updateFood`, `death` (score), `game_error` (message),
   `feed` ({type, who?, score?, apples?, points?}).
 - Client->server events: `clientReady` [username, lobbyId], `keyPress` [dir].
 - On socket close: remove the player, broadcast feed `death`.
 
-## gameTick payload
+## World snapshot payload
+
+Zig sends player identity metadata only after lobby membership changes:
+
+```text
+r = [[id, displayName, color], ...]
+```
+
+Each subsequent tick is aligned by player index with that roster. Coordinates
+are grid-cell integers; clients multiply them by the `init.scale` value (16).
+
+```text
+tick = [
+  [[score, bodyLength, [x, y, x, y, ...]], ...],
+  [bonusX, bonusY, ...],
+  [[dropId, x, y, ttlMs], ...],
+  [goldenX, goldenY, ttlMs] | null
+]
+```
+
+The client also accepts the legacy `gameTick` object used by Go:
 
 ```json
 {

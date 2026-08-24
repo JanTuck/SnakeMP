@@ -50,6 +50,7 @@ function finish() {
   running = false;
   const rss = samples.map((s) => s.rss).filter((v) => v > 0);
   const sum = rss.reduce((a, b) => a + b, 0);
+  const cpu = samples.slice(1).map((s) => s.cpuPct);
   const summary = {
     pid,
     samples: samples.length,
@@ -57,6 +58,7 @@ function finish() {
     rssMin: rss.length ? Math.min.apply(null, rss) : null,
     rssMax: rss.length ? Math.max.apply(null, rss) : null,
     rssAvg: rss.length ? Math.round(sum / rss.length) : null,
+    cpuAvgPct: cpu.length ? Math.round(cpu.reduce((a, b) => a + b, 0) / cpu.length * 100) / 100 : null,
     cpuPeakPct: samples.length ? Math.max.apply(null, samples.map((s) => s.cpuPct)) : null,
     threadsMax: samples.length ? Math.max.apply(null, samples.map((s) => s.threads)) : null,
     fdsMax: samples.length ? Math.max.apply(null, samples.map((s) => s.fds)) : null,
