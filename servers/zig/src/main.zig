@@ -568,14 +568,18 @@ fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
 /// Publish one immutable binary snapshot to a connection. All connections in
 /// the lobby reference the same payload under backpressure; fast writes retain
 /// no per-connection state at all.
-fn connEnqueueSharedFrame(c: *Conn, frame: *model.SharedFrame) void {
+const SharedFrameAccounting = struct {
+    bytes_sent: usize = 0,
+    frames_sent: usize = 0,
+};
+
+fn connEnqueueSharedFrame(c: *Conn, frame: *model.SharedFrame) SharedFrameAccounting {
     c.output_mutex.lockUncancelable(g_io);
     defer c.output_mutex.unlock(g_io);
-    if (c.closing or c.poisoned) return;
-    _ = websocket_frames_sent.fetchAdd(1, .monotonic);
+    if (c.closing or c.poisoned) return .{};
     if (!outputEmpty(c)) {
         _ = appendSharedOutput(c, frame, 0);
-        return;
+        return .{ .frames_sent = 1 };
     }
 
     const hlen: usize = frame.header_len;
@@ -588,18 +592,17 @@ fn connEnqueueSharedFrame(c: *Conn, frame: *model.SharedFrame) void {
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 const sent: usize = @intCast(rc);
-                _ = network_bytes_sent.fetchAdd(sent, .monotonic);
                 if (sent < frame.len()) _ = appendSharedOutput(c, frame, sent);
-                return;
+                return .{ .bytes_sent = sent, .frames_sent = 1 };
             },
             .INTR => continue,
             .AGAIN => {
                 _ = appendSharedOutput(c, frame, 0);
-                return;
+                return .{ .frames_sent = 1 };
             },
             else => {
                 c.poisoned = true;
-                return;
+                return .{};
             },
         }
     }
@@ -711,13 +714,20 @@ fn recoverySnapshot(
 fn broadcastBinarySnapshot(l: *Lobby, frame: *model.SharedFrame, now: i64, sequence: u16) void {
     var cached_recovery: ?*model.SharedFrame = null;
     defer if (cached_recovery) |recovery| releaseSharedFrame(recovery);
+    var accounting: SharedFrameAccounting = .{};
+    defer {
+        if (accounting.bytes_sent != 0) _ = network_bytes_sent.fetchAdd(accounting.bytes_sent, .monotonic);
+        if (accounting.frames_sent != 0) _ = websocket_frames_sent.fetchAdd(accounting.frames_sent, .monotonic);
+    }
 
     for (l.players.values()) |player| {
         const c = player.conn;
         if (c.snapshot_hidden.load(.acquire)) {
             if (c.next_background_snapshot_ms.load(.acquire) > now) continue;
             const recovery = recoverySnapshot(l, frame, now, sequence, &cached_recovery) orelse continue;
-            connEnqueueSharedFrame(c, recovery);
+            const sent = connEnqueueSharedFrame(c, recovery);
+            accounting.bytes_sent += sent.bytes_sent;
+            accounting.frames_sent += sent.frames_sent;
             c.next_background_snapshot_ms.store(nextBackgroundSnapshot(now), .release);
             continue;
         }
@@ -727,9 +737,13 @@ fn broadcastBinarySnapshot(l: *Lobby, frame: *model.SharedFrame, now: i64, seque
                 c.snapshot_needs_keyframe.store(true, .release);
                 continue;
             };
-            connEnqueueSharedFrame(c, recovery);
+            const sent = connEnqueueSharedFrame(c, recovery);
+            accounting.bytes_sent += sent.bytes_sent;
+            accounting.frames_sent += sent.frames_sent;
         } else {
-            connEnqueueSharedFrame(c, frame);
+            const sent = connEnqueueSharedFrame(c, frame);
+            accounting.bytes_sent += sent.bytes_sent;
+            accounting.frames_sent += sent.frames_sent;
         }
     }
 }
