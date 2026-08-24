@@ -16,7 +16,7 @@ const assert = require('node:assert/strict');
 // docs/BENCHMARKS.md. Its 29.40 B periodic-stream mean consists of a 215 B
 // keyframe every 30 frames and 23 B dependent deltas.
 const DEFAULT_SAMPLES = [
-  { name: 'v4-16-player-18-cell', deltaBytes: 23, keyframeBytes: 215 },
+  { name: 'v5-16-player-18-cell', deltaBytes: 23, keyframeBytes: 215 },
 ];
 
 function finitePositive(name, raw, fallback) {

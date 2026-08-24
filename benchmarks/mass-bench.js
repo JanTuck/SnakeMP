@@ -4,8 +4,8 @@
  *   MASS_BASE=http://127.0.0.1:4900 MASS_SERVER_PID=<pid> \
  *     node benchmarks/mass-bench.js
  *
- * The server must run with SNEK_DEBUG=1 and a sufficiently high
- * SNEK_MAX_PLAYERS. Results are written to .scratch/mass-zig.json.
+ * The server must run with SNEK_DEBUG=1. Results are written to
+ * .scratch/mass-zig.json.
  */
 const childProcess = require('child_process');
 const fs = require('fs');
@@ -14,7 +14,7 @@ const path = require('path');
 
 const BASE = process.env.MASS_BASE || 'http://127.0.0.1:4900';
 const SERVER_PID = Number(process.env.MASS_SERVER_PID || 0);
-const LEVELS = String(process.env.MASS_LEVELS || '1000,3000,6000,9000,12000').split(',').map(Number).filter(Boolean);
+const LEVELS = String(process.env.MASS_LEVELS || '5,10,20,32').split(',').map(Number).filter(Boolean);
 const WORKERS = Math.max(1, Number(process.env.MASS_CLIENT_WORKERS || 8));
 const PER_LOBBY = Math.max(1, Number(process.env.MASS_PLAYERS_PER_LOBBY || 16));
 const WARMUP_MS = Math.max(1000, Number(process.env.MASS_WARMUP_MS || 3000));
@@ -310,10 +310,21 @@ function closeClients() {
   if (!procSnapshot()) throw new Error('MASS_SERVER_PID does not identify a readable running process');
   const initialServer = await stats();
   if (initialServer.totalPlayers !== 0) throw new Error('benchmark server must start with zero players');
+  const serverPlayerCap = Math.min(32, initialServer.maxPlayers);
+  if (!Number.isSafeInteger(serverPlayerCap) || serverPlayerCap < 1) {
+    throw new Error('debug stats returned an invalid maxPlayers capacity');
+  }
+  if (LEVELS.some((level) => level > serverPlayerCap)) {
+    throw new Error('MASS_LEVELS exceeds the server player cap of ' + serverPlayerCap);
+  }
+  if (!Number.isSafeInteger(PER_LOBBY) || PER_LOBBY > Math.min(32, initialServer.maxPlayersPerLobby)) {
+    throw new Error('MASS_PLAYERS_PER_LOBBY exceeds the server lobby cap of ' + Math.min(32, initialServer.maxPlayersPerLobby));
+  }
   const output = {
     schemaVersion: 2,
     base: BASE,
     serverPid: SERVER_PID,
+    serverPlayerCap,
     levels: LEVELS,
     clientWorkers: WORKERS,
     playersPerLobby: PER_LOBBY,

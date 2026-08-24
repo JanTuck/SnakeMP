@@ -16,6 +16,15 @@ const NAME = process.env.STRESS_NAME || 'server';
 const CRLF = String.fromCharCode(13, 10);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0; };
+function alphaId(value) {
+  let remaining = value;
+  let encoded = '';
+  do {
+    encoded = String.fromCharCode(97 + (remaining % 26)) + encoded;
+    remaining = Math.floor(remaining / 26);
+  } while (remaining > 0);
+  return encoded;
+}
 const validityChecks = [];
 function checkValidity(name, passed, detail) {
   validityChecks.push({ name, passed: Boolean(passed), detail });
@@ -102,7 +111,7 @@ function rawSocket(port, payload) {
   await wait(700);
 
   // S0: cap enforcement — concentrate 120 join attempts in one fresh lobby so
-  // the configured per-lobby cap is actually crossed (the default is 16).
+  // the configured per-lobby/global cap is actually crossed.
   {
     const generated = await post('/generateid');
     const lobby = generated.location ? decodeURIComponent(String(generated.location).split('/').pop()) : null;
@@ -112,7 +121,7 @@ function rawSocket(port, payload) {
       const s = await connectOnce();
       if (!s) { connectFailed++; continue; }
       socks.push(s);
-      const outcome = lobby ? await joinOnce(s, 'cap-bot-' + i, lobby, 3000) : 'timeout';
+      const outcome = lobby ? await joinOnce(s, 'capbot' + alphaId(i), lobby, 3000) : 'timeout';
       if (outcome === 'init') joined++;
       else if (outcome === 'game_error') rejected++;
       else timedOut++;
@@ -230,7 +239,7 @@ function rawSocket(port, payload) {
     for (let i = 0; i < 12; i++) {
       const s = await connectOnce();
       if (!s) { joinFailures++; continue; }
-      const outcome = await joinOnce(s, 'slow-bot-' + i, '12345', 3000);
+      const outcome = await joinOnce(s, 'slowbot' + alphaId(i), '12345', 3000);
       if (outcome === 'init') bots.push(s);
       else { joinFailures++; try { s.close(); } catch (e) {} }
     }

@@ -27,6 +27,7 @@
 
     let enabled = false;
     let open = false;
+    let scrollPending = false;
     const messages = [];
     let roster = new Map();
 
@@ -96,6 +97,15 @@
         history.scrollTop = history.scrollHeight;
     }
 
+    function scheduleScrollToLatest() {
+        if (scrollPending) return;
+        scrollPending = true;
+        requestAnimationFrame(() => {
+            scrollPending = false;
+            scrollToLatest();
+        });
+    }
+
     function setOpen(nextOpen) {
         if (nextOpen && !enabled) return;
         open = nextOpen;
@@ -103,7 +113,7 @@
         openButton.setAttribute('aria-expanded', open ? 'true' : 'false');
         if (open) {
             input.focus({ preventScroll: true });
-            requestAnimationFrame(scrollToLatest);
+            scheduleScrollToLatest();
         } else if (document.activeElement === input) {
             input.blur();
         }
@@ -147,7 +157,7 @@
             clearTimeout(removed.hideTimer);
             removed.element.remove();
         }
-        if (open) requestAnimationFrame(scrollToLatest);
+        if (open) scheduleScrollToLatest();
     }
 
     socket.on('init', () => {
@@ -174,6 +184,11 @@
         if (socket.emit('chat', message)) {
             input.value = '';
             status.textContent = 'Message sent.';
+            // Match the familiar in-game chat loop: Enter sends, closes chat,
+            // and immediately returns the keyboard to steering. Recent
+            // messages remain visible in the lightweight feed above the
+            // persistent Chat button.
+            setOpen(false);
         } else {
             status.textContent = 'Chat is offline. Reconnect and try again.';
         }

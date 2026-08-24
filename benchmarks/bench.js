@@ -29,6 +29,7 @@ function positiveIntegerEnv(name, fallback) {
 const REPETITIONS = positiveIntegerEnv('BENCH_REPETITIONS', 3);
 const WARMUP_MS = positiveNumberEnv('BENCH_WARMUP_MS', 5000);
 const SAMPLE_MS = positiveNumberEnv('BENCH_SAMPLE_MS', 6000);
+const DEFAULT_RAMP_LEVELS = [5, 10, 20];
 const wait = (ms) => new Promise(r => setTimeout(r, ms));
 const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0; };
 const avg = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
@@ -82,6 +83,20 @@ function connect() {
     s.on('connect_error', (e) => { clearTimeout(t); s.close(); reject(new Error('connect_error')); });
   });
 }
+function alphaId(value) {
+  let remaining = value;
+  let encoded = '';
+  do {
+    encoded = String.fromCharCode(97 + (remaining % 26)) + encoded;
+    remaining = Math.floor(remaining / 26);
+  } while (remaining > 0);
+  return encoded;
+}
+function rampLevelsForCapacity(availablePlayers) {
+  const candidates = [...DEFAULT_RAMP_LEVELS, availablePlayers];
+  return [...new Set(candidates.filter((count) => Number.isSafeInteger(count) && count > 0 && count <= availablePlayers))]
+    .sort((left, right) => left - right);
+}
 function makeObserver() {
   const obs = { deltas: [], bytes: [], last: 0, decodeUs: [], worldHandlers: new Set() };
   obs.socket = io(BASE, { transports: ['websocket'], forceNew: true });
@@ -110,7 +125,10 @@ function makeBot(i, lobbyId) {
   const state = { alive: false, packets: 0, bytes: 0 };
   const s = io(BASE, { transports: ['websocket'], forceNew: true });
   state.socket = s;
-  const joinOnce = () => { s.emit('clientReady', 'bot-' + i + '-' + (Date.now() % 100000), lobbyId || '12345'); state.alive = true; };
+  // Benchmark identities must obey the same production name contract as real
+  // players. Letter-only deterministic names keep large ramps valid without
+  // spending the four-character non-letter allowance on counters/timestamps.
+  const joinOnce = () => { s.emit('clientReady', 'bot' + alphaId(i), lobbyId || '12345'); state.alive = true; };
   const walk = setInterval(() => {
     if (!state.alive) return;
     const dirs = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
@@ -224,7 +242,10 @@ function validateMeasurements() {
       `connection repetition ${index + 1} has invalid timing measurements`);
   }
 
-  for (const count of [5, 10, 20, 40, 80]) {
+  const rampLevels = metrics.methodology.rampLevels;
+  assert(Array.isArray(rampLevels) && rampLevels.length > 0,
+    'load ramp has no capacity-valid stages');
+  for (const count of (rampLevels || [])) {
     const runs = metrics.phases.ramp?.[count]?.runs;
     assert(Array.isArray(runs) && runs.length === REPETITIONS,
       `ramp ${count} did not record every repetition`);
@@ -238,6 +259,8 @@ function validateMeasurements() {
       assert(finiteNonNegative(run.clientCpuPct), `${label} has an invalid client CPU measurement`);
       assert(finiteNonNegative(run.players) && finitePositive(run.rss) && Array.isArray(run.lobbies),
         `${label} has missing or malformed debug stats`);
+      assert(run.players === run.expectedPlayers,
+        `${label} joined ${run.players} players; expected ${run.expectedPlayers}`);
     }
   }
 
@@ -292,11 +315,37 @@ async function ensureLobbies(nLobbies) {
 }
 
 (async () => {
-  metrics.rssStart = (await getStats())?.rss ?? null;
-  metrics.phases.idle = { stats: await getStats() };
+  const initialStats = await getStats();
+  if (!Number.isSafeInteger(initialStats.maxPlayers) || initialStats.maxPlayers < 2) {
+    throw new Error('/debug/stats returned an unusable maxPlayers capacity');
+  }
+  if (!Number.isSafeInteger(initialStats.maxPlayersPerLobby) || initialStats.maxPlayersPerLobby < 2) {
+    throw new Error('/debug/stats returned an unusable maxPlayersPerLobby capacity');
+  }
+  if (initialStats.totalPlayers !== 0) {
+    throw new Error('benchmark server must start with zero retained players; found ' + initialStats.totalPlayers);
+  }
+  metrics.rssStart = initialStats.rss ?? null;
+  metrics.phases.idle = { stats: initialStats };
   const obs = makeObserver();
   await new Promise((r, j) => { obs.socket.on('connect', r); obs.socket.on('connect_error', j); obs.socket.on('disconnect', () => {}); });
   await wait(WARMUP_MS); // identical runtime/JIT warm-up for every implementation
+  const capacityStats = await getStats();
+  const observerPlayers = capacityStats.totalPlayers;
+  if (observerPlayers !== 1) throw new Error('benchmark observer did not claim exactly one player slot');
+  const serverPlayerCap = Math.min(32, capacityStats.maxPlayers);
+  const availablePlayers = serverPlayerCap - observerPlayers;
+  const rampLevels = rampLevelsForCapacity(availablePlayers);
+  if (!rampLevels.length) throw new Error('server has no player capacity left for a load ramp');
+  const lobbyCapacity = Math.min(16, capacityStats.maxPlayersPerLobby);
+  metrics.methodology.rampLevels = rampLevels;
+  metrics.methodology.rampCapacity = {
+    reportedMaxPlayers: capacityStats.maxPlayers,
+    enforcedBenchmarkCap: serverPlayerCap,
+    observerPlayers,
+    availableBotSlots: availablePlayers,
+    lobbyCapacity,
+  };
 
   // A: baseline cadence
   const baselineRuns = [];
@@ -326,12 +375,20 @@ async function ensureLobbies(nLobbies) {
 
   // B: load ramp
   metrics.phases.ramp = {};
-  for (const N of [5, 10, 20, 40, 80]) {
+  for (const N of rampLevels) {
     const runs = [];
     for (let rep = 0; rep < REPETITIONS; rep++) {
-      const lobbies = await ensureLobbies(Math.ceil((N + 1) / 16));
+      const lobbies = await ensureLobbies(Math.ceil((N + observerPlayers) / lobbyCapacity));
+      if (lobbies.length < Math.ceil((N + observerPlayers) / lobbyCapacity)) {
+        throw new Error('could not create enough lobbies for the ' + N + '-bot ramp');
+      }
       const bots = [];
-      for (let i = 0; i < N; i++) bots.push(makeBot(i + N * 1000 + rep * 100000, lobbies[i % lobbies.length]));
+      // Slot zero belongs to the observer. Fill each lobby only to the
+      // production default capacity before moving to the next one.
+      for (let i = 0; i < N; i++) {
+        const lobbyIndex = Math.floor((i + observerPlayers) / lobbyCapacity);
+        bots.push(makeBot(i + N * 1000 + rep * 100000, lobbies[lobbyIndex]));
+      }
       await wait(WARMUP_MS);
       const packetStart = bots.reduce((sum, bot) => sum + bot.packets, 0);
       const byteStart = bots.reduce((sum, bot) => sum + bot.bytes, 0);
@@ -350,6 +407,7 @@ async function ensureLobbies(nLobbies) {
         byteRate: bytes / (elapsedMs / 1000),
         clientCpuPct: clientCpu(cpuStart, elapsedMs),
         players: st?.totalPlayers ?? null,
+        expectedPlayers: N + observerPlayers,
         rss: st?.rss ?? null,
         lobbies: st?.lobbies ?? null,
       });
@@ -414,7 +472,7 @@ async function ensureLobbies(nLobbies) {
   const rssBeforeChurn = (await getStats())?.rss ?? null;
   let churnFails = 0;
   for (let i = 0; i < 30; i++) {
-    try { const s = await connect(); s.emit('clientReady', 'churn-' + i, '12345'); await wait(50); s.close(); } catch (e) { churnFails++; }
+    try { const s = await connect(); s.emit('clientReady', 'churn' + alphaId(i), '12345'); await wait(50); s.close(); } catch (e) { churnFails++; }
   }
   await wait(2000);
   metrics.phases.churn = { fails: churnFails, rssAfter: (await getStats())?.rss ?? null, rssBefore: rssBeforeChurn };

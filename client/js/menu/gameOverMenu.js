@@ -46,8 +46,11 @@ export default class GameOverMenu extends Menu {
         const overlay = document.createElement("section");
         overlay.className = `game-over-overlay${this.compact ? " is-spectating is-replay" : ""}`;
         overlay.dataset.gameOverOverlay = "";
-        overlay.setAttribute("role", this.compact ? "region" : "dialog");
-        if (!this.compact) overlay.setAttribute("aria-modal", "true");
+        // Chat remains a live peer control after death, so this cannot be an
+        // aria-modal dialog: a modal would tell assistive technology that the
+        // still-visible Chat button is unreachable. The strong visual overlay
+        // remains, while Retry and Chat stay in the normal keyboard order.
+        overlay.setAttribute("role", "region");
         overlay.setAttribute("aria-labelledby", "game_over_title");
         overlay.setAttribute("aria-describedby", "game_over_context");
 

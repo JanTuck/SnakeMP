@@ -503,6 +503,10 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
     counter-increment: rank;
 }
 
+/* Author display rules override the browser's default [hidden] rule. Keep
+   vacated leaderboard rows out of layout when the live roster shrinks. */
+.hud-rows li[hidden] { display: none !important; }
+
 .hud-rows li::before {
     content: counter(rank);
     color: #77736e;

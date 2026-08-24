@@ -5,6 +5,51 @@ const HEADING_VECTOR = Object.freeze({
     ArrowUp: Object.freeze([0, -1])
 });
 
+// Keep remote presentation time independent from packet-arrival jitter. The
+// server still advances at 15 Hz; this clock merely lets requestAnimationFrame
+// distribute each authoritative cell step evenly across the display refreshes.
+export class RemoteInterpolationClock {
+    constructor(tickMs, maxExtrapolation = 0.35) {
+        this.tickMs = tickMs;
+        this.maxExtrapolation = maxExtrapolation;
+        this.reset();
+    }
+
+    reset() {
+        this.sequence = null;
+        this.baseAt = 0;
+        this.baseProgress = 1;
+        this.running = false;
+    }
+
+    progress(now) {
+        if (!this.running) return 1;
+        const elapsed = Math.max(0, now - this.baseAt);
+        return Math.max(-1, Math.min(1 + this.maxExtrapolation,
+            this.baseProgress + elapsed / this.tickMs));
+    }
+
+    snapshot(now, sequence) {
+        const adjacent = this.sequence !== null &&
+            sequence === ((this.sequence + 1) & 0xffff);
+        if (!adjacent) {
+            // First and recovery keyframes are already complete states. Show
+            // them immediately and wait for one adjacent update before moving.
+            this.baseProgress = 1;
+            this.running = false;
+        } else {
+            // Advancing the authoritative endpoints changes the interpolation
+            // basis by exactly one tick. Subtracting one preserves the current
+            // straight-line screen position instead of resetting to zero at a
+            // jittery packet-arrival boundary.
+            this.baseProgress = this.progress(now) - 1;
+            this.running = true;
+        }
+        this.baseAt = now;
+        this.sequence = sequence;
+    }
+}
+
 export default class Snake {
     constructor(ctx, meta) {
         this.scale = 16;

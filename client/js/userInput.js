@@ -29,7 +29,8 @@ let gameplayEnabled = false;
 
 function isEditingTarget(target) {
     const tag = target && typeof target.tagName === "string" ? target.tagName.toUpperCase() : "";
-    return Boolean((target && target.isContentEditable) || tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT");
+    return Boolean((target && target.isContentEditable) || tag === "INPUT" || tag === "TEXTAREA" ||
+        tag === "SELECT" || tag === "BUTTON" || tag === "A");
 }
 
 function emitBoost(active) {

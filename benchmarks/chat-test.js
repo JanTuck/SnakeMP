@@ -105,12 +105,19 @@ const socket = {
   emit(...args) { emitted.push(args); return sendResult; },
 };
 const timers = [];
+const activeTimers = new Set();
+const animationFrames = [];
 const source = fs.readFileSync('client/js/chat.js', 'utf8');
 vm.runInNewContext(source, {
   document, socket, TextEncoder,
-  requestAnimationFrame(callback) { callback(); },
-  setTimeout(callback, delay) { timers.push({ callback, delay }); return timers.length; },
-  clearTimeout() {},
+  requestAnimationFrame(callback) { animationFrames.push(callback); return animationFrames.length; },
+  setTimeout(callback, delay) {
+    const id = timers.length + 1;
+    timers.push({ id, callback, delay });
+    activeTimers.add(id);
+    return id;
+  },
+  clearTimeout(id) { activeTimers.delete(id); },
 }, { filename: 'client/js/chat.js' });
 
 const root = document.elements.game_chat;
@@ -138,6 +145,7 @@ for (let index = 0; index < 100; index++) {
   socket.fire('chat', { id: 'p1', text: `message ${index}` });
 }
 assert.equal(history.children.length, 100, 'session history evicts beyond its 100-message bound');
+assert.equal(activeTimers.size, 200, 'evicted messages release both visibility timers');
 
 const keyEvent = {
   key: 'Enter', target: element(document, 'canvas'), defaultPrevented: false,
@@ -147,12 +155,22 @@ document.fire('keydown', keyEvent);
 assert.equal(root.classList.contains('is-open'), true);
 assert.equal(document.activeElement, input);
 assert.equal(keyEvent.defaultPrevented, true);
+assert.equal(animationFrames.length, 1, 'opening chat schedules one scroll to the latest history');
+animationFrames.shift()();
+socket.fire('chat', { id: 'p1', text: 'burst one' });
+socket.fire('chat', { id: 'p1', text: 'burst two' });
+socket.fire('chat', { id: 'p1', text: 'burst three' });
+assert.equal(animationFrames.length, 1, 'a message burst coalesces history scrolling into one animation frame');
+animationFrames.shift()();
 
 input.value = '  hello world  ';
 form.fire('submit', { preventDefault() {} });
 assert.deepEqual(emitted.at(-1), ['chat', 'hello world']);
 assert.equal(input.value, '');
+assert.equal(root.classList.contains('is-open'), false, 'sending closes chat so steering resumes immediately');
+assert.equal(document.activeElement, null, 'sending returns keyboard focus to gameplay');
 
+document.fire('keydown', keyEvent);
 input.value = 'x'.repeat(97);
 form.fire('submit', { preventDefault() {} });
 assert.equal(input.validityReported, true, 'oversize chat reports a useful validation error');

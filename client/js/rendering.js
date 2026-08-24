@@ -1,4 +1,4 @@
-import Snake from "./snake.js?v=__SNEK_ASSET_REV__";
+import Snake, { RemoteInterpolationClock } from "./snake.js?v=__SNEK_ASSET_REV__";
 import GameOverMenu from "./menu/gameOverMenu.js?v=__SNEK_ASSET_REV__";
 import { Sprites } from "./sprites.js?v=__SNEK_ASSET_REV__";
 import { Sfx } from "./audio.js?v=__SNEK_ASSET_REV__";
@@ -38,11 +38,12 @@ let roster = [];
 let compactPlayers = [];
 const compactById = new Map();
 let lastSnapshotSequence = null;
-let lastTickAt = 0;
+const remoteInterpolation = new RemoteInterpolationClock(TICK_MS);
 let shakeUntil = 0;
 let lastFrameAt = 0;
 let renderReady = false;
 let framePending = false;
+let cachedCanvasRect = null;
 const prevScores = new Map();
 const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)') || { matches: false };
 let lastDangerCheck = -Infinity;
@@ -54,6 +55,23 @@ function requestFrame(resuming = false) {
     framePending = true;
     requestAnimationFrame(frame);
 }
+
+function invalidateScreenLayout() {
+    cachedCanvasRect = null;
+    for (const plate of nameplates.values()) plate.measured = false;
+}
+
+function screenRect() {
+    if (cachedCanvasRect === null) cachedCanvasRect = canvas.getBoundingClientRect();
+    return cachedCanvasRect;
+}
+
+// The arena is fixed to the viewport, so its screen geometry only changes on
+// resize. Keeping it out of the 60/120 Hz render path avoids needless layout
+// reads, especially when a full 32-player roster also has DOM nameplates.
+window.addEventListener?.('resize', invalidateScreenLayout, { passive: true });
+window.visualViewport?.addEventListener?.('resize', invalidateScreenLayout, { passive: true });
+if (typeof ResizeObserver === 'function') new ResizeObserver(invalidateScreenLayout).observe(canvas);
 
 function showError(message) {
     let domError = document.getElementById('game_error');
@@ -105,14 +123,23 @@ function ensureNameplate(id, displayName) {
         element.dir = 'auto';
         element.hidden = true;
         nameplateLayer.appendChild(element);
-        plate = { element, displayName: '', screenX: 0, screenY: 0, below: false };
+        plate = {
+            element, displayName: '', screenX: 0, screenY: 0, below: false,
+            width: 0, height: 28, measured: false, isLocal: false,
+        };
         nameplates.set(id, plate);
     }
     if (plate.displayName !== displayName) {
         plate.displayName = displayName;
         plate.element.textContent = displayName;
+        plate.measured = false;
     }
-    plate.element.classList.toggle('is-local', id === socket.id);
+    const isLocal = id === socket.id;
+    if (plate.isLocal !== isLocal) {
+        plate.isLocal = isLocal;
+        plate.measured = false;
+    }
+    plate.element.classList.toggle('is-local', isLocal);
     plate.element.classList.toggle('is-bounty', id === world.bountyId && gameMode === 'arcade_v2');
 }
 
@@ -149,9 +176,14 @@ function placeNameplates(rect) {
     const right = rect.right ?? rect.left + rect.width;
     for (const plate of nameplates.values()) {
         if (plate.element.hidden) continue;
-        const halfWidth = Math.min((plate.element.offsetWidth || 0) / 2, Math.max(0, rect.width / 2 - 8));
+        if (!plate.measured) {
+            plate.width = plate.element.offsetWidth || 0;
+            plate.height = plate.element.offsetHeight || 28;
+            plate.measured = true;
+        }
+        const halfWidth = Math.min(plate.width / 2, Math.max(0, rect.width / 2 - 8));
         plate.screenX = Math.max(rect.left + halfWidth + 8, Math.min(right - halfWidth - 8, plate.screenX));
-        plate.below = plate.screenY < rect.top + (plate.element.offsetHeight || 28) + 10;
+        plate.below = plate.screenY < rect.top + plate.height + 10;
     }
     for (const plate of nameplates.values()) {
         if (plate.element.hidden) continue;
@@ -285,7 +317,7 @@ socket.on("b", (payload) => {
         setBountyId(gameMode === 'arcade_v2' && frame.hasBounty ? roster[frame.bountySlot]?.[0] : null);
         world.players = compactPlayers;
         lastSnapshotSequence = frame.sequence;
-        lastTickAt = performance.now();
+        remoteInterpolation.snapshot(performance.now(), frame.sequence);
     } catch (_) {
         // DataView bounds checks are a final guard against hostile frames.
         return;
@@ -327,6 +359,7 @@ socket.on('init', (initData) => {
     gameOverMenu?.destroy?.();
     gameOverMenu = null;
     isSetup = true;
+    remoteInterpolation.reset();
     lastFrameAt = 0;
     Motion.canvas(canvas);
     requestFrame();
@@ -491,10 +524,12 @@ function drawDanger(t, now) {
     const threat = snakeList.get(dangerId);
     const localHead = local?.snake[0], threatHead = threat?.snake[0];
     if (localHead === undefined || threatHead === undefined) return;
-    const localPrev = local.prevSnake?.[0] || localHead;
     const threatPrev = threat.prevSnake?.[0] || threatHead;
-    const localX = localPrev.x + (localHead.x - localPrev.x) * t + 8;
-    const localY = localPrev.y + (localHead.y - localPrev.y) * t + 8;
+    // The local snake is drawn at its newest authoritative position while
+    // remote snakes remain interpolated. Anchor the warning to that same
+    // visible local head so it cannot trail the player by one server tick.
+    const localX = localHead.x + 8;
+    const localY = localHead.y + 8;
     const threatX = threatPrev.x + (threatHead.x - threatPrev.x) * t + 8;
     const threatY = threatPrev.y + (threatHead.y - threatPrev.y) * t + 8;
     const dx = threatX - localX, dy = threatY - localY;
@@ -560,7 +595,7 @@ function frame(now) {
     // authoritative game loop if it throws.
     requestFrame();
 
-    const t = Math.min(1, (now - lastTickAt) / TICK_MS);
+    const t = remoteInterpolation.progress(now);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
     ctx.save();
@@ -570,7 +605,7 @@ function frame(now) {
     }
 
     drawWorld(now);
-    const canvasRect = canvas.getBoundingClientRect();
+    const canvasRect = screenRect();
     const localDirection = getPredictedDirection();
     for (let snake of snakeList.values()) {
         const isLocal = snake.id === socket.id;

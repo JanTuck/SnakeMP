@@ -24,6 +24,22 @@ let joinLatencyMs = [];
 let base = '';
 let workerIndex = 0;
 
+function alphaId(value) {
+  let remaining = value;
+  let encoded = '';
+  do {
+    encoded = String.fromCharCode(97 + (remaining % 26)) + encoded;
+    remaining = Math.floor(remaining / 26);
+  } while (remaining > 0);
+  return encoded;
+}
+
+function playerName(ordinal) {
+  // Production names allow at most 24 characters and four non-letters. Keep
+  // load identities entirely alphabetic while remaining unique per worker.
+  return 'mass' + alphaId(workerIndex) + 'player' + alphaId(ordinal);
+}
+
 function addOne(job) {
   return new Promise((resolve) => {
     const started = performance.now();
@@ -57,7 +73,7 @@ function addOne(job) {
     socket.on('connect', () => {
       if (state.settled) return;
       counters.connected++;
-      socket.emit('clientReady', 'mass-' + workerIndex + '-' + job.ordinal, job.lobby);
+      socket.emit('clientReady', playerName(job.ordinal), job.lobby);
     });
     socket.on('init', () => {
       if (state.settled) {
@@ -98,10 +114,10 @@ function addOne(job) {
       if (!view || view.byteLength < 7 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 5) return invalid();
       const sequence = view.getUint16(3, true);
       const header = view.getUint8(5);
-      if ((header & 0x60) !== 0) return invalid();
+      if ((header & 0x40) !== 0) return invalid();
       const kind = header >>> 7;
-      const players = header & 0x1f;
-      if (players > 16 || (kind === 1 && (state.sequence === null || sequence !== ((state.sequence + 1) & 0xffff)))) return invalid();
+      const players = header & 0x3f;
+      if (players > 32 || (kind === 1 && (state.sequence === null || sequence !== ((state.sequence + 1) & 0xffff)))) return invalid();
       if (kind === 1 && players !== state.cells.length) return invalid();
       const nextCells = state.scratchCells;
       nextCells.length = players;

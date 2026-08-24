@@ -40,6 +40,10 @@ const vm = require('node:vm');
   let decodeCalls = 0;
   let fillRects = 0;
   let strokes = 0;
+  const lineTos = [];
+  let rectReads = 0;
+  let nameplateMetricReads = 0;
+  let resizeHandler = null;
   const Particles = {
     burst() { particlesActive = true; },
     hasActive() { return particlesActive; },
@@ -49,7 +53,7 @@ const vm = require('node:vm');
 
   const ctx = {
     clearRect() {}, save() {}, restore() {}, translate() {}, drawImage() {},
-    fillRect() { fillRects += 1; }, beginPath() {}, moveTo() {}, lineTo() {}, arc() {},
+    fillRect() { fillRects += 1; }, beginPath() {}, moveTo() {}, lineTo(x, y) { lineTos.push([x, y]); }, arc() {},
     stroke() { strokes += 1; },
   };
   const canvas = {
@@ -57,7 +61,7 @@ const vm = require('node:vm');
     height: 1152,
     getContext() { return ctx; },
     addEventListener() {},
-    getBoundingClientRect() { return { left: 0, top: 0, width: 2048, height: 1152 }; },
+    getBoundingClientRect() { rectReads += 1; return { left: 0, top: 0, width: 2048, height: 1152 }; },
   };
   ctx.canvas = canvas;
   const elements = {
@@ -108,6 +112,11 @@ const vm = require('node:vm');
     console,
     socket,
     Snake,
+    RemoteInterpolationClock: class {
+      reset() { this.ready = false; }
+      snapshot() { this.ready = true; }
+      progress() { return this.ready ? 1 : 1; }
+    },
     GameOverMenu,
     Sprites: { async load() {}, get() { return undefined; } },
     Sfx: { muted: false, death() {}, toggle() { return false; } },
@@ -127,8 +136,12 @@ const vm = require('node:vm');
       createElement() {
         const element = {
           _classes: new Set(), style: {}, hidden: false,
-          appendChild() {}, textContent: '', offsetWidth: 0, offsetHeight: 0,
+          appendChild() {}, textContent: '',
         };
+        Object.defineProperties(element, {
+          offsetWidth: { get() { nameplateMetricReads += 1; return 80; } },
+          offsetHeight: { get() { nameplateMetricReads += 1; return 28; } },
+        });
         element.classList = {
           toggle(name, force) { if (force === false) element._classes.delete(name); else element._classes.add(name); },
           contains(name) { return element._classes.has(name); },
@@ -137,7 +150,11 @@ const vm = require('node:vm');
         return element;
       },
     },
-    window: { location: { reload() {} }, matchMedia() { return { matches: false }; } },
+    window: {
+      location: { reload() {} },
+      matchMedia() { return { matches: false }; },
+      addEventListener(name, handler) { if (name === 'resize') resizeHandler = handler; },
+    },
     performance: { now() { return 100; } },
     requestAnimationFrame(callback) { queuedFrames.push(callback); return queuedFrames.length; },
     setTimeout() { return 1; },
@@ -183,10 +200,14 @@ const vm = require('node:vm');
   assert.equal(queuedFrames.length, 1, 'active play must continuously schedule frames');
   assert.ok(fillRects >= 2, 'Arcade v2 renders one matte remain as a base and highlight');
   assert.ok(strokes >= 1, 'nearest approaching head receives one restrained danger chevron');
+  assert.deepEqual(lineTos.at(-2), [158, 108], 'danger feedback stays anchored to the newest visible local head');
   assert.deepEqual(snakeDraws.slice(-2), [
     { id: 'local', t: 1, isLocal: true, localDirection: 'ArrowUp' },
-    { id: 'remote', t: 0, isLocal: false, localDirection: null },
-  ], 'local input uses the newest authoritative position while remote motion remains interpolated');
+    { id: 'remote', t: 1, isLocal: false, localDirection: null },
+  ], 'the first complete remote keyframe renders immediately while local input uses the newest authoritative position');
+  assert.equal(rectReads, 1, 'steady animation caches the viewport-sized canvas geometry');
+  assert.equal(nameplateMetricReads, 4, 'each visible nameplate receives one initial width/height measurement');
+  resizeHandler();
 
   wrapHeads = true;
   socket.emitEvent('b', 'valid-frame');
@@ -201,11 +222,15 @@ const vm = require('node:vm');
   assert.equal(queuedFrames.length, 1, 'death reuses the already pending live-arena frame');
   queuedFrames.shift()(116);
   assert.equal(particleUpdates, 2);
+  assert.equal(rectReads, 2, 'a real viewport resize refreshes the cached canvas geometry once');
+  assert.equal(nameplateMetricReads, 8, 'a viewport resize remeasures each responsive nameplate once');
   assert.equal(queuedFrames.length, 1, 'Arcade v2 spectating continues after the particle burst');
 
   particlesActive = false;
   queuedFrames.shift()(4000);
   assert.equal(particleUpdates, 3);
+  assert.equal(rectReads, 2, 'steady animation does not repeat layout reads after resizing');
+  assert.equal(nameplateMetricReads, 8, 'steady animation reuses resized nameplate metrics');
   assert.equal(menus.at(-1).finished, true, 'the 3.5 second wreckage replay resolves into retry state');
   assert.equal(queuedFrames.length, 1, 'the full board stays live after replay');
 

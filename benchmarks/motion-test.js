@@ -121,6 +121,12 @@ const path = require('node:path');
   assert.equal(elements.get('hud_mode').textContent, 'Feast · 3s', 'feast temporarily replaces only the Arcade v2 mode label');
   assert.equal(elements.get('hud_rows').children[0].classList.contains('hud-bounty'), true);
   assert.match(elements.get('hud_rows').children[0]['aria-label'], /bounty/);
+  Hud.update([
+    { id: 'leader', displayName: 'Leader', score: 8, snake: [{ x: 0, y: 0 }] },
+  ], 'departed-player', { feastTtl: 0, bountyId: null });
+  assert.equal(elements.get('hud_rows').children[0].children[0].textContent, 'Leader');
+  assert.equal(elements.get('hud_rows').children[1].hidden, true,
+    'a death roster shrink hides the vacated rank instead of retaining a duplicate survivor');
   Hud.setMode('arcade_v1');
   assert.equal(elements.get('hud_rows').children[0].classList.contains('hud-bounty'), false, 'Arcade v1 clears v2 bounty treatment');
 

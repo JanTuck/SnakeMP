@@ -58,6 +58,7 @@ for (const [relative, route] of removed) {
 }
 
 const rendering = fs.readFileSync(path.join(clientRoot, 'js/rendering.js'), 'utf8');
+const gameOverMenu = fs.readFileSync(path.join(clientRoot, 'js/menu/gameOverMenu.js'), 'utf8');
 assert(!/\b(?:Food|ResourceHandler)\b/.test(rendering), 'rendering still depends on obsolete wrapper classes');
 assert.strictEqual(
   (rendering.match(/food = \{ x: [^,;]+, y: [^};]+ \};/g) || []).length,
@@ -68,14 +69,30 @@ assert(!/swords\.png/.test(fs.readFileSync(path.join(clientRoot, 'img/CREDITS.md
 assert(!/gsap/i.test(fs.readFileSync(path.join(clientRoot, 'game.html'), 'utf8')), 'game page still loads GSAP');
 assert(!/window\.gsap/.test(rendering), 'rendering still depends on GSAP');
 assert(!/window\.gsap/.test(fs.readFileSync(path.join(clientRoot, 'js/hud.js'), 'utf8')), 'HUD still depends on GSAP');
+assert(/overlay\.setAttribute\("role", "region"\)/.test(gameOverMenu),
+  'game over must remain a non-modal region so Chat and Retry are keyboard peers');
+assert(!/setAttribute\("aria-modal"/.test(gameOverMenu),
+  'game over must not hide the still-interactive Chat control from assistive technology');
 
 const gamePage = fs.readFileSync(path.join(clientRoot, 'game.html'), 'utf8');
 const chat = fs.readFileSync(path.join(clientRoot, 'js/chat.js'), 'utf8');
+const chatCss = fs.readFileSync(path.join(clientRoot, 'css/chat.css'), 'utf8');
+const gameCss = fs.readFileSync(path.join(clientRoot, 'css/game.css'), 'utf8');
 for (const route of ['/js/chat.js', '/css/chat.css']) {
   assert(gamePage.includes(route), `game page does not load ${route}`);
   assert(manifest.includes(`.path = "${route}"`), `chat asset is not embedded: ${route}`);
 }
 assert(/const MAX_HISTORY = 100;/.test(chat), 'chat session history must remain explicitly bounded');
+assert(/\.game-chat:not\(\.is-open\) \.chat-message:nth-last-child\(n \+ 6\)/.test(chatCss),
+  'closed chat must keep exactly the five newest messages in its live feed');
+assert(/\.game-chat\.is-open \.chat-history[\s\S]*overflow-y: auto;/.test(chatCss),
+  'focused chat must expose scrollable full history');
+assert(/\.chat-message[\s\S]*background: #090c12;/.test(chatCss),
+  'chat messages need an opaque contrast surface over every arena color');
+assert(/\.game-chat:not\(\.is-open\) \.chat-open[\s\S]*display: block;/.test(chatCss),
+  'the Chat control must remain visible and clickable during active play');
+assert(/\.hud-rows li\[hidden\]\s*\{\s*display:\s*none\s*!important;\s*\}/.test(gameCss),
+  'HUD row display rules must not override hidden rows after a player dies');
 assert(!/\.innerHTML\b|insertAdjacentHTML|document\.write/.test(chat), 'chat must only render untrusted text through DOM text nodes');
 assert(/\.textContent = name;/.test(chat) && /\.textContent = text;/.test(chat), 'chat names and messages must use textContent');
 

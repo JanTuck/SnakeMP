@@ -20,6 +20,11 @@ function frame(bytes, prefix = 0) {
   const { decodeSnapshot } = await import(moduleUrl);
   const snakeSource = fs.readFileSync(path.join(__dirname, '..', 'client', 'js', 'snake.js'), 'utf8');
   const { default: Snake } = await import('data:text/javascript;base64,' + Buffer.from(snakeSource).toString('base64'));
+  const massWorkerSource = fs.readFileSync(path.join(__dirname, 'mass-worker.js'), 'utf8');
+  assert.match(massWorkerSource, /\(header & 0x40\) !== 0/,
+    'mass decoder must reserve only bit 6 of the v5 header');
+  assert.match(massWorkerSource, /const players = header & 0x3f/,
+    'mass decoder must preserve the full six-bit v5 player count');
 
   const keyframe = frame([
     0x53, 0x4e, 5, 1, 0, 1,
