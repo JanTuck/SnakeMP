@@ -282,6 +282,26 @@ the median of seven ReleaseFast samples:
 The isolated integration audit additionally verified all 64 temporary lobbies
 were reaped and creation capacity recovered.
 
+## Connection churn and pressure cleanup
+
+On Linux, accepted TCP sockets inherit `TCP_NODELAY` from their listener, and
+closing the only descriptor for an open-file description automatically removes
+it from epoll. The server now configures `TCP_NODELAY` once at startup and
+relies on final close instead of issuing a redundant `EPOLL_CTL_DEL`. This
+removes exactly one `setsockopt` and one `epoll_ctl` syscall per connection—
+24,000 syscalls across establishment and teardown of 12,000 connections. A
+listener option failure is fatal, and accepted descriptors are never duplicated,
+which are required invariants for those reductions.
+
+Maintenance no longer allocates a temporary list to reclaim poisoned, idle, or
+heartbeat-timed-out connections. It collects fixed stack batches of up to 4,096
+and recreates the map iterator only between teardown batches, so reclamation
+continues under allocator pressure. A reduced lifecycle integration pass
+covered 600 normal churn connections, 300 malformed-frame connections, partial
+frames, 16 created/reaped lobbies, and four paused readers with 400 pipelined
+requests each. All transient connections, players, and lobbies recovered;
+post-backpressure RSS growth was 507,904 B against the 8 MiB bound.
+
 ## Historical v1 wire-format microbenchmark
 
 This older format-selection benchmark is retained to document why binary

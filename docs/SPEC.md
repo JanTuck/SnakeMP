@@ -9,6 +9,9 @@ transport.
 - The simulation runs at **15 Hz**, one tick every **66.67 ms**.
 - A single edge-triggered Linux epoll reactor owns listening, HTTP parsing,
   WebSocket framing, connection lifetime, and nonblocking socket writes.
+- The listener owns `TCP_NODELAY`, inherited by accepted Linux sockets. Accepted
+  descriptors are never duplicated; final close therefore removes their epoll
+  registrations without a separate delete syscall.
 - Game workers are allocated lazily and adaptively. Empty lobbies own no game
   thread. A worker owns up to **128 active lobbies** by default, processes them
   sequentially each tick, and uses a 128 KiB stack plus a retained per-tick

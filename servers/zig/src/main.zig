@@ -80,6 +80,7 @@ const MAX_QUEUE_ITEMS: usize = 4096;
 const MAX_OUTPUT_IOVECS: usize = 64;
 const OUTPUT_COMPACT_MIN_HEAD: usize = 64;
 const OUTPUT_RETAINED_ITEMS: usize = 256;
+const MAINTENANCE_BATCH: usize = 4096;
 const HTTP_IDLE_MS = config.HTTP_IDLE_MS;
 
 // ------------------------------------------------------------------ state
@@ -125,7 +126,9 @@ var last_worker_resize_ms: i64 = 0;
 
 inline fn clockNanos(clock: linux.clockid_t) i64 {
     var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(clock, &ts);
+    if (linux.errno(linux.clock_gettime(clock, &ts)) != .SUCCESS) {
+        @panic("clock_gettime failed");
+    }
     return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
@@ -2284,7 +2287,9 @@ fn readAvailable(c: *Conn, aa: Allocator, peer_shutdown: bool) bool {
 }
 
 fn teardownConn(c: *Conn) void {
-    _ = linux.epoll_ctl(epoll_fd, linux.EPOLL.CTL_DEL, c.fd, null);
+    // Closing the only fd for this open-file description automatically removes
+    // it from epoll. Accepted sockets are never duped, so EPOLL_CTL_DEL would
+    // be one redundant syscall per connection.
     _ = connections.remove(c.fd);
 
     var arena = std.heap.ArenaAllocator.init(galloc);
@@ -2311,7 +2316,6 @@ fn setNonBlocking(fd: posix.fd_t) bool {
 }
 
 fn registerConn(fd: posix.fd_t) void {
-    setSockOpts(fd);
     const c = galloc.create(Conn) catch {
         closeFd(fd);
         return;
@@ -2343,34 +2347,45 @@ fn acceptReady() void {
     }
 }
 
-fn serviceHeartbeats(now: i64, arena: Allocator) void {
-    var doomed: std.ArrayListUnmanaged(*Conn) = .empty;
-    defer doomed.deinit(arena);
-    var connection_it = connections.valueIterator();
-    while (connection_it.next()) |connection_ptr| {
-        const c = connection_ptr.*;
-        if (connPoisoned(c)) {
-            doomed.append(arena, c) catch {};
-            continue;
-        }
-        if (c.mode == .http and now - c.last_activity_ms > HTTP_IDLE_MS) {
-            doomed.append(arena, c) catch {};
-            continue;
-        }
-        if (c.mode != .websocket) continue;
-        if (c.awaiting_pong_since) |started| {
-            if (now - started > PING_TIMEOUT_MS) {
-                doomed.append(arena, c) catch {};
+fn serviceHeartbeats(now: i64) void {
+    // Cleanup must remain available under allocator pressure. Remove fixed
+    // batches between map scans because teardown invalidates its iterator.
+    while (true) {
+        var doomed: [MAINTENANCE_BATCH]*Conn = undefined;
+        var doomed_len: usize = 0;
+        var connection_it = connections.valueIterator();
+        while (connection_it.next()) |connection_ptr| {
+            const c = connection_ptr.*;
+            if (connPoisoned(c)) {
+                doomed[doomed_len] = c;
+                doomed_len += 1;
+                if (doomed_len == doomed.len) break;
                 continue;
             }
+            if (c.mode == .http and now - c.last_activity_ms > HTTP_IDLE_MS) {
+                doomed[doomed_len] = c;
+                doomed_len += 1;
+                if (doomed_len == doomed.len) break;
+                continue;
+            }
+            if (c.mode != .websocket) continue;
+            if (c.awaiting_pong_since) |started| {
+                if (now - started > PING_TIMEOUT_MS) {
+                    doomed[doomed_len] = c;
+                    doomed_len += 1;
+                    if (doomed_len == doomed.len) break;
+                    continue;
+                }
+            }
+            if (now >= c.next_ping_ms) {
+                connEnqueueFrame(c, 0x9, "");
+                c.awaiting_pong_since = now;
+                c.next_ping_ms = now + PING_INTERVAL_MS;
+            }
         }
-        if (now >= c.next_ping_ms) {
-            connEnqueueFrame(c, 0x9, "");
-            c.awaiting_pong_since = now;
-            c.next_ping_ms = now + PING_INTERVAL_MS;
-        }
+        for (doomed[0..doomed_len]) |c| teardownConn(c);
+        if (doomed_len < doomed.len) return;
     }
-    for (doomed.items) |c| teardownConn(c);
 }
 
 fn reactorLoop() void {
@@ -2408,7 +2423,7 @@ fn reactorLoop() void {
 
         const now_ms = unixMillis();
         if (now_ms >= next_maintenance) {
-            serviceHeartbeats(now_ms, aa);
+            serviceHeartbeats(now_ms);
             reapIdleLobbies(now_ms);
             deactivateEmptyLobbies();
             rebalanceGameWorkers(now_ms, aa);
@@ -2417,10 +2432,11 @@ fn reactorLoop() void {
     }
 }
 
-fn setSockOpts(fd: posix.fd_t) void {
-    if (builtin.os.tag != .linux) return;
+fn setSockOpts(fd: posix.fd_t) bool {
+    if (builtin.os.tag != .linux) return true;
     const one: c_int = 1;
-    posix.setsockopt(fd, 6, 1, std.mem.asBytes(&one)) catch {}; // TCP_NODELAY
+    posix.setsockopt(fd, 6, 1, std.mem.asBytes(&one)) catch return false; // TCP_NODELAY
+    return true;
 }
 
 // ------------------------------------------------------------------ signals / main
@@ -2473,8 +2489,11 @@ pub fn main(init: std.process.Init) !void {
 
     installSignalHandlers();
 
-    const def_id = galloc.dupe(u8, DEFAULT_LOBBY_ID) catch unreachable;
-    _ = createLobbyLocked(def_id) catch unreachable;
+    {
+        const def_id = try galloc.dupe(u8, DEFAULT_LOBBY_ID);
+        errdefer galloc.free(def_id);
+        _ = try createLobbyLocked(def_id);
+    }
 
     const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
     const srv = addr.listen(g_io, .{ .reuse_address = true }) catch |e| {
@@ -2483,6 +2502,9 @@ pub fn main(init: std.process.Init) !void {
     };
     listen_fd = srv.socket.handle;
     if (!setNonBlocking(listen_fd)) return error.NonBlockingSetupFailed;
+    // Linux inherits TCP_NODELAY from the listening socket, avoiding one
+    // setsockopt syscall for every accepted connection.
+    if (!setSockOpts(listen_fd)) return error.TcpNoDelaySetupFailed;
     const epoll_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
     if (linux.errno(epoll_rc) != .SUCCESS) return error.EpollCreateFailed;
     epoll_fd = @intCast(epoll_rc);
