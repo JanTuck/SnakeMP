@@ -113,9 +113,9 @@ const vm = require('node:vm');
     socket,
     Snake,
     RemoteInterpolationClock: class {
-      reset() { this.ready = false; }
-      snapshot() { this.ready = true; }
-      progress() { return this.ready ? 1 : 1; }
+      reset() { this.snapshots = 0; }
+      snapshot() { this.snapshots += 1; }
+      progress() { return this.snapshots >= 2 ? 0.25 : 1; }
     },
     GameOverMenu,
     Sprites: { async load() {}, get() { return undefined; } },
@@ -222,6 +222,10 @@ const vm = require('node:vm');
   assert.equal(queuedFrames.length, 1, 'death reuses the already pending live-arena frame');
   queuedFrames.shift()(116);
   assert.equal(particleUpdates, 2);
+  assert.deepEqual(snakeDraws.slice(-2), [
+    { id: 'local', t: 0.25, isLocal: true, localDirection: 'ArrowUp' },
+    { id: 'remote', t: 0.25, isLocal: false, localDirection: null },
+  ], 'local and remote bodies share smooth presentation time while local steering feedback remains immediate');
   assert.equal(rectReads, 2, 'a real viewport resize refreshes the cached canvas geometry once');
   assert.equal(nameplateMetricReads, 8, 'a viewport resize remeasures each responsive nameplate once');
   assert.equal(queuedFrames.length, 1, 'Arcade v2 spectating continues after the particle burst');

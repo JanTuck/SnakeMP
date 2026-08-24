@@ -32,7 +32,7 @@ function near(actual, expected, message, epsilon = 1e-9) {
   // though requestAnimationFrame itself is running at 60 or 120 Hz.
   const snapshotTimes = [0, 67, 121, 200, 263, 337, 397, 468, 533, 608, 670];
 
-  function sampleAt(refreshHz) {
+  function sampleAt(refreshHz, label) {
     const clock = new RemoteInterpolationClock(TICK_MS);
     let snapshotIndex = 0;
     let state = 0;
@@ -70,16 +70,22 @@ function near(actual, expected, message, epsilon = 1e-9) {
     const deltas = active.slice(1).map((sample, index) => sample.position - active[index].position);
     const expectedStep = frameMs / TICK_MS;
     for (const delta of deltas) {
-      assert.ok(delta > 0, `${refreshHz} Hz remote motion must not freeze or reverse between frames`);
-      near(delta, expectedStep, `${refreshHz} Hz straight motion keeps an even per-frame step`, 1e-8);
+      assert.ok(delta > 0, `${refreshHz} Hz ${label} motion must not freeze or reverse between frames`);
+      near(delta, expectedStep, `${refreshHz} Hz ${label} straight motion keeps an even per-frame step`, 1e-8);
     }
     return { samples: active, expectedStep };
   }
 
-  const at60 = sampleAt(60);
-  const at120 = sampleAt(120);
-  near(at60.expectedStep, 0.25, '60 Hz renders four equal frames per server cell');
-  near(at120.expectedStep, 0.125, '120 Hz renders eight equal frames per server cell');
+  const remote60 = sampleAt(60, 'remote');
+  const local60 = sampleAt(60, 'local');
+  const remote120 = sampleAt(120, 'remote');
+  const local120 = sampleAt(120, 'local');
+  assert.deepEqual(local60.samples, remote60.samples,
+    'local and remote straight-line presentation must be identical at 60 Hz');
+  assert.deepEqual(local120.samples, remote120.samples,
+    'local and remote straight-line presentation must be identical at 120 Hz');
+  near(remote60.expectedStep, 0.25, '60 Hz renders four equal frames per server cell');
+  near(remote120.expectedStep, 0.125, '120 Hz renders eight equal frames per server cell');
 
   const bounded = new RemoteInterpolationClock(TICK_MS);
   bounded.snapshot(0, 65535);
@@ -93,7 +99,7 @@ function near(actual, expected, message, epsilon = 1e-9) {
   bounded.reset();
   assert.equal(bounded.progress(10_000), 1, 'reset cannot leave stale interpolation running');
 
-  console.log('remote motion tests: PASS (60/120 Hz, jitter continuity, bounded recovery)');
+  console.log('local/remote motion tests: PASS (60/120 Hz, jitter continuity, bounded recovery)');
 })().catch((error) => {
   console.error(error.stack || error);
   process.exitCode = 1;

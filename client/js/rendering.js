@@ -524,12 +524,12 @@ function drawDanger(t, now) {
     const threat = snakeList.get(dangerId);
     const localHead = local?.snake[0], threatHead = threat?.snake[0];
     if (localHead === undefined || threatHead === undefined) return;
-    const threatPrev = threat.prevSnake?.[0] || threatHead;
-    // The local snake is drawn at its newest authoritative position while
-    // remote snakes remain interpolated. Anchor the warning to that same
-    // visible local head so it cannot trail the player by one server tick.
-    const localX = localHead.x + 8;
-    const localY = localHead.y + 8;
+    const localPrev = local.interpolate && local.prevSnake?.[0] || localHead;
+    const threatPrev = threat.interpolate && threat.prevSnake?.[0] || threatHead;
+    // Both snakes use the same presentation clock. Keep the warning anchored
+    // to the head the player can actually see rather than its next grid cell.
+    const localX = localPrev.x + (localHead.x - localPrev.x) * t + 8;
+    const localY = localPrev.y + (localHead.y - localPrev.y) * t + 8;
     const threatX = threatPrev.x + (threatHead.x - threatPrev.x) * t + 8;
     const threatY = threatPrev.y + (threatHead.y - threatPrev.y) * t + 8;
     const dx = threatX - localX, dy = threatY - localY;
@@ -609,13 +609,11 @@ function frame(now) {
     const localDirection = getPredictedDirection();
     for (let snake of snakeList.values()) {
         const isLocal = snake.id === socket.id;
-        // Remote snakes keep one-tick interpolation for smooth network motion.
-        // The local snake is already authoritative when its snapshot arrives;
-        // drawing that newest state immediately avoids adding another 66.7 ms
-        // of presentation lag after the server has accepted a turn.
-        const snakeT = isLocal ? 1 : t;
-        snake.draw(snakeT, isLocal, isLocal ? localDirection : null);
-        prepareNameplate(snake, snakeT, canvasRect);
+        // Use one display-refresh presentation clock for every snake. Local
+        // steering intent still updates the eyes on the next animation frame,
+        // while its body and nameplate no longer jump one cell at 15 Hz.
+        snake.draw(t, isLocal, isLocal ? localDirection : null);
+        prepareNameplate(snake, t, canvasRect);
     }
     drawDanger(t, now);
     drawDeathReplay(now);
