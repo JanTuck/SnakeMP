@@ -78,10 +78,15 @@ body {
 .card {
     background: var(--panel);
     border: 1px solid var(--panel-edge);
+    border-top: 3px solid var(--apple);
     border-radius: 14px;
     padding: 26px 28px;
     box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
     text-align: left;
+}
+.btn-icon {
+    margin-right: 8px;
+    font-size: 0.9em;
 }
 .card-title {
     margin: 0 0 14px;
