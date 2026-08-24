@@ -157,22 +157,4 @@ export default class Snake {
         }
     }
 
-    drawDisplayName(){
-        const head = this.snake[0];
-        if (head === undefined) return;
-        const ctx = this.ctx;
-        const centerX = head.x + this.scale / 2;
-        // Flip the label below the head when it would clip at the top edge.
-        const baseline = head.y < 34 ? head.y + this.scale + 25 : head.y - 11;
-        ctx.save();
-        ctx.font = '700 20px "Segoe UI", Arial, sans-serif';
-        ctx.textAlign = "center";
-        ctx.textBaseline = "alphabetic";
-        const labelWidth = Math.ceil(ctx.measureText(this.displayName).width) + 16;
-        ctx.fillStyle = "rgba(13, 16, 22, 0.86)";
-        this.roundRect(centerX - labelWidth / 2, baseline - 21, labelWidth, 27, 6);
-        ctx.fillStyle = "#fffaf1";
-        ctx.fillText(this.displayName, centerX, baseline);
-        ctx.restore();
-    }
 }

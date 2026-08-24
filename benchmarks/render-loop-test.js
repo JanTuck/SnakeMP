@@ -25,6 +25,7 @@ const vm = require('node:vm');
   };
 
   const queuedFrames = [];
+  const nameplateChildren = [];
   let particlesActive = false;
   let particleUpdates = 0;
   let lastParticleDt = 0;
@@ -52,6 +53,7 @@ const vm = require('node:vm');
     game_error: { style: {}, textContent: '' },
     game_popup: { style: {} },
     hud_mute: { addEventListener() {} },
+    nameplates: { hidden: false, appendChild(child) { nameplateChildren.push(child); } },
   };
 
   class GameOverMenu {
@@ -76,6 +78,14 @@ const vm = require('node:vm');
     document: {
       getElementById(id) { return elements[id]; },
       querySelector() { return {}; },
+      createElement() {
+        const element = {
+          classList: { toggle() {} }, style: {}, hidden: false,
+          appendChild() {}, textContent: '', offsetWidth: 0, offsetHeight: 0,
+        };
+        element.remove = () => { element.removed = true; };
+        return element;
+      },
     },
     window: { location: { reload() {} } },
     performance: { now() { return 100; } },
@@ -89,6 +99,12 @@ const vm = require('node:vm');
   await new vm.Script(source, { filename }).runInContext(context);
 
   assert.equal(queuedFrames.length, 0, 'the join screen must not start an idle render loop');
+
+  socket.emitEvent('r', [['remote', '長い名前 😀', '#abcdef']]);
+  assert.equal(nameplateChildren.length, 1, 'a roster member receives one DOM nameplate');
+  assert.equal(nameplateChildren[0].textContent, '長い名前 😀', 'Unicode display names remain exact text');
+  socket.emitEvent('r', []);
+  assert.equal(nameplateChildren[0].removed, true, 'departed roster members lose their nameplate');
 
   socket.emitEvent('init', { food: { x: 10, y: 20 }, classical: true });
   assert.deepEqual(modes, [true], 'classical init state must reach the HUD mode label');

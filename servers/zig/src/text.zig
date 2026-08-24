@@ -2,6 +2,7 @@
 //! from writing into the caller-provided arena.
 
 const std = @import("std");
+const config = @import("config.zig");
 const json = @import("json.zig");
 
 const Allocator = std.mem.Allocator;
@@ -37,9 +38,10 @@ pub fn jsTrim(value: []const u8) []const u8 {
     return value[begin..end];
 }
 
-/// Approximation of ^[\p{L}\p{N}_\- ]+$ on a trimmed 4..16-codepoint value.
+/// Approximation of ^[\p{L}\p{N}_\- ]+$ on a bounded, trimmed value.
 pub fn checkUsername(raw: []const u8) UsernameCheck {
     const trimmed = jsTrim(raw);
+    if (trimmed.len > config.MAX_USERNAME_BYTES) return .{ .ok = false, .trimmed = trimmed };
     var count: usize = 0;
     var index: usize = 0;
     while (index < trimmed.len) {
@@ -53,7 +55,20 @@ pub fn checkUsername(raw: []const u8) UsernameCheck {
         count += 1;
         index += len;
     }
-    return .{ .ok = count >= 4 and count <= 16, .trimmed = trimmed };
+    return .{
+        .ok = count >= config.MIN_USERNAME_CODEPOINTS and count <= config.MAX_USERNAME_CODEPOINTS,
+        .trimmed = trimmed,
+    };
+}
+
+test "username validation accepts long Unicode names within wire bounds" {
+    try std.testing.expect(checkUsername("x").ok);
+    try std.testing.expect(checkUsername("界").ok);
+    try std.testing.expect(checkUsername("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-").ok);
+    try std.testing.expect(!checkUsername("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-x").ok);
+    try std.testing.expect(!checkUsername("😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀").ok);
+    try std.testing.expect(!checkUsername("bad.name").ok);
+    try std.testing.expectEqualStrings("trimmed", checkUsername("  trimmed  ").trimmed);
 }
 
 fn hexValue(ch: u8) ?u8 {

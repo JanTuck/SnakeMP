@@ -21,16 +21,6 @@ const OPPOSITE = new Map([
     [ARROW_RIGHT, ARROW_LEFT]
 ]);
 
-const TURN_LEFT = new Map([
-    [ARROW_LEFT, ARROW_DOWN],
-    [ARROW_RIGHT, ARROW_UP]
-]);
-
-const TURN_RIGHT = new Map([
-    [ARROW_RIGHT, ARROW_DOWN],
-    [ARROW_LEFT, ARROW_UP]
-]);
-
 let observedDirection = null;
 const queuedDirections = [];
 
@@ -66,7 +56,7 @@ function emitDirection(direction) {
     const previous = predictedDirection();
     if (previous !== null && (direction === previous || direction === OPPOSITE.get(previous))) return;
     // Mirror the server's two-turn queue. More intent than this cannot be
-    // represented authoritatively and would make relative steering drift.
+    // represented authoritatively and would make local prediction drift.
     if (queuedDirections.length >= 2) return;
     socket.emit("keyPress", direction);
     queuedDirections.push(direction);
@@ -83,18 +73,7 @@ function handleDirection(event) {
     event.preventDefault();
     if (event.repeat) return;
 
-    const heading = predictedDirection();
-    // While travelling horizontally, left/right arrows choose the vertical
-    // turn relative to the snake's current (or already queued) heading. While
-    // travelling vertically they remain absolute left/right controls. WASD
-    // and up/down arrows are always absolute.
-    const horizontal = heading === ARROW_LEFT || heading === ARROW_RIGHT;
-    const direction = horizontal && event.code === ARROW_LEFT
-        ? TURN_LEFT.get(heading)
-        : horizontal && event.code === ARROW_RIGHT
-            ? TURN_RIGHT.get(heading)
-            : input;
-    emitDirection(direction);
+    emitDirection(input);
 }
 
 document.addEventListener("keydown", handleDirection);

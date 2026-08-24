@@ -239,4 +239,35 @@ function game(overrides = {}) {
   assert.equal(page.button.disabled, false);
 }
 
+{
+  const page = game();
+  page.elements.username.value = 'x';
+  page.form.fire('submit', submitEvent());
+  assert.deepEqual(page.emitted, [['clientReady', 'x', 'room seven', '']], 'single-character names are valid');
+}
+
+{
+  const page = game();
+  page.elements.username.value = 'x'.repeat(65);
+  page.form.fire('submit', submitEvent());
+  assert.equal(page.emitted.length, 0, 'names over 64 code points never reach transport');
+  assert.equal(page.elements.username.validityReported, true);
+  assert.equal(page.button.disabled, false);
+}
+
+{
+  const page = game();
+  page.elements.username.value = '😀'.repeat(63);
+  page.form.fire('submit', submitEvent());
+  assert.equal(page.emitted.length, 1, 'a 252-byte Unicode name fits the wire field');
+}
+
+{
+  const page = game();
+  page.elements.username.value = '😀'.repeat(64);
+  page.form.fire('submit', submitEvent());
+  assert.equal(page.emitted.length, 0, 'names over the one-byte UTF-8 wire limit never reach transport');
+  assert.equal(page.elements.username.validityReported, true);
+}
+
 console.log('auth interaction tests: PASS (URL/code joins, exact handoff, bounds, one-shot create, retries)');

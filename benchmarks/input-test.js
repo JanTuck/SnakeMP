@@ -40,39 +40,35 @@ const path = require('node:path');
   assert.deepEqual(directions(), ['ArrowLeft'], 'a stationary snake may start left');
   input.resetDirection();
 
-  const steeringCases = [
-    ['ArrowUp', 'ArrowLeft', 'ArrowRight'],
-    ['ArrowRight', 'ArrowUp', 'ArrowDown'],
-    ['ArrowDown', 'ArrowLeft', 'ArrowRight'],
-    ['ArrowLeft', 'ArrowDown', 'ArrowUp'],
-  ];
-  for (const [heading, left, right] of steeringCases) {
+  for (const heading of ['ArrowUp', 'ArrowDown']) {
     input.resetDirection();
     input.syncDirection(heading);
     const before = emitted.length;
     press('ArrowLeft');
-    assert.equal(emitted[before][1], left, `${heading}: left arrow resolves to the intended turn`);
+    assert.equal(emitted[before][1], 'ArrowLeft', `${heading}: left remains an absolute direction`);
     input.resetDirection();
     input.syncDirection(heading);
     press('ArrowRight');
-    assert.equal(emitted[before + 1][1], right, `${heading}: right arrow resolves to the intended turn`);
+    assert.equal(emitted[before + 1][1], 'ArrowRight', `${heading}: right remains an absolute direction`);
   }
 
   input.resetDirection();
   input.syncDirection('ArrowRight');
   const rapidStart = emitted.length;
-  press('ArrowLeft');  // right -> up
-  press('ArrowRight'); // queued up -> right
-  press('ArrowLeft');  // queue is full; do not drift beyond server capacity
+  press('ArrowLeft');  // opposite: ignored
+  press('ArrowRight'); // unchanged: ignored
+  press('ArrowUp');
+  press('ArrowRight');
+  press('ArrowDown');  // queue is full; do not drift beyond server capacity
   assert.deepEqual(directions().slice(rapidStart), ['ArrowUp', 'ArrowRight'],
-    'rapid relative turns compose from queued intent and mirror the server queue limit');
+    'horizontal left/right no longer remap, while absolute turns mirror the server queue limit');
   input.syncDirection('ArrowRight'); // stale old-heading snapshot: preserve intent
   press('ArrowLeft');
   assert.deepEqual(directions().slice(rapidStart), ['ArrowUp', 'ArrowRight'],
-    'an old snapshot cannot reinterpret or overfill queued relative turns');
+    'an old snapshot cannot reinterpret or overfill queued absolute turns');
   input.syncDirection('ArrowUp');
-  press('ArrowLeft'); // queued right -> up, now that one queue slot is free
-  assert.deepEqual(directions().slice(rapidStart), ['ArrowUp', 'ArrowRight', 'ArrowUp'],
+  press('ArrowDown'); // reverse of queued right is allowed only after it becomes perpendicular
+  assert.deepEqual(directions().slice(rapidStart), ['ArrowUp', 'ArrowRight', 'ArrowDown'],
     'acknowledging a turn frees one predictor slot without losing the next turn');
 
   input.resetDirection();
@@ -91,7 +87,7 @@ const path = require('node:path');
 
   delete global.document;
   delete global.socket;
-  console.log('horizontal-aware steering input tests: PASS');
+  console.log('absolute steering input tests: PASS');
 })().catch((error) => {
   delete global.document;
   delete global.socket;

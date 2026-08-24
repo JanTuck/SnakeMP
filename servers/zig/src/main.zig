@@ -1549,6 +1549,22 @@ fn applyMoveAndCheckWall(player: *Player, slot: usize, collision_index: *collisi
     return collidedWall(player.snake.items[0]);
 }
 
+/// Resolve collisions from one immutable tick-start position set. A snake
+/// dies when its own head occupies a wall, itself, or any cell of another
+/// snake. The owner of a body that was hit is not killed merely for being hit.
+/// Because every head is classified before anyone is removed, head-to-head
+/// and mutual body crossings still kill every attacker without insertion-order
+/// bias.
+fn startingCollisionDeaths(players: []const *Player, collision_index: *const collision.Index) [binary_snapshot.MAX_PLAYERS]bool {
+    var deaths = [_]bool{false} ** binary_snapshot.MAX_PLAYERS;
+    for (players, 0..) |player, slot| {
+        const head = player.snake.items[0];
+        deaths[slot] = collidedWall(head) or collision_index.selfHit(slot, player) or
+            collision_index.otherAt(slot, player) != null;
+    }
+    return deaths;
+}
+
 // ------------------------------------------------------------------ tick
 
 fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
@@ -1596,51 +1612,35 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
         for (graveyard_storage[0..graveyard_len]) |p| destroyPlayer(p);
     }
     var collision_index = collision.Index.build(snapshot);
+    const starting_deaths = startingCollisionDeaths(snapshot, &collision_index);
 
     for (snapshot, 0..) |p, slot| {
         // skip players killed earlier in this same tick
         if (!collision_index.isActive(slot)) continue;
 
+        // Resolve the complete tick-start collision set before movement. A
+        // body owner survives being rammed; head-to-head still marks both
+        // heads, and mutual collisions are independent of insertion order.
+        if (starting_deaths[slot]) {
+            sendDeathEvent(p.conn, p.score, aa);
+            feedDeath(l, p, aa);
+            collision_index.remove(slot, p);
+            detachPlayer(l, p);
+            graveyard_storage[graveyard_len] = p;
+            graveyard_len += 1;
+            continue;
+        }
+
         const head = p.snake.items[0];
 
-        // a. wall / self collision
-        if (collidedWall(head) or collision_index.selfHit(slot, p)) {
-            sendDeathEvent(p.conn, p.score, aa);
-            feedDeath(l, p, aa);
-            collision_index.remove(slot, p);
-            detachPlayer(l, p);
-            graveyard_storage[graveyard_len] = p;
-            graveyard_len += 1;
-            continue;
-        }
-
-        // b. head vs any segment of another snake: both die
-        const collision_hit = collision_index.otherAt(slot, p);
-        if (collision_hit) |hit| {
-            const other = hit.player;
-            sendDeathEvent(p.conn, p.score, aa);
-            sendDeathEvent(other.conn, other.score, aa);
-            feedDeath(l, p, aa);
-            feedDeath(l, other, aa);
-            collision_index.remove(slot, p);
-            collision_index.remove(hit.slot, other);
-            detachPlayer(l, p);
-            graveyard_storage[graveyard_len] = p;
-            graveyard_len += 1;
-            detachPlayer(l, other);
-            graveyard_storage[graveyard_len] = other;
-            graveyard_len += 1;
-            continue;
-        }
-
-        // c. main food
+        // a. main food
         if (head.x == l.food.x and head.y == l.food.y) {
             p.eat(1, 1);
             respawnFood(l);
             broadcastUpdateFood(l, aa);
         }
 
-        // d-f. Special pickups do not exist in classical mode.
+        // b-d. Special pickups do not exist in classical mode.
         if (!l.classical) {
             // bonus apples (every apple matching the head)
             var bi = l.bonus.items.len;
@@ -1673,7 +1673,7 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
             }
         }
 
-        // g. one queued turn, then move
+        // e. one queued turn, then move
         const crossed_wall = applyMoveAndCheckWall(p, slot, &collision_index);
         // Never publish an out-of-board head. The decoder deliberately rejects
         // invalid coordinates, so wall death must happen in the movement tick
@@ -2966,6 +2966,98 @@ test "movement reports a wall crossing before snapshot publication" {
     collision_index = collision.Index.build(&players);
     try std.testing.expect(applyMoveAndCheckWall(&player, 0, &collision_index));
     try std.testing.expectEqual(-model.CELL, player.snake.items[0].x);
+}
+
+test "collision deaths belong to attackers rather than body owners" {
+    var connection = Conn{ .fd = -1 };
+    var owner_cells = [_]model.CellPos{
+        .{ .x = 64, .y = 64 },
+        .{ .x = 48, .y = 64 },
+        .{ .x = 32, .y = 64 },
+    };
+    var attacker_cells = [_]model.CellPos{.{ .x = 32, .y = 64 }};
+    var second_attacker_cells = [_]model.CellPos{.{ .x = 48, .y = 64 }};
+    var owner = Player{
+        .id = @constCast("owner"),
+        .name = @constCast("owner"),
+        .color_hex = @constCast("#abcdef"),
+        .snake = .{ .items = &owner_cells, .capacity = owner_cells.len },
+        .conn = &connection,
+    };
+    var attacker = Player{
+        .id = @constCast("attacker"),
+        .name = @constCast("attacker"),
+        .color_hex = @constCast("#fedcba"),
+        .snake = .{ .items = &attacker_cells, .capacity = attacker_cells.len },
+        .conn = &connection,
+    };
+    var second_attacker = Player{
+        .id = @constCast("attacker-2"),
+        .name = @constCast("attacker-2"),
+        .color_hex = @constCast("#ffffff"),
+        .snake = .{ .items = &second_attacker_cells, .capacity = second_attacker_cells.len },
+        .conn = &connection,
+    };
+
+    const players = [_]*Player{ &owner, &attacker, &second_attacker };
+    const scan_index = collision.Index.build(&players);
+    const scan_deaths = startingCollisionDeaths(&players, &scan_index);
+    try std.testing.expect(!scan_deaths[0]);
+    try std.testing.expect(scan_deaths[1]);
+    try std.testing.expect(scan_deaths[2]);
+
+    const indexed = collision.Index.buildForced(&players);
+    const indexed_deaths = startingCollisionDeaths(&players, &indexed);
+    try std.testing.expectEqualSlices(bool, scan_deaths[0..players.len], indexed_deaths[0..players.len]);
+
+    const reversed = [_]*Player{ &attacker, &second_attacker, &owner };
+    const reversed_index = collision.Index.build(&reversed);
+    const reversed_deaths = startingCollisionDeaths(&reversed, &reversed_index);
+    try std.testing.expect(reversed_deaths[0]);
+    try std.testing.expect(reversed_deaths[1]);
+    try std.testing.expect(!reversed_deaths[2]);
+}
+
+test "head-to-head and mutual body collisions kill every attacker simultaneously" {
+    var connection = Conn{ .fd = -1 };
+    var a_cells = [_]model.CellPos{
+        .{ .x = 80, .y = 80 },
+        .{ .x = 96, .y = 80 },
+    };
+    var b_cells = [_]model.CellPos{
+        .{ .x = 80, .y = 80 },
+        .{ .x = 64, .y = 80 },
+    };
+    var a = Player{
+        .id = @constCast("a"),
+        .name = @constCast("a"),
+        .color_hex = @constCast("#abcdef"),
+        .snake = .{ .items = &a_cells, .capacity = a_cells.len },
+        .conn = &connection,
+    };
+    var b = Player{
+        .id = @constCast("b"),
+        .name = @constCast("b"),
+        .color_hex = @constCast("#fedcba"),
+        .snake = .{ .items = &b_cells, .capacity = b_cells.len },
+        .conn = &connection,
+    };
+    const players = [_]*Player{ &a, &b };
+    var index = collision.Index.build(&players);
+    var deaths = startingCollisionDeaths(&players, &index);
+    try std.testing.expect(deaths[0] and deaths[1]);
+
+    a_cells = .{
+        .{ .x = 64, .y = 64 },
+        .{ .x = 80, .y = 64 },
+    };
+    b_cells = .{
+        .{ .x = 80, .y = 64 },
+        .{ .x = 64, .y = 64 },
+    };
+    index = collision.Index.buildForced(&players);
+    deaths = startingCollisionDeaths(&players, &index);
+    try std.testing.expect(deaths[0] and deaths[1]);
 }
 
 test "shared keyframe coalescing preserves partial frames and controls" {

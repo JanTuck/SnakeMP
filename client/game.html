@@ -18,9 +18,9 @@
             </div>
             <form id="join_form">
                 <div class="field">
-                    <label for="username">Player name <span>4&ndash;16 characters</span></label>
+                    <label for="username">Player name <span>Up to 64 characters</span></label>
                     <input id="username" name="username" type="text" required placeholder="Choose a name"
-                           minlength="4" maxlength="16" autocomplete="nickname" spellcheck="false">
+                           autocomplete="nickname" spellcheck="false">
                 </div>
                 <div class="field">
                     <label for="lobby_password">Lobby password <span>Optional</span></label>
@@ -36,6 +36,7 @@
 </div>
 <canvas id="canvas" aria-label="Snake game board" width="2048" height="1152">
 </canvas>
+<div id="nameplates" aria-hidden="true"></div>
 <aside id="hud" aria-label="Game status"></aside>
 <script src="/js/transport.js"></script>
 <script src="/js/userInput.js" type="module"></script>
@@ -98,11 +99,19 @@
     joinForm.addEventListener('submit', (event) => {
         event.preventDefault(); // Stay on the page; the form must not reload it.
         if (joinPending) return;
-        const username = domUsername.value;
+        const username = domUsername.value.trim();
         const password = domPassword?.value || '';
+        const usernameLength = Array.from(username).length;
+        const usernameBytes = new TextEncoder().encode(username).length;
+        const usernameValid = usernameLength >= 1 && usernameLength <= 64 && usernameBytes <= 255;
         const passwordValid = new TextEncoder().encode(password).length <= 64;
+        domUsername.setCustomValidity(usernameValid ? '' : 'Use 1 to 64 characters (255 UTF-8 bytes maximum).');
         if (domPassword !== null) {
             domPassword.setCustomValidity(passwordValid ? '' : 'Password must be 64 UTF-8 bytes or fewer.');
+        }
+        if (!usernameValid) {
+            domUsername.reportValidity();
+            return;
         }
         if (!passwordValid) {
             domPassword?.reportValidity();

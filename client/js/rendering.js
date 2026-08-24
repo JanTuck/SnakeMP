@@ -13,11 +13,13 @@ import { resetDirection, syncDirection } from "./userInput.js";
 // where the player joins.
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext('2d');
+const nameplateLayer = document.getElementById("nameplates");
 
 const TICK_MS = 1000 / 15; // must match the server game loop
 const DROP_TTL_MS = 25000;
 
 const snakeList = new Map();
+const nameplates = new Map();
 let food = null;
 let isSetup = false;
 let gameOver = false;
@@ -86,6 +88,59 @@ function drawSprite(name, cellX, cellY, size, alpha = 1) {
     ctx.globalAlpha = 1;
 }
 
+function ensureNameplate(id, displayName) {
+    let plate = nameplates.get(id);
+    if (plate === undefined) {
+        const element = document.createElement('span');
+        element.className = 'player-nameplate';
+        element.dir = 'auto';
+        element.hidden = true;
+        nameplateLayer.appendChild(element);
+        plate = { element, displayName: '', screenX: 0, screenY: 0, below: false };
+        nameplates.set(id, plate);
+    }
+    if (plate.displayName !== displayName) {
+        plate.displayName = displayName;
+        plate.element.textContent = displayName;
+    }
+}
+
+function removeNameplate(id) {
+    const plate = nameplates.get(id);
+    if (plate === undefined) return;
+    plate.element.remove();
+    nameplates.delete(id);
+}
+
+function prepareNameplate(snake, t, rect) {
+    const plate = nameplates.get(snake.id);
+    const current = snake.snake[0];
+    if (plate === undefined || current === undefined) return;
+    const previous = snake.interpolate && snake.prevSnake.length > 0 ? snake.prevSnake[0] : current;
+    const worldX = previous.x + (current.x - previous.x) * t + snake.scale / 2;
+    const worldY = previous.y + (current.y - previous.y) * t + snake.scale / 2;
+    plate.screenX = rect.left + worldX * rect.width / canvas.width;
+    plate.screenY = rect.top + worldY * rect.height / canvas.height;
+    plate.element.hidden = false;
+}
+
+function placeNameplates(rect) {
+    // Read every label's geometry before writing any positions. This prevents
+    // one player's animation from forcing layout before the next is measured.
+    const right = rect.right ?? rect.left + rect.width;
+    for (const plate of nameplates.values()) {
+        if (plate.element.hidden) continue;
+        const halfWidth = Math.min((plate.element.offsetWidth || 0) / 2, Math.max(0, rect.width / 2 - 8));
+        plate.screenX = Math.max(rect.left + halfWidth + 8, Math.min(right - halfWidth - 8, plate.screenX));
+        plate.below = plate.screenY < rect.top + (plate.element.offsetHeight || 28) + 10;
+    }
+    for (const plate of nameplates.values()) {
+        if (plate.element.hidden) continue;
+        plate.element.style.translate = `${plate.screenX}px ${plate.screenY}px`;
+        plate.element.classList.toggle('is-below', plate.below);
+    }
+}
+
 // Immutable identity metadata arrives only on membership changes. Binary
 // snapshots are positional records aligned to this roster.
 socket.on("r", (nextRoster) => {
@@ -103,6 +158,7 @@ socket.on("r", (nextRoster) => {
         const meta = nextRoster[i];
         const id = meta[0];
         live.add(id);
+        ensureNameplate(id, meta[1]);
         let state = compactById.get(id);
         if (state === undefined) {
             state = { id, displayName: meta[1], color: meta[2], score: 0, bodyLength: 0, snake: [] };
@@ -118,6 +174,7 @@ socket.on("r", (nextRoster) => {
             compactById.delete(id);
             snakeList.delete(id);
             prevScores.delete(id);
+            removeNameplate(id);
         }
     }
     roster = nextRoster;
@@ -218,6 +275,7 @@ socket.on('init', (initData) => {
 
     food = { x: initData.food.x, y: initData.food.y };
     gameOver = false;
+    nameplateLayer.hidden = false;
     resetDirection();
     gameOverMenu?.destroy?.();
     gameOverMenu = null;
@@ -254,6 +312,7 @@ socket.on('feed', (item) => {
 
 socket.on('death', (score) => {
     gameOver = true; // Stop drawing ticks over the game over screen.
+    nameplateLayer.hidden = true;
     resetDirection();
     Sfx.death();
     shakeUntil = performance.now() + 450;
@@ -342,10 +401,12 @@ function frame(now) {
     }
 
     drawWorld(now);
+    const canvasRect = canvas.getBoundingClientRect();
     for (let snake of snakeList.values()) {
         snake.draw(t);
-        snake.drawDisplayName();
+        prepareNameplate(snake, t, canvasRect);
     }
+    placeNameplates(canvasRect);
     Particles.update(dt);
     Particles.draw(ctx);
     ctx.restore();

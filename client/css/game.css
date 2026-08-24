@@ -57,6 +57,46 @@ canvas {
     -ms-interpolation-mode: nearest-neighbor;
 }
 
+/* Names remain browser-rendered and anti-aliased while the arena keeps its
+   intentional nearest-neighbour sprite scaling. */
+#nameplates {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    overflow: hidden;
+    pointer-events: none;
+}
+
+#nameplates[hidden],
+.player-nameplate[hidden] { display: none; }
+
+.player-nameplate {
+    position: absolute;
+    left: 0;
+    top: 0;
+    max-width: calc(100vw - 16px);
+    padding: 4px 8px 5px;
+    overflow: hidden;
+    color: #fffaf1;
+    background: rgba(13, 16, 22, 0.88);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(4, 6, 11, 0.26);
+    font-size: clamp(0.75rem, 0.35vw + 0.68rem, 0.94rem);
+    font-weight: 720;
+    line-height: 1.1;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    transform: translate3d(-50%, calc(-100% - 8px), 0);
+    will-change: translate;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    unicode-bidi: isolate;
+}
+
+.player-nameplate.is-below {
+    transform: translate3d(-50%, 12px, 0);
+}
+
 img { display: block; }
 
 .background_blur {
@@ -79,15 +119,6 @@ img { display: block; }
     border: 1px solid var(--line-strong);
     border-radius: 14px;
     box-shadow: 0 24px 64px rgba(0, 0, 0, 0.58);
-}
-
-.popup::before {
-    content: "";
-    position: absolute;
-    inset: 0 0 auto;
-    height: 3px;
-    border-radius: 14px 14px 0 0;
-    background: var(--apple);
 }
 
 .popup_content { padding: 30px 32px 26px; }
@@ -531,14 +562,6 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
     border: 1px solid var(--line-strong);
     border-radius: 14px;
     box-shadow: 0 24px 64px rgba(0, 0, 0, 0.58);
-}
-
-.game-over-panel::before {
-    content: "";
-    position: absolute;
-    inset: 0 0 auto;
-    height: 3px;
-    background: var(--apple);
 }
 
 .game-over-panel h1 {

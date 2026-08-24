@@ -25,6 +25,11 @@ pub const DEFAULT_LOBBY_ID = "12345";
 /// Passwords are request- and packet-bounded before hashing. This is a byte
 /// limit (not a code-point limit), matching HTTP and WebSocket wire lengths.
 pub const MAX_LOBBY_PASSWORD_BYTES: usize = 64;
+/// Display names are counted as Unicode code points, with the independent
+/// byte ceiling inherited from the one-byte WebSocket field length.
+pub const MIN_USERNAME_CODEPOINTS: usize = 1;
+pub const MAX_USERNAME_CODEPOINTS: usize = 64;
+pub const MAX_USERNAME_BYTES: usize = 255;
 
 pub const BONUS_CAP: usize = 12;
 pub const DROP_MAX: usize = 2;
