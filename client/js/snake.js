@@ -46,13 +46,13 @@ export default class Snake {
         }
         const head = this.snake[0];
         const previousHead = this.prevSnake[0];
-        let dx = previousHead === undefined || head === undefined ? 0 : head.x - previousHead.x;
-        let dy = previousHead === undefined || head === undefined ? 0 : head.y - previousHead.y;
-        // The neck also reveals heading when there is no previous moving frame.
-        if (dx === 0 && dy === 0 && player.cells > 1) {
-            dx = head.x - this.snake[1].x;
-            dy = head.y - this.snake[1].y;
-        }
+        const motionDx = previousHead === undefined || head === undefined ? 0 : head.x - previousHead.x;
+        const motionDy = previousHead === undefined || head === undefined ? 0 : head.y - previousHead.y;
+        // A recovery keyframe may span several turns. Its neck is the current
+        // authoritative heading; net displacement from an old rendered head
+        // is only a fallback for a one-cell snake.
+        const dx = player.cells > 1 ? head.x - this.snake[1].x : motionDx;
+        const dy = player.cells > 1 ? head.y - this.snake[1].y : motionDy;
         if (Math.abs(dx) > Math.abs(dy)) this.heading = dx < 0 ? "ArrowLeft" : "ArrowRight";
         else if (dy !== 0) this.heading = dy < 0 ? "ArrowUp" : "ArrowDown";
         this.id = meta[0];
@@ -62,7 +62,7 @@ export default class Snake {
         this.bodyLength = player.cells;
         // A recovery keyframe may jump several cells after dropped deltas;
         // interpolate only an adjacent (or unchanged) authoritative update.
-        this.interpolate = Math.abs(dx) + Math.abs(dy) <= this.scale;
+        this.interpolate = Math.abs(motionDx) + Math.abs(motionDy) <= this.scale;
     }
 
     // Commit one validated delta. Body transitions are deterministic shifts,

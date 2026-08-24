@@ -138,6 +138,43 @@ The earlier 1,000-player v2 scaling row below measured 172.11 B average wire and
 runs, so this is evidence of the intended byte reduction rather than a formal
 paired performance trial.
 
+## Fan-out accounting and tick scratch
+
+Snapshot fan-out previously performed one global byte-counter and one global
+frame-counter atomic operation per client per tick. The current path totals
+direct writes locally and commits each counter once per lobby broadcast; queued
+suffix bytes remain counted by the reactor when written. At 16 players per
+lobby this removes 93.75% of those diagnostic read-modify-write operations
+(about 360,000/s to 22,500/s at 12,000 players). When `SNEK_DEBUG` is disabled,
+all diagnostic network atomics are now omitted from the production hot path.
+
+A paired 1,000-player, four-second v3 trial against isolated before/after
+binaries kept exactly 1,000 clients, zero join failures/disconnects, a 1.0
+delivery ratio, and approximately 14,967 frames/s and 510.4 KB/s in both runs.
+CPU was 8.48% in both samples. Fan-out p50/p95/p99 was
+136.679/182.786/217.892 us before and 143.181/190.851/215.949 us after; that
+single end-to-end sample is noise-scale and does not establish a whole-server
+latency improvement. It does verify that batching preserved accounting,
+delivery, and cadence while removing the deterministic cross-worker atomic
+operation count.
+
+The worker tick also replaced two arena-backed pointer lists with bounded
+16-player stack arrays, uses the collision index's active mask instead of a
+string-map lookup for tombstones, and samples wall time once per packed worker
+tick instead of once per lobby. `bench_tick_scratch.zig`, using 16 players and
+128 lobbies per worker and reporting the median of five samples, measured:
+
+| Operation | Before | After | Reduction |
+|---|---:|---:|---:|
+| Snapshot + graveyard scratch | 16.96 ns/lobby | 3.90 ns/lobby | 77.0% |
+| Realtime sampling | 2,585.12 ns/worker tick | 20.37 ns/worker tick | 99.2% |
+
+The benchmark is reproducible with
+`cd servers/zig && zig run -O ReleaseFast bench_tick_scratch.zig`. At 750 active
+lobbies the fixed arrays also remove 22,500 arena allocation API calls per
+second; these were cheap retained-arena bump allocations, not 22,500 backing
+heap allocations.
+
 ## Historical v1 wire-format microbenchmark
 
 This older format-selection benchmark is retained to document why binary
@@ -191,14 +228,14 @@ approximately zero, and one respectively after every wave.
 
 | Point | RSS | Players | Connections | Lobbies |
 |---|---:|---:|---:|---:|
-| Baseline | 1,339,392 B | 0 | 2 | 1 |
-| Wave 1 active / recovered | 3,457,024 / 3,461,120 B | 1,000 / 0 | 1,002 / 2 | 64 / 1 |
-| Wave 2 active / recovered | 3,825,664 / 3,825,664 B | 1,000 / 0 | 1,002 / 1 | 64 / 1 |
-| Wave 3 active / recovered | 4,198,400 / 4,202,496 B | 1,000 / 0 | 1,001 / 1 | 64 / 1 |
-| Wave 4 active / recovered | 4,202,496 / 4,202,496 B | 1,000 / 0 | 1,001 / 1 | 64 / 1 |
+| Baseline | 1,347,584 B | 0 | 2 | 1 |
+| Wave 1 active / recovered | 2,654,208 / 2,654,208 B | 1,000 / 0 | 1,002 / 2 | 64 / 1 |
+| Wave 2 active / recovered | 2,748,416 / 2,748,416 B | 1,000 / 0 | 1,002 / 1 | 64 / 1 |
+| Wave 3 active / recovered | 2,748,416 / 2,748,416 B | 1,000 / 0 | 1,001 / 1 | 64 / 1 |
+| Wave 4 active / recovered | 2,748,416 / 2,748,416 B | 1,000 / 0 | 1,001 / 1 | 64 / 1 |
 
-All assertions passed. Recovered RSS grew by 741,376 B from the first to fourth
-recovery, with a fitted slope of 260,096 B/wave, both below the 4 MiB and
+All assertions passed. Recovered RSS grew by 94,208 B from the first to fourth
+recovery, with a fitted slope of 28,262 B/wave, both below the 4 MiB and
 1 MiB/wave regression limits. RSS does **not** immediately fall when small
 allocations are freed because the allocator retains pages for reuse; claiming a
 per-wave RSS drop would therefore be misleading. The leak signal is zero live

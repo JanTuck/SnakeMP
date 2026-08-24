@@ -92,6 +92,11 @@ pub const Index = struct {
         return index.tracked;
     }
 
+    pub inline fn isActive(index: *const Index, slot: usize) bool {
+        std.debug.assert(index.tracked);
+        return (index.active & bit(slot)) != 0;
+    }
+
     /// Return the first other player in stable lobby insertion order.
     pub fn otherAt(index: *const Index, slot: usize, player: *const model.Player) ?Hit {
         std.debug.assert(index.tracked);
@@ -207,6 +212,8 @@ test "index preserves overlapping players and insertion order" {
     try std.testing.expect(first.player == &a);
 
     index.remove(0, &a);
+    try std.testing.expect(!index.isActive(0));
+    try std.testing.expect(index.isActive(1));
     try std.testing.expectEqual(@as(Mask, 0b110), index.maskAt(.{ .x = 16, .y = 16 }));
     const second = index.otherAt(2, &c).?;
     try std.testing.expectEqual(@as(usize, 1), second.slot);

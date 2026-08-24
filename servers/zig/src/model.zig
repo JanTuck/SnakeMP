@@ -25,7 +25,6 @@ pub const Player = struct {
     name: []u8,
     color_hex: []u8,
     snake: std.ArrayListUnmanaged(CellPos) = .empty,
-    body_length: usize = 1,
     score: i64 = 0,
     dir: ?Direction = null,
     queue: [2]Direction = undefined,
@@ -47,7 +46,6 @@ pub const Player = struct {
     pub fn eat(player: *Player, points: i64, growth: i64) void {
         player.score += points;
         player.pending_growth += growth;
-        player.body_length = player.snake.items.len + @as(usize, @intCast(player.pending_growth));
     }
 
     pub fn applyMove(player: *Player, allocator: std.mem.Allocator) void {
@@ -72,12 +70,11 @@ pub const Player = struct {
         var i = player.snake.items.len - 1;
         while (i > 0) : (i -= 1) player.snake.items[i] = player.snake.items[i - 1];
         player.snake.items[0] = head;
-        player.body_length = player.snake.items.len;
     }
 };
 
 pub const BonusApple = struct { pos: CellPos };
-pub const Drop = struct { id: []u8, pos: CellPos, expires_at: i64 };
+pub const Drop = struct { pos: CellPos, expires_at: i64 };
 pub const Golden = struct { pos: CellPos, expires_at: i64 };
 pub const TickStats = struct {
     last_tick_ms: f64 = 0,
@@ -148,7 +145,6 @@ pub const Lobby = struct {
     golden: ?Golden = null,
     next_drop_at: i64 = 0,
     next_golden_at: i64 = 0,
-    drop_seq: u64 = 1,
     last_empty_at: i64 = 0,
     roster_wire: std.ArrayListUnmanaged(u8) = .empty,
     roster_dirty: bool = true,

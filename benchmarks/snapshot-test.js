@@ -17,6 +17,8 @@ function frame(bytes, prefix = 0) {
   const source = fs.readFileSync(path.join(__dirname, '..', 'client', 'js', 'snapshot.js'), 'utf8');
   const moduleUrl = 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
   const { decodeSnapshot } = await import(moduleUrl);
+  const snakeSource = fs.readFileSync(path.join(__dirname, '..', 'client', 'js', 'snake.js'), 'utf8');
+  const { default: Snake } = await import('data:text/javascript;base64,' + Buffer.from(snakeSource).toString('base64'));
 
   const keyframe = frame([
     0x53, 0x4e, 3, 0, 1, 0, 1, 0, 1,
@@ -51,6 +53,17 @@ function frame(bytes, prefix = 0) {
     0, 0, 0,
   ]);
   assert.equal(decodeSnapshot(recovery, 1, 2, current)?.sequence, 10, 'independent keyframes must recover any prior sequence');
+
+  const recoveredSnake = new Snake({ canvas: {} }, ['id', 'name', '#123456']);
+  recoveredSnake.snake = [{ x: 10 * 16, y: 10 * 16 }];
+  // Head (18,11), then neck (18,10): the current heading is down even though
+  // net displacement since the last visible frame is mostly rightward.
+  const recoveryBody = new DataView(Uint8Array.from([18, 11, 0]).buffer);
+  recoveredSnake.updateKeyframe(['id', 'name', '#123456'], recoveryBody, {
+    cells: 2, packed: true, bodyOffset: 0, score: 0,
+  });
+  assert.equal(recoveredSnake.heading, 'ArrowDown', 'keyframe neck must determine recovery heading');
+  assert.equal(recoveredSnake.interpolate, false, 'multi-tick recovery must not interpolate');
 
   console.log('snapshot v3 production decoder tests: PASS');
 })().catch((error) => {

@@ -448,7 +448,7 @@ fn connQueueRaw(c: *Conn, bytes: []const u8) void {
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 const sent: usize = @intCast(rc);
-                _ = network_bytes_sent.fetchAdd(sent, .monotonic);
+                if (debug_enabled) _ = network_bytes_sent.fetchAdd(sent, .monotonic);
                 if (sent < bytes.len) _ = appendOwnedOutput(c, bytes[sent..], "");
                 return;
             },
@@ -500,7 +500,7 @@ fn connQueueResponse(c: *Conn, header: []const u8, body: []const u8, body_static
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 const sent: usize = @intCast(rc);
-                _ = network_bytes_sent.fetchAdd(sent, .monotonic);
+                if (debug_enabled) _ = network_bytes_sent.fetchAdd(sent, .monotonic);
                 if (sent < header.len) {
                     queueSuffix(c, header[sent..], body, body_static);
                 } else if (sent < header.len + body.len) {
@@ -527,7 +527,7 @@ fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
     c.output_mutex.lockUncancelable(g_io);
     defer c.output_mutex.unlock(g_io);
     if (c.closing or c.poisoned) return;
-    _ = websocket_frames_sent.fetchAdd(1, .monotonic);
+    if (debug_enabled) _ = websocket_frames_sent.fetchAdd(1, .monotonic);
     var hdr: [10]u8 = undefined;
     const hlen = wsHeader(&hdr, opcode, payload.len);
     if (!outputEmpty(c)) {
@@ -544,7 +544,7 @@ fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 const sent: usize = @intCast(rc);
-                _ = network_bytes_sent.fetchAdd(sent, .monotonic);
+                if (debug_enabled) _ = network_bytes_sent.fetchAdd(sent, .monotonic);
                 if (sent < hlen) {
                     _ = appendOwnedOutput(c, hdr[sent..hlen], payload);
                 } else if (sent < hlen + payload.len) {
@@ -628,7 +628,7 @@ fn flushOutput(c: *Conn) bool {
                 const sent: usize = @intCast(rc);
                 c.output_offset += sent;
                 c.output_bytes -= sent;
-                _ = network_bytes_sent.fetchAdd(sent, .monotonic);
+                if (debug_enabled) _ = network_bytes_sent.fetchAdd(sent, .monotonic);
                 if (c.output_offset == total) {
                     releasePending(output);
                     c.output_head += 1;
@@ -716,8 +716,8 @@ fn broadcastBinarySnapshot(l: *Lobby, frame: *model.SharedFrame, now: i64, seque
     defer if (cached_recovery) |recovery| releaseSharedFrame(recovery);
     var accounting: SharedFrameAccounting = .{};
     defer {
-        if (accounting.bytes_sent != 0) _ = network_bytes_sent.fetchAdd(accounting.bytes_sent, .monotonic);
-        if (accounting.frames_sent != 0) _ = websocket_frames_sent.fetchAdd(accounting.frames_sent, .monotonic);
+        if (debug_enabled and accounting.bytes_sent != 0) _ = network_bytes_sent.fetchAdd(accounting.bytes_sent, .monotonic);
+        if (debug_enabled and accounting.frames_sent != 0) _ = websocket_frames_sent.fetchAdd(accounting.frames_sent, .monotonic);
     }
 
     for (l.players.values()) |player| {
@@ -796,9 +796,10 @@ fn gameWorkerLoop(worker: *GameWorker) void {
         if (worker.stop.load(.acquire)) break;
         _ = arena.reset(.retain_capacity);
         worker.mutex.lockUncancelable(g_io);
+        const tick_now = unixMillis();
         for (worker.lobbies.items) |lobby| {
             lobby.mutex.lockUncancelable(g_io);
-            if (lobby.players.count() > 0) tickLobby(lobby, unixMillis(), arena.allocator());
+            if (lobby.players.count() > 0) tickLobby(lobby, tick_now, arena.allocator());
             lobby.mutex.unlock(g_io);
         }
         worker.mutex.unlock(g_io);
@@ -1021,7 +1022,6 @@ fn unassignGameWorker(lobby: *Lobby) void {
 
 fn destroyLobby(l: *Lobby) void {
     unassignGameWorker(l);
-    for (l.drops.items) |d| galloc.free(d.id);
     l.drops.deinit(galloc);
     l.bonus.deinit(galloc);
     l.roster_wire.deinit(galloc);
@@ -1246,12 +1246,7 @@ fn respawnFood(l: *Lobby) void {
 
 fn spawnDropLocked(l: *Lobby, now: i64, aa: Allocator) void {
     const cell = randomFreeCell(l) orelse return;
-    const id = std.fmt.allocPrint(galloc, "drop-{d}", .{l.drop_seq}) catch return;
-    l.drop_seq += 1;
-    l.drops.append(galloc, .{ .id = id, .pos = cell, .expires_at = now + DROP_TTL_MS }) catch {
-        galloc.free(id);
-        return;
-    };
+    l.drops.append(galloc, .{ .pos = cell, .expires_at = now + DROP_TTL_MS }) catch return;
     const frame = eventFrame(aa, "feed", ",{\"type\":\"drop-incoming\"}") catch return;
     defer aa.free(frame);
     broadcastLobby(l, frame);
@@ -1299,6 +1294,13 @@ fn buildRoster(l: *Lobby) ![]const u8 {
     return l.roster_wire.items[0 .. l.roster_wire.items.len - 1];
 }
 
+fn applyMoveAndCheckWall(player: *Player, slot: usize, collision_index: *collision.Index) bool {
+    const before_move = collision.BeforeMove.capture(player);
+    player.applyMove(galloc);
+    collision_index.afterMove(slot, player, before_move);
+    return collidedWall(player.snake.items[0]);
+}
+
 // ------------------------------------------------------------------ tick
 
 fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
@@ -1309,7 +1311,6 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
         var di: usize = 0;
         while (di < l.drops.items.len) {
             if (l.drops.items[di].expires_at <= now) {
-                galloc.free(l.drops.items[di].id);
                 _ = l.drops.orderedRemove(di);
             } else di += 1;
         }
@@ -1332,24 +1333,26 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
 
     // 3. per-player simulation, insertion order. Deaths are tombstoned and
     //    destroyed after the broadcast (the snapshot keeps borrowing them).
-    var snapshot: std.ArrayListUnmanaged(*Player) = .empty;
-    defer snapshot.deinit(aa);
-    snapshot.appendSlice(aa, l.players.values()) catch return;
+    const player_count = l.players.count();
+    if (player_count > binary_snapshot.MAX_PLAYERS) return;
+    var snapshot_storage: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
+    @memcpy(snapshot_storage[0..player_count], l.players.values());
+    const snapshot = snapshot_storage[0..player_count];
 
-    // Every player can enter the graveyard at most once per tick. Reserve the
-    // full capacity before mutating the lobby so allocation failure can never
-    // force us to destroy a player still borrowed by `snapshot`.
-    var graveyard: std.ArrayListUnmanaged(*Player) = .empty;
+    // Death processing mutates the ordered player map, so retain the initial
+    // insertion order on the worker stack and destroy tombstones after fanout.
+    var graveyard_storage: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
+    var graveyard_len: usize = 0;
     defer {
-        for (graveyard.items) |p| destroyPlayer(p);
-        graveyard.deinit(aa);
+        for (graveyard_storage[0..graveyard_len]) |p| destroyPlayer(p);
     }
-    graveyard.ensureTotalCapacity(aa, snapshot.items.len) catch return;
-    var collision_index = collision.Index.build(snapshot.items);
+    var collision_index = collision.Index.build(snapshot);
 
-    for (snapshot.items, 0..) |p, slot| {
+    for (snapshot, 0..) |p, slot| {
         // skip players killed earlier in this same tick
-        if (l.players.get(p.id) == null) continue;
+        if (collision_index.tracksPlayers()) {
+            if (!collision_index.isActive(slot)) continue;
+        } else if (l.players.get(p.id) == null) continue;
 
         const head = p.snake.items[0];
 
@@ -1359,7 +1362,8 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
             feedDeath(l, p, aa);
             collision_index.remove(slot, p);
             detachPlayer(l, p);
-            graveyard.appendAssumeCapacity(p);
+            graveyard_storage[graveyard_len] = p;
+            graveyard_len += 1;
             continue;
         }
 
@@ -1379,9 +1383,11 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
             collision_index.remove(slot, p);
             collision_index.remove(hit.slot, other);
             detachPlayer(l, p);
-            graveyard.appendAssumeCapacity(p);
+            graveyard_storage[graveyard_len] = p;
+            graveyard_len += 1;
             detachPlayer(l, other);
-            graveyard.appendAssumeCapacity(other);
+            graveyard_storage[graveyard_len] = other;
+            graveyard_len += 1;
             continue;
         }
 
@@ -1421,7 +1427,6 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
                 di -= 1;
                 const dp = l.drops.items[di].pos;
                 if (head.x == dp.x and head.y == dp.y) {
-                    galloc.free(l.drops.items[di].id);
                     _ = l.drops.swapRemove(di);
                     openDropLocked(l, p, aa);
                 }
@@ -1429,9 +1434,18 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
         }
 
         // g. one queued turn, then move
-        const before_move = collision.BeforeMove.capture(p);
-        p.applyMove(galloc);
-        collision_index.afterMove(slot, p, before_move);
+        const crossed_wall = applyMoveAndCheckWall(p, slot, &collision_index);
+        // Never publish an out-of-board head. The decoder deliberately rejects
+        // invalid coordinates, so wall death must happen in the movement tick
+        // rather than one snapshot later.
+        if (crossed_wall) {
+            sendDeathEvent(p.conn, p.score, aa);
+            feedDeath(l, p, aa);
+            collision_index.remove(slot, p);
+            detachPlayer(l, p);
+            graveyard_storage[graveyard_len] = p;
+            graveyard_len += 1;
+        }
     }
 
     // 5. broadcast membership metadata only when it changed, followed by the
@@ -1885,7 +1899,7 @@ fn parseWsFrames(c: *Conn, aa: Allocator, data: []u8) !WsResult {
         const payload = data[pstart .. pstart + len];
         for (payload, 0..) |*ch, i| ch.* ^= key[i & 3];
         off += hdr_len + 4 + len;
-        _ = websocket_frames_received.fetchAdd(1, .monotonic);
+        if (debug_enabled) _ = websocket_frames_received.fetchAdd(1, .monotonic);
 
         switch (opcode) {
             0x1 => {}, // text control packets are server-only
@@ -2021,7 +2035,7 @@ fn readAvailable(c: *Conn, aa: Allocator) bool {
             .SUCCESS => {
                 const count: usize = @intCast(rc);
                 if (count == 0) return false;
-                _ = network_bytes_received.fetchAdd(count, .monotonic);
+                if (debug_enabled) _ = network_bytes_received.fetchAdd(count, .monotonic);
                 c.last_activity_ms = unixMillis();
                 c.input.appendSlice(galloc, scratch[0..count]) catch return false;
                 const max_input = if (c.mode == .http) MAX_HTTP_INPUT else MAX_WS_INPUT;
@@ -2339,6 +2353,30 @@ test "compact roster and tick preserve world information" {
     const result = try binary_snapshot.build(&wire, &lobby, 0, galloc);
     try std.testing.expectEqual(binary_snapshot.Kind.keyframe, result.kind);
     try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', binary_snapshot.VERSION, 0 }, result.bytes[0..4]);
+}
+
+test "movement reports a wall crossing before snapshot publication" {
+    galloc = std.testing.allocator;
+    var connection = Conn{ .fd = -1 };
+    var player = Player{
+        .id = @constCast("sid"),
+        .name = @constCast("name"),
+        .color_hex = @constCast("#abcdef"),
+        .dir = .right,
+        .conn = &connection,
+    };
+    defer player.snake.deinit(galloc);
+    try player.snake.append(galloc, .{ .x = GRID_W - model.CELL, .y = 10 * model.CELL });
+    const players = [_]*Player{&player};
+    var collision_index = collision.Index.build(&players);
+    try std.testing.expect(applyMoveAndCheckWall(&player, 0, &collision_index));
+    try std.testing.expectEqual(GRID_W, player.snake.items[0].x);
+
+    player.snake.items[0].x = 0;
+    player.dir = .left;
+    collision_index = collision.Index.build(&players);
+    try std.testing.expect(applyMoveAndCheckWall(&player, 0, &collision_index));
+    try std.testing.expectEqual(-model.CELL, player.snake.items[0].x);
 }
 
 test "shared keyframe coalescing preserves partial frames and controls" {

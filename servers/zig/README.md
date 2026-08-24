@@ -102,4 +102,5 @@ npm run parity
 npm run test:memory
 node benchmarks/wire-format-bench.js
 cd servers/zig && zig run -O ReleaseFast bench_snapshot.zig
+cd servers/zig && zig run -O ReleaseFast bench_tick_scratch.zig
 ```

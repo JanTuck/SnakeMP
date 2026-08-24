@@ -133,6 +133,8 @@ socket.on("b", (payload) => {
     if (!isSetup || gameOver) return;
     const frame = decodeSnapshot(payload, roster.length, lastSnapshotSequence, compactPlayers);
     if (frame === null) return;
+    const scoreEffects = [];
+    let localHeading = null;
     try {
         for (let index = 0; index < frame.playerCount; index++) {
             const meta = roster[index];
@@ -146,17 +148,13 @@ socket.on("b", (payload) => {
             }
             if (frame.kind === 0) snake.updateKeyframe(meta, frame.view, update);
             else snake.updateDelta(meta, update);
-            if (state.id === socket.id) confirmHeading(snake.heading);
+            if (state.id === socket.id) localHeading = snake.heading;
             state.score = update.score;
             state.bodyLength = update.cells;
             state.snake = snake.snake;
             if (update.score > before && update.cells > 0) {
                 const head = snake.snake[0];
-                Particles.burst(head.x + 8, head.y + 8, state.color, state.id === socket.id ? 18 : 8);
-                if (state.id === socket.id) {
-                    Sfx.eat();
-                    Hud.popScore();
-                }
+                scoreEffects.push({ x: head.x + 8, y: head.y + 8, color: state.color, local: state.id === socket.id });
             }
         }
 
@@ -182,10 +180,23 @@ socket.on("b", (payload) => {
         world.players = compactPlayers;
         lastSnapshotSequence = frame.sequence;
         lastTickAt = performance.now();
-        Hud.update(compactPlayers, socket.id);
     } catch (_) {
         // DataView bounds checks are a final guard against hostile frames.
+        return;
     }
+
+    // Effects are best effort and run only after the authoritative state and
+    // sequence are committed. A broken audio/HUD/particle effect must not
+    // strand the decoder on an old base sequence with partially applied state.
+    if (localHeading !== null) try { confirmHeading(localHeading); } catch (_) {}
+    for (const effect of scoreEffects) {
+        try { Particles.burst(effect.x, effect.y, effect.color, effect.local ? 18 : 8); } catch (_) {}
+        if (effect.local) {
+            try { Sfx.eat(); } catch (_) {}
+            try { Hud.popScore(); } catch (_) {}
+        }
+    }
+    try { Hud.update(compactPlayers, socket.id); } catch (_) {}
 });
 
 socket.on('init', (initData) => {

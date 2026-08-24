@@ -185,9 +185,9 @@ two drops), golden presence, and exact end-of-frame alignment. Malformed,
 truncated, or out-of-sequence snapshots are ignored without mutating game
 state.
 
-Drop ids are intentionally absent: the browser renders position and TTL and
-never consumes the server's internal drop id. TTL values are clamped to
-`0..65535`; game TTLs are lower than this bound.
+Drops have no identity allocation: the game and browser consume only position
+and TTL. TTL values are clamped to `0..65535`; game TTLs are lower than this
+bound.
 
 ## Tick order
 
