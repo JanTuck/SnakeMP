@@ -34,6 +34,8 @@
 <script src="/js/rendering.js" type="module"></script>
 <script>
     const socket = io();
+    // This page always belongs to the lobby in its URL: /game/<id>.
+    const LOBBY_ID = decodeURIComponent(location.pathname.split('/').filter(Boolean)[1] || '') || '12345';
     //Set last used username if present
     let domUsername = document.getElementById('username');
     let savedUsername = null;
@@ -49,7 +51,7 @@
     document.getElementById('join_form').addEventListener('submit', (event) => {
         event.preventDefault(); // Stay on the page; the form must not reload it.
         const username = domUsername.value;
-        socket.emit('clientReady', username);
+        socket.emit('clientReady', username, LOBBY_ID);
         hasJoined = true;
         try {
             localStorage.setItem("snake_username", username);
@@ -61,7 +63,7 @@
     // automatically with the last used username.
     socket.on('connect', () => {
         if (hasJoined && savedUsername !== null) {
-            socket.emit('clientReady', savedUsername);
+            socket.emit('clientReady', savedUsername, LOBBY_ID);
         }
     });
 
