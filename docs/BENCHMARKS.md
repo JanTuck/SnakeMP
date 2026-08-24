@@ -175,6 +175,14 @@ lobbies the fixed arrays also remove 22,500 arena allocation API calls per
 second; these were cheap retained-arena bump allocations, not 22,500 backing
 heap allocations.
 
+Visibility bandwidth must distinguish ordinary deltas from complete recovery
+keyframes. With the measured 16-player, 18-cell v3 stream (28 B delta, 220 B
+keyframe, one periodic keyframe per 30 foreground snapshots), one foreground
+client consumes 516 B/s of application snapshot payload and one hidden client
+at 1 Hz consumes 220 B/s: a **57.36%** reduction, not the naive 93.33% cadence
+ratio. `node benchmarks/visibility-bandwidth.js` projects mixed-client totals
+with those payload classes separately.
+
 ## Historical v1 wire-format microbenchmark
 
 This older format-selection benchmark is retained to document why binary

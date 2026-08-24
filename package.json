@@ -7,14 +7,18 @@
     "build": "npm run build:zig",
     "build:zig": "bash servers/zig/build-assets.sh && cd servers/zig && ${ZIG_BIN:-zig} build-exe -O ReleaseFast -fstrip src/main.zig -femit-bin=snek-zig --cache-dir .zig-cache --global-cache-dir .zig-global-cache",
     "format": "zig fmt servers/zig/src/*.zig",
+    "test": "npm run check",
     "check": "npm run check:zig && npm run test:transport && npm run test:snapshot",
     "check:zig": "bash servers/zig/build-assets.sh && cd servers/zig && ${ZIG_BIN:-zig} fmt --check src/*.zig && ${ZIG_BIN:-zig} test src/main.zig --cache-dir .zig-cache --global-cache-dir .zig-global-cache",
     "test:transport": "node benchmarks/transport-test.js",
     "test:snapshot": "node benchmarks/snapshot-test.js",
     "test:memory": "npm run build:zig && node benchmarks/run-memory-ramp.js",
+    "test:lifecycle": "npm run build:zig && node benchmarks/run-memory-lifecycle-audit.js",
     "parity": "bash benchmarks/run-parity.sh",
     "benchmark:build": "node benchmarks/build-release.js",
-    "bench": "bash benchmarks/run-benchmarks.sh"
+    "bench:snapshot": "cd servers/zig && zig run -O ReleaseFast --cache-dir .zig-cache --global-cache-dir .zig-global-cache bench_snapshot.zig",
+    "bench:tick-scratch": "cd servers/zig && zig run -O ReleaseFast --cache-dir .zig-cache --global-cache-dir .zig-global-cache bench_tick_scratch.zig",
+    "bench": "npm run build:zig && bash benchmarks/run-benchmarks.sh"
   },
   "dependencies": {
     "ws": "~7.4.2"

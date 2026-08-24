@@ -68,10 +68,44 @@ function connect() {
 const lastPlayers = (events) => { for (let i = events.length - 1; i >= 0; i--) { const e = events[i]; if (e.players) return e.players; } return []; };
 const lastWorld = (events) => { for (let i = events.length - 1; i >= 0; i--) if (events[i].players) return events[i]; return null; };
 const hasEvent = (events, type) => events.some(e => e[type] !== undefined);
-const moved = (samples, axis, sign) => {
-  for (let i = 1; i < samples.length; i++) {
-    const d = samples[i][axis] - samples[i - 1][axis];
-    if (Math.abs(d) > 0 && Math.sign(d) === sign) return true;
+const playerHead = (events, id) => {
+  const player = lastPlayers(events).find(p => p.id === id);
+  const head = player && player.snake[0];
+  return head ? { x: head.x, y: head.y } : null;
+};
+const headMoves = (events, from, id, initialHead) => {
+  const moves = [];
+  let previous = initialHead;
+  for (let i = from; i < events.length; i++) {
+    const players = events[i].players;
+    if (!players) continue;
+    const player = players.find(p => p.id === id);
+    const head = player && player.snake[0];
+    if (!head) continue;
+    if (previous && (head.x !== previous.x || head.y !== previous.y)) {
+      moves.push({ dx: head.x - previous.x, dy: head.y - previous.y });
+    }
+    previous = { x: head.x, y: head.y };
+  }
+  return moves;
+};
+async function observeHeadMoves(events, from, id, initialHead, ready, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let moves = [];
+  do {
+    moves = headMoves(events, from, id, initialHead);
+    if (ready(moves)) return moves;
+    await wait(20);
+  } while (Date.now() < deadline);
+  return headMoves(events, from, id, initialHead);
+}
+const moveEvidence = (moves) => moves.map(({ dx, dy }) => `(${dx},${dy})`).join(' ');
+const isRight = ({ dx, dy }) => dx > 0 && dy === 0;
+const isUp = ({ dx, dy }) => dx === 0 && dy < 0;
+const isLeft = ({ dx, dy }) => dx < 0 && dy === 0;
+const hasChainedUpLeft = (moves) => {
+  for (let i = 0; i + 1 < moves.length; i++) {
+    if (isUp(moves[i]) && isLeft(moves[i + 1])) return true;
   }
   return false;
 };
@@ -122,27 +156,34 @@ const moved = (samples, axis, sign) => {
   a.s.emit('clientReady', 'parity-player', lobbyId);
   await wait(500);
   check('join -> init received', hasEvent(a.events, 'init'));
-  await a.s.emit.call ? null : null;
+  const movementStart = playerHead(a.events, a.s.id);
+  const movementFrom = a.events.length;
   a.s.emit('keyPress', 'ArrowRight');
-  await wait(400);
+  const movementMoves = await observeHeadMoves(a.events, movementFrom, a.s.id, movementStart,
+    moves => moves.some(isRight), 1200);
   const p1 = lastPlayers(a.events).find(p => p.id === a.s.id);
-  check('movement works', !!p1 && p1.snake.length >= 1, JSON.stringify(p1 && p1.snake[0]));
+  check('movement works', !!p1 && p1.snake.length >= 1 && movementMoves.some(isRight), moveEvidence(movementMoves));
   const w1 = lastWorld(a.events);
   check('gameTick world shape', !!w1 && Array.isArray(w1.bonus) && Array.isArray(w1.drops) && 'golden' in (w1 || {}));
 
   // reversal ignored
-  const xBefore = (lastPlayers(a.events).find(p => p.id === a.s.id) || { snake: [{ x: 0 }] }).snake[0].x;
+  const reversalStart = playerHead(a.events, a.s.id);
+  const reversalFrom = a.events.length;
   a.s.emit('keyPress', 'ArrowLeft');
-  await wait(300);
+  const reversalMoves = await observeHeadMoves(a.events, reversalFrom, a.s.id, reversalStart,
+    moves => moves.length >= 2, 1200);
   const p2 = lastPlayers(a.events).find(p => p.id === a.s.id);
-  check('reversal ignored (alive, still moving right)', !!p2 && p2.snake[0].x > xBefore, JSON.stringify(p2 && p2.snake[0]));
+  check('reversal ignored (alive, still moving right)', !!p2 && reversalMoves.length >= 1 && reversalMoves.every(isRight), moveEvidence(reversalMoves));
 
   // chained UP -> LEFT
+  const chainedStart = playerHead(a.events, a.s.id);
+  const chainedFrom = a.events.length;
   a.s.emit('keyPress', 'ArrowUp');
   a.s.emit('keyPress', 'ArrowLeft');
-  await wait(500);
+  const chainedMoves = await observeHeadMoves(a.events, chainedFrom, a.s.id, chainedStart,
+    hasChainedUpLeft, 1500);
   const p3 = lastPlayers(a.events).find(p => p.id === a.s.id);
-  check('chained turn applies over two ticks', !!p3, '');
+  check('chained turn applies over two ticks', !!p3 && hasChainedUpLeft(chainedMoves), moveEvidence(chainedMoves));
 
   // unknown lobby
   const c = await connect();
@@ -161,7 +202,6 @@ const moved = (samples, axis, sign) => {
   check('lobby isolation', bPlayers.length === 1 && bPlayers[0].displayName === 'parity-other', JSON.stringify(bPlayers.map(p => p.displayName)));
 
   // same-socket rejoin after death
-  const beforeDeath = hasEvent(a.events, 'death');
   let died = false;
   for (let i = 0; i < 120 && !died; i++) {
     a.s.emit('keyPress', 'ArrowLeft'); // drive into the left wall

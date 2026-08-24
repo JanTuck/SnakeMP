@@ -1,23 +1,22 @@
 #!/usr/bin/env node
 /*
  * Project server-to-client snapshot bandwidth when background tabs receive
- * visibility-aware 1 Hz updates instead of the foreground 15 Hz cadence.
+ * visibility-aware keyframes at 1 Hz instead of the foreground 15 Hz stream.
  *
- * Override the measured defaults with comma-separated application payload
- * sizes, for example:
- *   SNAPSHOT_BYTES=40,80,160 CLIENTS=12000 node benchmarks/visibility-bandwidth.js
+ * Delta and keyframe payloads differ substantially in snapshot v3, so they
+ * must be supplied separately. Comma-separated lists are paired by position:
+ *   DELTA_BYTES=28,32 KEYFRAME_BYTES=220,300 CLIENTS=12000 \
+ *     node benchmarks/visibility-bandwidth.js
  */
 'use strict';
 
 const assert = require('node:assert/strict');
 
+// The 18-cell sample is the representative production-encoder measurement in
+// docs/BENCHMARKS.md. Its 34.40 B periodic-stream mean consists of a 220 B
+// keyframe every 30 frames and 28 B dependent deltas.
 const DEFAULT_SAMPLES = [
-  { name: 'v2-baseline', bytes: 24.125925925925927 },
-  { name: 'v2-5-bot-ramp', bytes: 72.64444444444445 },
-  { name: 'v2-10-bot-ramp', bytes: 118.32592592592593 },
-  { name: 'v2-20-bot-ramp', bytes: 127.87407407407407 },
-  { name: 'v2-40-bot-ramp', bytes: 157.92830188679244 },
-  { name: 'v2-80-bot-ramp', bytes: 158.06666666666666 },
+  { name: 'v3-16-player-18-cell', deltaBytes: 28, keyframeBytes: 220 },
 ];
 
 function finitePositive(name, raw, fallback) {
@@ -26,11 +25,24 @@ function finitePositive(name, raw, fallback) {
   return value;
 }
 
-function parseSamples(raw) {
-  if (raw === undefined || raw.trim() === '') return DEFAULT_SAMPLES;
-  return raw.split(',').map((item, index) => ({
+function parseByteList(name, raw) {
+  return raw.split(',').map((item, index) => finitePositive(`${name} item ${index + 1}`, item.trim()));
+}
+
+function parseSamples(deltaRaw, keyframeRaw) {
+  if (deltaRaw === undefined && keyframeRaw === undefined) return DEFAULT_SAMPLES;
+  if (deltaRaw === undefined || keyframeRaw === undefined) {
+    throw new Error('DELTA_BYTES and KEYFRAME_BYTES must be configured together');
+  }
+  const deltas = parseByteList('DELTA_BYTES', deltaRaw);
+  const keyframes = parseByteList('KEYFRAME_BYTES', keyframeRaw);
+  if (deltas.length !== keyframes.length) {
+    throw new Error('DELTA_BYTES and KEYFRAME_BYTES must contain the same number of items');
+  }
+  return deltas.map((deltaBytes, index) => ({
     name: `configured-${index + 1}`,
-    bytes: finitePositive(`SNAPSHOT_BYTES item ${index + 1}`, item.trim()),
+    deltaBytes,
+    keyframeBytes: keyframes[index],
   }));
 }
 
@@ -50,26 +62,31 @@ function bandwidth(bytesPerSecond) {
 const clients = finitePositive('CLIENTS', process.env.CLIENTS, 12_000);
 const foregroundHz = finitePositive('FOREGROUND_HZ', process.env.FOREGROUND_HZ, 15);
 const hiddenHz = finitePositive('HIDDEN_HZ', process.env.HIDDEN_HZ, 1);
+const keyframeInterval = finitePositive('KEYFRAME_INTERVAL', process.env.KEYFRAME_INTERVAL, 30);
+if (!Number.isSafeInteger(keyframeInterval)) throw new Error('KEYFRAME_INTERVAL must be a positive integer');
 if (hiddenHz >= foregroundHz) throw new Error('HIDDEN_HZ must be lower than FOREGROUND_HZ');
 
-const samples = parseSamples(process.env.SNAPSHOT_BYTES);
+const samples = parseSamples(process.env.DELTA_BYTES, process.env.KEYFRAME_BYTES);
 const hiddenRatios = [0.25, 0.50, 0.75, 1.00];
-const hiddenClientReduction = 1 - hiddenHz / foregroundHz;
-
-// The requirement is specifically a 15 Hz -> 1 Hz background cadence.
-if (foregroundHz === 15 && hiddenHz === 1) {
-  assert.ok(Math.abs(hiddenClientReduction - 14 / 15) < 1e-12);
-  assert.ok(Math.abs(hiddenClientReduction * 100 - 93.33333333333333) < 1e-10);
-}
+const foregroundKeyframeHz = foregroundHz / keyframeInterval;
+const foregroundDeltaHz = foregroundHz - foregroundKeyframeHz;
 
 const projections = samples.map((sample) => {
-  const allForegroundBytesPerSecond = clients * foregroundHz * sample.bytes;
+  const foregroundBytesPerClientSecond =
+    foregroundDeltaHz * sample.deltaBytes + foregroundKeyframeHz * sample.keyframeBytes;
+  const hiddenBytesPerClientSecond = hiddenHz * sample.keyframeBytes;
+  const hiddenClientReduction = 1 - hiddenBytesPerClientSecond / foregroundBytesPerClientSecond;
+  const allForegroundBytesPerSecond = clients * foregroundBytesPerClientSecond;
+
   const scenarios = hiddenRatios.map((hiddenRatio) => {
     const foregroundClients = clients * (1 - hiddenRatio);
     const hiddenClients = clients * hiddenRatio;
-    const throttledBytesPerSecond = sample.bytes * (
-      foregroundClients * foregroundHz + hiddenClients * hiddenHz
-    );
+    const foregroundDeltaBytesPerSecond = foregroundClients * foregroundDeltaHz * sample.deltaBytes;
+    const foregroundKeyframeBytesPerSecond = foregroundClients * foregroundKeyframeHz * sample.keyframeBytes;
+    const hiddenKeyframeBytesPerSecond = hiddenClients * hiddenHz * sample.keyframeBytes;
+    const throttledBytesPerSecond = foregroundDeltaBytesPerSecond
+      + foregroundKeyframeBytesPerSecond
+      + hiddenKeyframeBytesPerSecond;
     const savedBytesPerSecond = allForegroundBytesPerSecond - throttledBytesPerSecond;
     const savedFraction = savedBytesPerSecond / allForegroundBytesPerSecond;
     const expectedSavedFraction = hiddenRatio * hiddenClientReduction;
@@ -80,6 +97,11 @@ const projections = samples.map((sample) => {
       foregroundClients,
       hiddenClients,
       effectiveSnapshotsPerSecond: foregroundClients * foregroundHz + hiddenClients * hiddenHz,
+      payloadBreakdown: {
+        foregroundDeltas: bandwidth(foregroundDeltaBytesPerSecond),
+        foregroundKeyframes: bandwidth(foregroundKeyframeBytesPerSecond),
+        hiddenKeyframes: bandwidth(hiddenKeyframeBytesPerSecond),
+      },
       throttled: bandwidth(throttledBytesPerSecond),
       saved: bandwidth(savedBytesPerSecond),
       totalBandwidthSavedPct: round(savedFraction * 100, 6),
@@ -87,40 +109,51 @@ const projections = samples.map((sample) => {
   });
 
   assert.ok(Math.abs(
-    scenarios.at(-1).throttled.bytesPerSecond - allForegroundBytesPerSecond * hiddenHz / foregroundHz
+    scenarios.at(-1).throttled.bytesPerSecond - clients * hiddenBytesPerClientSecond
   ) < 0.001);
   return {
     name: sample.name,
-    averageApplicationPayloadBytes: round(sample.bytes, 6),
+    applicationPayloadBytes: {
+      delta: round(sample.deltaBytes, 6),
+      keyframe: round(sample.keyframeBytes, 6),
+      foregroundPeriodicMean: round(foregroundBytesPerClientSecond / foregroundHz, 6),
+    },
+    perClient: {
+      foregroundBytesPerSecond: round(foregroundBytesPerClientSecond, 6),
+      hiddenBytesPerSecond: round(hiddenBytesPerClientSecond, 6),
+      hiddenClientBandwidthReductionPct: round(hiddenClientReduction * 100, 6),
+    },
     allForeground: bandwidth(allForegroundBytesPerSecond),
+    expectedTotalBandwidthSavedPct: {
+      hidden25: round(0.25 * hiddenClientReduction * 100, 6),
+      hidden50: round(0.50 * hiddenClientReduction * 100, 6),
+      hidden75: round(0.75 * hiddenClientReduction * 100, 6),
+      hidden100: round(hiddenClientReduction * 100, 6),
+    },
     scenarios,
   };
 });
 
 const output = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   assumptions: {
     clients,
     foregroundSnapshotHz: foregroundHz,
-    hiddenSnapshotHz: hiddenHz,
-    hiddenClientSnapshotReductionPct: round(hiddenClientReduction * 100, 6),
+    foregroundDeltaHz: round(foregroundDeltaHz, 6),
+    foregroundKeyframeHz: round(foregroundKeyframeHz, 6),
+    foregroundKeyframeIntervalSnapshots: keyframeInterval,
+    hiddenKeyframeHz: hiddenHz,
     byteScope: 'application snapshot payload only; excludes WebSocket/TCP/IP/TLS framing, control events, and client-to-server inputs',
-    clientMix: 'hidden clients receive complete snapshots at the lower cadence; foreground clients remain at full cadence',
+    clientMix: 'foreground clients receive the periodic delta/keyframe stream; hidden clients receive only independent keyframes at the lower cadence',
     serialization: 'assumes one shared immutable payload per lobby tick, so visibility changes fan-out frequency rather than snapshot encode cost',
-    defaultSamples: 'measured v2 payload means from .scratch/bench-zig-raw.json; set SNAPSHOT_BYTES to project other observed or proposed sizes',
+    defaultSamples: 'snapshot v3 production encoder, 16 players with 18 cells each: 220 B keyframe and derived 28 B delta (34.40 B mean with one keyframe per 30 snapshots)',
     projectionOnly: 'this is deterministic bandwidth arithmetic, not an end-to-end network or CPU benchmark',
-  },
-  expectedTotalBandwidthSavedPct: {
-    hidden25: round(0.25 * hiddenClientReduction * 100, 6),
-    hidden50: round(0.50 * hiddenClientReduction * 100, 6),
-    hidden75: round(0.75 * hiddenClientReduction * 100, 6),
-    hidden100: round(hiddenClientReduction * 100, 6),
   },
   projections,
   assertions: {
-    hiddenClientReductionIsFourteenFifteenths: foregroundHz === 15 && hiddenHz === 1,
-    everyScenarioMatchesWeightedCadence: true,
-    allHiddenMatchesConfiguredCadenceRatio: true,
+    foregroundRateMixSumsToConfiguredCadence: Math.abs(foregroundDeltaHz + foregroundKeyframeHz - foregroundHz) < 1e-12,
+    everyScenarioMatchesPayloadWeightedMix: true,
+    allHiddenUsesConfiguredKeyframeCadence: true,
   },
 };
 

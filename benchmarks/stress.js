@@ -16,8 +16,12 @@ const NAME = process.env.STRESS_NAME || 'server';
 const CRLF = String.fromCharCode(13, 10);
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0; };
+const validityChecks = [];
+function checkValidity(name, passed, detail) {
+  validityChecks.push({ name, passed: Boolean(passed), detail });
+}
 const metrics = {
-  schemaVersion: 2,
+  schemaVersion: 3,
   name: NAME,
   base: BASE,
   methodology: {
@@ -57,6 +61,20 @@ function connectOnce(timeoutMs) {
     setTimeout(() => { try { s.close(); } catch (e) {} done(false); }, timeoutMs || 10000);
   });
 }
+function joinOnce(socket, username, lobby, timeoutMs) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (outcome) => {
+      if (settled) return;
+      settled = true;
+      resolve(outcome);
+    };
+    socket.on('init', () => done('init'));
+    socket.on('game_error', () => done('game_error'));
+    setTimeout(() => done('timeout'), timeoutMs || 3000);
+    socket.emit('clientReady', username, lobby);
+  });
+}
 function rawSocket(port, payload) {
   return new Promise((resolve) => {
     const net = require('net');
@@ -76,35 +94,36 @@ function rawSocket(port, payload) {
   const obs = io(BASE, { transports: ['websocket'], forceNew: true, reconnection: true });
   const obsDeltas = [];
   let obsLast = 0;
+  let obsConnections = 0;
+  obs.on('connect', () => { obsConnections++; });
   obs.on('connect', () => obs.emit('clientReady', 'stress-observer', '12345'));
   obs.on('death', () => setTimeout(() => obs.emit('clientReady', 'stress-observer', '12345'), 300));
   attachWorld(obs, () => { const n = Date.now(); if (obsLast) obsDeltas.push(n - obsLast); obsLast = n; });
   await wait(700);
 
-  // S0: cap enforcement — 120 join attempts must hit the caps gracefully.
+  // S0: cap enforcement — concentrate 120 join attempts in one fresh lobby so
+  // the configured per-lobby cap is actually crossed (the default is 16).
   {
-    const lobbies = ['12345'];
-    while (lobbies.length < 8) {
-      const r = await post('/generateid');
-      if (r.location) lobbies.push(decodeURIComponent(String(r.location).split('/').pop()));
-    }
-    let joined = 0, rejected = 0;
+    const generated = await post('/generateid');
+    const lobby = generated.location ? decodeURIComponent(String(generated.location).split('/').pop()) : null;
+    let joined = 0, rejected = 0, timedOut = 0, connectFailed = 0;
     const socks = [];
     for (let i = 0; i < 120; i++) {
       const s = await connectOnce();
-      if (!s) continue;
+      if (!s) { connectFailed++; continue; }
       socks.push(s);
-      const lobby = lobbies[i % lobbies.length];
-      const got = new Promise((r) => {
-        s.on('init', () => r('init')); s.on('game_error', (m) => r('err:' + m));
-        setTimeout(() => r('none'), 3000);
-      });
-      s.emit('clientReady', 'cap-bot-' + i, lobby);
-      const res = await got;
-      if (res === 'init') joined++; else rejected++;
+      const outcome = lobby ? await joinOnce(s, 'cap-bot-' + i, lobby, 3000) : 'timeout';
+      if (outcome === 'init') joined++;
+      else if (outcome === 'game_error') rejected++;
+      else timedOut++;
     }
-    metrics.phases.cap = { attempts: 120, joined, rejected };
+    metrics.phases.cap = { attempts: 120, lobbyCreated: Boolean(lobby), joined, rejected, timedOut, connectFailed };
     console.log('S0 caps: ' + JSON.stringify(metrics.phases.cap));
+    checkValidity('cap lobby created', Boolean(lobby), metrics.phases.cap);
+    checkValidity('cap accepted at least one join', joined > 0, metrics.phases.cap);
+    checkValidity('cap produced an explicit rejection', rejected > 0, metrics.phases.cap);
+    checkValidity('cap classified every attempt', joined + rejected + timedOut + connectFailed === 120, metrics.phases.cap);
+    checkValidity('cap had no ambiguous join timeout', timedOut === 0, metrics.phases.cap);
     for (const s of socks) try { s.close(); } catch (e) {}
     await wait(500);
   }
@@ -134,6 +153,9 @@ function rawSocket(port, payload) {
     }
     metrics.phases.idleRamp = ramp;
     metrics.idleHeld = held.length;
+    const samples = Object.values(ramp).filter((entry) => entry && typeof entry === 'object');
+    checkValidity('idle ramp collected samples', samples.length > 0, { samples: samples.length });
+    checkValidity('server stayed alive during idle ramp', samples.length > 0 && samples.every((entry) => entry.serverAlive), ramp);
     for (const s of held) try { s.close(); } catch (e) {}
     await wait(800);
   }
@@ -148,16 +170,21 @@ function rawSocket(port, payload) {
     }
     metrics.phases.lobbyFlood = { created: ok, ms: Date.now() - t0 };
     console.log('S2 lobby flood: ' + JSON.stringify(metrics.phases.lobbyFlood));
+    checkValidity('lobby flood completed all requests', ok === 200, metrics.phases.lobbyFlood);
   }
 
   // S3: hostile garbage — oversized frames + malformed raw TCP.
   {
     const s = await connectOnce();
+    let oversizedFrameAttempted = false;
     if (s) {
       s.emit('clientReady', 'garbage-bot', '12345');
       await wait(300);
       // Bypass the bounded adapter to exercise the server's frame-size guard.
-      s.send(Buffer.alloc(2 * 1024 * 1024 + 1, 0xff));
+      try {
+        s.send(Buffer.alloc(2 * 1024 * 1024 + 1, 0xff));
+        oversizedFrameAttempted = true;
+      } catch (e) {}
       await wait(1000);
       try { s.close(); } catch (e) {}
     }
@@ -173,8 +200,11 @@ function rawSocket(port, payload) {
     await wait(500);
     const alive = (await get('/')).status === 200;
     const tickP95 = obsDeltas.length > 10 ? pct(obsDeltas.slice(-100), 0.95) : null;
-    metrics.phases.hostile = { rawAttempts: 100, rawConnectionsOpened, serverAliveAfter: alive, tickP95After: tickP95 };
+    metrics.phases.hostile = { oversizedFrameAttempted, rawAttempts: 100, rawConnectionsOpened, serverAliveAfter: alive, tickP95After: tickP95 };
     console.log('S3 hostile: ' + JSON.stringify(metrics.phases.hostile));
+    checkValidity('oversized frame was attempted', oversizedFrameAttempted, metrics.phases.hostile);
+    checkValidity('hostile raw connections reached server', rawConnectionsOpened > 0, metrics.phases.hostile);
+    checkValidity('server survived hostile phase', alive, metrics.phases.hostile);
   }
 
   // S4: churn storm — rapid connect/disconnect.
@@ -186,31 +216,41 @@ function rawSocket(port, payload) {
       for (const s of res) { if (s) try { s.close(); } catch (e) {} else fails++; }
     }
     await wait(1500);
-    metrics.phases.churn = { cycles: 200, connectFails: fails, ms: Date.now() - t0 };
+    const alive = (await get('/')).status === 200;
+    metrics.phases.churn = { cycles: 200, connected: 200 - fails, connectFails: fails, ms: Date.now() - t0, serverAliveAfter: alive };
     console.log('S4 churn: ' + JSON.stringify(metrics.phases.churn));
+    checkValidity('churn established connections', fails < 200, metrics.phases.churn);
+    checkValidity('server survived churn phase', alive, metrics.phases.churn);
   }
 
   // S5: low-input-rate clients — one input/sec per bot, tick cadence must hold.
   {
     const bots = [];
+    let joinFailures = 0;
     for (let i = 0; i < 12; i++) {
       const s = await connectOnce();
-      if (!s) continue;
-      s.emit('clientReady', 'slow-bot-' + i, '12345');
-      bots.push(s);
+      if (!s) { joinFailures++; continue; }
+      const outcome = await joinOnce(s, 'slow-bot-' + i, '12345', 3000);
+      if (outcome === 'init') bots.push(s);
+      else { joinFailures++; try { s.close(); } catch (e) {} }
     }
     const d0 = obsDeltas.length;
     const directions = ['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp'];
     let directionIndex = 0;
+    let inputRounds = 0;
     const lowRateInput = setInterval(() => {
+      inputRounds++;
       const direction = directions[directionIndex++ % directions.length];
       for (const s of bots) s.emit('keyPress', direction);
     }, 1000);
     await wait(8000);
     clearInterval(lowRateInput);
     const deltas = obsDeltas.slice(d0);
-    metrics.phases.lowInputRate = { bots: bots.length, inputsPerBotPerSec: 1, tickAvg: deltas.length ? Math.round(deltas.reduce((a, b) => a + b, 0) / deltas.length * 10) / 10 : null, tickP95: deltas.length ? pct(deltas, 0.95) : null, tickMax: deltas.length ? Math.max(...deltas) : null };
+    metrics.phases.lowInputRate = { requestedBots: 12, bots: bots.length, joinFailures, inputRounds, inputsPerBotPerSec: 1, observedTicks: deltas.length, tickAvg: deltas.length ? Math.round(deltas.reduce((a, b) => a + b, 0) / deltas.length * 10) / 10 : null, tickP95: deltas.length ? pct(deltas, 0.95) : null, tickMax: deltas.length ? Math.max(...deltas) : null };
     console.log('S5 low input rate: ' + JSON.stringify(metrics.phases.lowInputRate));
+    checkValidity('low-input clients joined', bots.length > 0, metrics.phases.lowInputRate);
+    checkValidity('low-input phase sent inputs', inputRounds > 0, metrics.phases.lowInputRate);
+    checkValidity('low-input phase observed ticks', deltas.length > 0, metrics.phases.lowInputRate);
     for (const s of bots) try { s.close(); } catch (e) {}
   }
 
@@ -234,8 +274,18 @@ function rawSocket(port, payload) {
   metrics.aliveAtEnd = (await get('/')).status === 200;
   const stats = await get('/debug/stats');
   try { metrics.finalStats = JSON.parse(stats.body); } catch (e) { metrics.finalStats = null; }
-  console.log('STRESS done: alive=' + metrics.aliveAtEnd + ' observer=' + metrics.observerAlive);
+  checkValidity('observer connected', obsConnections > 0, { connections: obsConnections });
+  checkValidity('observer received a sustained tick stream', metrics.observerAlive, { ticks: obsDeltas.length });
+  checkValidity('server recovered its established cadence', metrics.phases.recovery.recovered, metrics.phases.recovery);
+  checkValidity('server was alive at end', metrics.aliveAtEnd, { aliveAtEnd: metrics.aliveAtEnd });
+  const failures = validityChecks.filter((entry) => !entry.passed);
+  metrics.validity = { passed: failures.length === 0, checks: validityChecks, failures };
+  console.log('STRESS done: alive=' + metrics.aliveAtEnd + ' observer=' + metrics.observerAlive + ' valid=' + metrics.validity.passed);
   obs.close();
   fs.writeFileSync(path.resolve(__dirname, '..', '.scratch', 'stress-' + NAME + '.json'), JSON.stringify(metrics, null, 1));
+  if (failures.length) {
+    for (const failure of failures) console.error('STRESS INVALID: ' + failure.name + ' ' + JSON.stringify(failure.detail));
+    process.exit(1);
+  }
   process.exit(0);
 })().catch((e) => { console.error('STRESS CRASH:', e && e.message ? e.message : e); process.exit(2); });

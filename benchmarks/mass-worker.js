@@ -5,7 +5,16 @@ const io = require('./socket');
 try { delete globalThis.WebSocket; } catch (_) {}
 
 const sockets = [];
-const counters = { connected: 0, joined: 0, failed: 0, disconnected: 0, packets: 0 };
+const counters = {
+  connected: 0,
+  joined: 0,
+  active: 0,
+  failed: 0,
+  disconnected: 0,
+  packets: 0,
+  binaryPackets: 0,
+  invalidPackets: 0,
+};
 let cadence = [];
 let joinLatencyMs = [];
 let base = '';
@@ -20,28 +29,50 @@ function addOne(job) {
       reconnection: false,
       timeout: 15000,
     });
-    const state = { socket, settled: false, lastTick: 0, observe: job.ordinal % 64 === 0, sequence: null, cells: [] };
+    const state = {
+      socket,
+      settled: false,
+      joined: false,
+      disconnected: false,
+      lastTick: 0,
+      observe: job.ordinal % 64 === 0,
+      sequence: null,
+      cells: [],
+    };
     sockets.push(state);
-    const finish = (ok) => {
+    let timer;
+    const finish = (error) => {
       if (state.settled) return;
       state.settled = true;
-      if (!ok) counters.failed++;
-      resolve();
+      clearTimeout(timer);
+      if (error) counters.failed++;
+      resolve(error);
     };
-    const timer = setTimeout(() => { socket.close(); finish(false); }, 20000);
+    timer = setTimeout(() => { socket.close(); finish('join timeout'); }, 20000);
     socket.on('connect', () => {
+      if (state.settled) return;
       counters.connected++;
       socket.emit('clientReady', 'mass-' + workerIndex + '-' + job.ordinal, job.lobby);
     });
     socket.on('init', () => {
-      clearTimeout(timer);
+      if (state.settled) {
+        socket.close();
+        return;
+      }
+      state.joined = true;
       counters.joined++;
+      counters.active++;
       joinLatencyMs.push(performance.now() - started);
-      finish(true);
+      finish(null);
     });
-    socket.on('game_error', () => { clearTimeout(timer); socket.close(); finish(false); });
-    socket.on('connect_error', () => { clearTimeout(timer); socket.close(); finish(false); });
-    socket.on('disconnect', () => { counters.disconnected++; });
+    socket.on('game_error', (message) => { socket.close(); finish('game_error: ' + String(message || 'unknown')); });
+    socket.on('connect_error', (error) => { socket.close(); finish('connect_error: ' + String(error && error.message || error)); });
+    socket.on('disconnect', () => {
+      if (state.disconnected) return;
+      state.disconnected = true;
+      counters.disconnected++;
+      if (state.joined) counters.active--;
+    });
     const recordTick = () => {
       counters.packets++;
       if (state.observe) {
@@ -52,45 +83,47 @@ function addOne(job) {
     };
     socket.on('tick', recordTick);
     socket.on('b', (payload) => {
+      counters.binaryPackets++;
+      const invalid = () => { counters.invalidPackets++; };
       // Traverse and bounds-check the binary layout so the harness includes
       // realistic decode work without constructing render objects.
       const view = payload instanceof ArrayBuffer
         ? new DataView(payload)
         : ArrayBuffer.isView(payload) ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength) : null;
-      if (!view || view.byteLength < 12 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 3) return;
+      if (!view || view.byteLength < 12 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 3) return invalid();
       const kind = view.getUint8(3);
       const sequence = view.getUint16(4, true);
       const baseSequence = view.getUint16(6, true);
-      if (kind > 1 || (kind === 0 ? baseSequence !== sequence : (state.sequence === null || baseSequence !== state.sequence || sequence !== ((baseSequence + 1) & 0xffff)))) return;
+      if (kind > 1 || (kind === 0 ? baseSequence !== sequence : (state.sequence === null || baseSequence !== state.sequence || sequence !== ((baseSequence + 1) & 0xffff)))) return invalid();
       let offset = 9;
       const players = view.getUint8(8);
       for (let i = 0; i < players; i++) {
         if (kind === 0) {
-          if (offset + 6 > view.byteLength) return;
+          if (offset + 6 > view.byteLength) return invalid();
           const encoded = view.getUint16(offset + 4, true);
           const cells = encoded & 0x7fff;
           const packed = (encoded & 0x8000) !== 0;
-          if (cells === 0 || cells > 7200) return;
+          if (cells === 0 || cells > 7200) return invalid();
           state.cells[i] = cells;
           offset += 6 + (packed ? 2 + Math.ceil((cells - 1) / 4) : cells * 2);
         } else {
-          if (offset >= view.byteLength) return;
+          if (offset >= view.byteLength) return invalid();
           const flags = view.getUint8(offset++);
           const mode = flags & 3;
-          if ((flags & 0xe0) !== 0 || mode === 3 || state.cells[i] === undefined) return;
+          if ((flags & 0xe0) !== 0 || mode === 3 || state.cells[i] === undefined) return invalid();
           if ((flags & 4) !== 0) offset += 4;
-          if (mode === 0 && (flags & 0x18) !== 0) return;
+          if (mode === 0 && (flags & 0x18) !== 0) return invalid();
           if (mode === 2) state.cells[i]++;
         }
-        if (offset > view.byteLength) return;
+        if (offset > view.byteLength) return invalid();
       }
-      if (offset >= view.byteLength) return;
+      if (offset >= view.byteLength) return invalid();
       const bonus = view.getUint8(offset++); offset += bonus * 2;
-      if (offset >= view.byteLength) return;
+      if (offset >= view.byteLength) return invalid();
       const drops = view.getUint8(offset++); offset += drops * 4;
-      if (offset >= view.byteLength) return;
+      if (offset >= view.byteLength) return invalid();
       const golden = view.getUint8(offset++); offset += golden * 4;
-      if (offset !== view.byteLength) return;
+      if (offset !== view.byteLength) return invalid();
       state.sequence = sequence;
       recordTick();
     });
@@ -99,23 +132,36 @@ function addOne(job) {
 
 async function addBatch(jobs) {
   let cursor = 0;
+  const failures = [];
   async function lane() {
     while (cursor < jobs.length) {
       const job = jobs[cursor++];
-      await addOne(job);
+      const error = await addOne(job);
+      if (error) failures.push({ ordinal: job.ordinal, error });
     }
   }
   await Promise.all(Array.from({ length: Math.min(100, jobs.length) }, lane));
-  if (process.send) process.send({ type: 'added' });
+  return failures;
 }
 
 process.on('message', (message) => {
   if (message.type === 'init') {
     base = message.base;
     workerIndex = message.workerIndex;
-    if (process.send) process.send({ type: 'ready' });
+    if (process.send) process.send({ type: 'ready', requestId: message.requestId, ok: true });
   } else if (message.type === 'add') {
-    addBatch(message.jobs).catch(() => process.send && process.send({ type: 'added' }));
+    addBatch(message.jobs).then((failures) => {
+      if (!process.send) return;
+      process.send({
+        type: 'added',
+        requestId: message.requestId,
+        ok: failures.length === 0,
+        failedJobs: failures.length,
+        failures: failures.slice(0, 10),
+      });
+    }).catch((error) => {
+      if (process.send) process.send({ type: 'added', requestId: message.requestId, ok: false, error: String(error && error.stack || error) });
+    });
   } else if (message.type === 'snapshot') {
     // Capture the counter and timestamp together in this process. The parent
     // receives worker replies at slightly different times under heavy load,
@@ -126,6 +172,7 @@ process.on('message', (message) => {
       requestId: message.requestId,
       sampledAtMs: performance.now(),
       counters: { ...counters },
+      observedActive: sockets.reduce((count, state) => count + Number(state.observe && state.joined && !state.disconnected), 0),
       cadence,
       joinLatencyMs,
     };

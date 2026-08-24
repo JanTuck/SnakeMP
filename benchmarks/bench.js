@@ -11,9 +11,24 @@ const { attachWorld } = require('./protocol');
 
 const BASE = process.env.BENCH_BASE || 'http://127.0.0.1:4000';
 const NAME = process.env.BENCH_NAME || 'server';
-const REPETITIONS = Math.max(1, Number(process.env.BENCH_REPETITIONS || 3));
-const WARMUP_MS = Math.max(1000, Number(process.env.BENCH_WARMUP_MS || 5000));
-const SAMPLE_MS = Math.max(2000, Number(process.env.BENCH_SAMPLE_MS || 6000));
+function positiveNumberEnv(name, fallback) {
+  if (process.env[name] === undefined) return fallback;
+  const value = Number(process.env[name]);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a finite positive number; received ${JSON.stringify(process.env[name])}`);
+  }
+  return value;
+}
+function positiveIntegerEnv(name, fallback) {
+  const value = positiveNumberEnv(name, fallback);
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`${name} must be an integer; received ${JSON.stringify(process.env[name])}`);
+  }
+  return value;
+}
+const REPETITIONS = positiveIntegerEnv('BENCH_REPETITIONS', 3);
+const WARMUP_MS = positiveNumberEnv('BENCH_WARMUP_MS', 5000);
+const SAMPLE_MS = positiveNumberEnv('BENCH_SAMPLE_MS', 6000);
 const wait = (ms) => new Promise(r => setTimeout(r, ms));
 const pct = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(s.length * p))] ?? 0; };
 const avg = (arr) => arr.length ? arr.reduce((a, b) => a + b, 0) / arr.length : 0;
@@ -49,7 +64,15 @@ function get(path) {
 }
 async function getStats() {
   const r = await get('/debug/stats');
-  try { return JSON.parse(r.body); } catch (e) { return null; }
+  if (r.error) throw new Error('/debug/stats request failed: ' + r.error);
+  if (r.status !== 200) throw new Error('/debug/stats returned HTTP ' + r.status);
+  try {
+    const stats = JSON.parse(r.body);
+    if (!stats || typeof stats !== 'object' || Array.isArray(stats)) throw new Error('expected an object');
+    return stats;
+  } catch (e) {
+    throw new Error('/debug/stats returned invalid JSON: ' + e.message);
+  }
 }
 function connect() {
   return new Promise((resolve, reject) => {
@@ -155,10 +178,101 @@ function httpBench(path, method, body, total, conc) {
     };
     const pump = () => {
       while (inflight < conc && i < total) { inflight++; i++; one(() => { inflight--; pump(); }); }
-      if (done + fail >= total) resolve({ ms: Date.now() - t0, lat, fail });
+      if (done + fail >= total) resolve({ attempts: total, ms: Date.now() - t0, lat, fail });
     };
     pump();
   });
+}
+
+function validateMeasurements() {
+  const errors = [];
+  const assert = (condition, message) => { if (!condition) errors.push(message); };
+  const finite = (value) => typeof value === 'number' && Number.isFinite(value);
+  const finiteNonNegative = (value) => finite(value) && value >= 0;
+  const finitePositive = (value) => finite(value) && value > 0;
+  const validSamples = (values, positive = false) => Array.isArray(values)
+    && values.length > 0
+    && values.every(positive ? finitePositive : finiteNonNegative);
+  const validStats = (stats) => stats
+    && finitePositive(stats.rss)
+    && finiteNonNegative(stats.totalPlayers)
+    && finiteNonNegative(stats.connections)
+    && Array.isArray(stats.lobbies);
+
+  assert(validStats(metrics.phases.idle?.stats), 'idle debug stats are missing or malformed');
+
+  const baselineRuns = metrics.phases.baseline?.runs;
+  assert(Array.isArray(baselineRuns) && baselineRuns.length === REPETITIONS,
+    'baseline did not record every repetition');
+  for (const [index, run] of (baselineRuns || []).entries()) {
+    assert(validSamples(run.deltas, true), `baseline repetition ${index + 1} has no valid cadence samples`);
+    assert(validSamples(run.bytes, true), `baseline repetition ${index + 1} has no valid wire-byte samples`);
+  }
+
+  const connectionRuns = metrics.phases.connections?.runs;
+  assert(Array.isArray(connectionRuns) && connectionRuns.length === REPETITIONS,
+    'connection phase did not record every repetition');
+  for (const [index, run] of (connectionRuns || []).entries()) {
+    assert(Number.isSafeInteger(run.attempts) && run.attempts > 0,
+      `connection repetition ${index + 1} has an invalid attempt count`);
+    assert(Number.isSafeInteger(run.connected) && Number.isSafeInteger(run.failed)
+      && run.connected >= 0 && run.failed >= 0 && run.connected + run.failed === run.attempts,
+    `connection repetition ${index + 1} did not account for every attempt`);
+    assert(run.connected > 0 && validSamples(run.latenciesMs),
+      `connection repetition ${index + 1} has no successful latency samples`);
+    assert(finitePositive(run.elapsedMs) && finiteNonNegative(run.connectionsPerSec),
+      `connection repetition ${index + 1} has invalid timing measurements`);
+  }
+
+  for (const count of [5, 10, 20, 40, 80]) {
+    const runs = metrics.phases.ramp?.[count]?.runs;
+    assert(Array.isArray(runs) && runs.length === REPETITIONS,
+      `ramp ${count} did not record every repetition`);
+    for (const [index, run] of (runs || []).entries()) {
+      const label = `ramp ${count} repetition ${index + 1}`;
+      assert(validSamples(run.deltas, true), `${label} has no valid cadence samples`);
+      assert(validSamples(run.bytes, true), `${label} has no valid observer wire-byte samples`);
+      assert(finitePositive(run.elapsedMs), `${label} has invalid elapsed time`);
+      assert(finitePositive(run.packets) && finitePositive(run.messageRate), `${label} has no bot message samples`);
+      assert(finitePositive(run.byteRate), `${label} has no bot wire-byte samples`);
+      assert(finiteNonNegative(run.clientCpuPct), `${label} has an invalid client CPU measurement`);
+      assert(finiteNonNegative(run.players) && finitePositive(run.rss) && Array.isArray(run.lobbies),
+        `${label} has missing or malformed debug stats`);
+    }
+  }
+
+  assert(validSamples(metrics.phases.inputLatencyMs), 'input-latency phase has no successful samples');
+  assert(Number.isSafeInteger(metrics.phases.churn?.fails) && metrics.phases.churn.fails >= 0
+    && finitePositive(metrics.phases.churn?.rssBefore) && finitePositive(metrics.phases.churn?.rssAfter),
+  'churn phase has missing or malformed measurements');
+  assert(Number.isSafeInteger(metrics.phases.hostile?.stormFails) && metrics.phases.hostile.stormFails >= 0
+    && finiteNonNegative(metrics.phases.hostile?.floodMs)
+    && validSamples(metrics.phases.hostile?.deltas, true),
+  'hostile phase has missing or malformed measurements');
+
+  for (const kind of ['home', 'join']) {
+    const runs = metrics.phases.http?.runs?.[kind];
+    assert(Array.isArray(runs) && runs.length === REPETITIONS,
+      `HTTP ${kind} phase did not record every repetition`);
+    for (const [index, run] of (runs || []).entries()) {
+      assert(Number.isSafeInteger(run.attempts) && run.attempts > 0
+        && Number.isSafeInteger(run.fail) && run.fail >= 0 && Array.isArray(run.lat)
+        && run.lat.length + run.fail === run.attempts,
+      `HTTP ${kind} repetition ${index + 1} did not account for every request`);
+      assert(validSamples(run.lat), `HTTP ${kind} repetition ${index + 1} has no successful latency samples`);
+      assert(finiteNonNegative(run.ms), `HTTP ${kind} repetition ${index + 1} has invalid elapsed time`);
+    }
+  }
+
+  const decode = metrics.phases.protocolNormalizeUs;
+  assert(Number.isSafeInteger(decode?.samples) && decode.samples > 0
+    && finiteNonNegative(decode.avg) && finiteNonNegative(decode.p50)
+    && finiteNonNegative(decode.p95) && finiteNonNegative(decode.p99),
+  'protocol decode phase has no valid samples');
+  assert(finitePositive(metrics.rssStart) && finitePositive(metrics.rssEnd),
+    'start or end RSS measurement is missing');
+  assert(metrics.alive === true, 'server failed the final liveness check');
+  return errors;
 }
 
 async function ensureLobbies(nLobbies) {
@@ -351,9 +465,17 @@ async function ensureLobbies(nLobbies) {
   metrics.alive = alive.status === 200;
   console.log('SERVER alive: ' + metrics.alive + ' | rss ' + metrics.rssStart + ' -> ' + metrics.rssEnd);
 
+  const validityErrors = validateMeasurements();
+  metrics.validity = { passed: validityErrors.length === 0, errors: validityErrors };
+
   obs.socket.close();
   const dir = path.resolve(__dirname, '..', '.scratch');
   fs.writeFileSync(dir + '/bench-' + NAME + '.json', JSON.stringify(metrics, null, 1));
   console.log('metrics written to .scratch/bench-' + NAME + '.json');
+  if (validityErrors.length > 0) {
+    console.error('BENCH INVALID:\n- ' + validityErrors.join('\n- '));
+    process.exit(1);
+  }
+  console.log('BENCH VALID');
   process.exit(0);
 })().catch(e => { console.error('BENCH CRASH:', e && e.message ? e.message : e); process.exit(2); });

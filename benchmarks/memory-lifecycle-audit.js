@@ -338,6 +338,7 @@ async function backpressurePhase(baseline) {
   }
   const recovered = waves[waves.length - 1].recovered;
   const recoveredRss = waves.map((wave) => wave.recovered.rssMedian);
+  const acceptedConnectionsMin = Math.min(...waves.map((wave) => wave.active.connections - before.connections));
   const recoveredSlopeBytesPerWave = recoveredRss.length < 2
     ? 0
     : (recoveredRss.at(-1) - recoveredRss[0]) / (recoveredRss.length - 1);
@@ -347,6 +348,7 @@ async function backpressurePhase(baseline) {
     requestsPerConnection: PIPELINE_REQUESTS,
     before,
     recovered,
+    acceptedConnectionsMin,
     persistentRssGrowthBytes: Math.max(0, recovered.rssMedian - before.rssMedian),
     recoveredSlopeBytesPerWave,
   };
@@ -421,6 +423,12 @@ function assertion(name, pass, actual, expected) {
     evidence.phases.partialFrames.active.connections >= evidence.baseline.connections + RETAINED_CONNECTIONS,
     evidence.phases.partialFrames.active.connections,
     '>= ' + (evidence.baseline.connections + RETAINED_CONNECTIONS),
+  ));
+  evidence.assertions.push(assertion(
+    'paused HTTP readers remain accepted during backpressure sampling',
+    evidence.phases.backpressure.acceptedConnectionsMin >= PIPELINE_CONNECTIONS,
+    evidence.phases.backpressure.acceptedConnectionsMin,
+    '>= ' + PIPELINE_CONNECTIONS,
   ));
   evidence.assertions.push(assertion(
     'HTTP backpressure recovery growth remains bounded',
