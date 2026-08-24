@@ -29,7 +29,8 @@ pub const ClientPacket = union(enum) {
 /// Validate a fully decoded client frame header before buffering its payload.
 /// The application protocol never fragments messages, and rejecting that
 /// unused feature prevents a peer from retaining MiB-sized fragment buffers.
-pub fn validateClientFrame(fin: bool, opcode: u8, payload_len: usize) !void {
+pub fn validateClientFrame(fin: bool, reserved_bits: u8, opcode: u8, payload_len: usize) !void {
+    if (reserved_bits != 0) return error.ReservedBitsSet;
     switch (opcode) {
         0x1, 0x2 => {
             if (!fin) return error.FragmentedDataUnsupported;
@@ -42,6 +43,50 @@ pub fn validateClientFrame(fin: bool, opcode: u8, payload_len: usize) !void {
         },
         else => return error.UnsupportedOpcode,
     }
+}
+
+/// Decode and enforce RFC 6455's canonical payload-length representation.
+pub fn payloadLength(marker: u8, extended: u64) !usize {
+    if (marker < 126) return marker;
+    if (marker == 126) {
+        if (extended < 126) return error.NonCanonicalLength;
+    } else if (marker == 127) {
+        if ((extended & (@as(u64, 1) << 63)) != 0) return error.InvalidPayloadLength;
+        if (extended < 65_536) return error.NonCanonicalLength;
+    } else return error.InvalidPayloadLength;
+    if (extended > std.math.maxInt(usize)) return error.FrameTooBig;
+    return @intCast(extended);
+}
+
+pub fn headerHasToken(value: []const u8, wanted: []const u8) bool {
+    var tokens = std.mem.splitScalar(u8, value, ',');
+    while (tokens.next()) |raw| {
+        const token = std.mem.trim(u8, raw, " \t");
+        if (std.ascii.eqlIgnoreCase(token, wanted)) return true;
+    }
+    return false;
+}
+
+pub fn validClientKey(key: []const u8) bool {
+    const size = std.base64.standard.Decoder.calcSizeForSlice(key) catch return false;
+    if (size != 16) return false;
+    var decoded: [16]u8 = undefined;
+    std.base64.standard.Decoder.decode(&decoded, key) catch return false;
+    return true;
+}
+
+pub fn validateTextPayload(payload: []const u8) !void {
+    if (!std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
+}
+
+pub fn validateClosePayload(payload: []const u8) !void {
+    if (payload.len == 1) return error.InvalidClosePayload;
+    if (payload.len == 0) return;
+    const code = std.mem.readInt(u16, payload[0..2], .big);
+    const standard = code >= 1000 and code <= 1014 and code != 1004 and code != 1005 and code != 1006;
+    const application = code >= 3000 and code <= 4999;
+    if (!standard and !application) return error.InvalidCloseCode;
+    try validateTextPayload(payload[2..]);
 }
 
 /// Parse the bounded client binary protocol without allocation. Slices borrow
@@ -79,13 +124,40 @@ pub fn clientPacket(payload: []const u8) ?ClientPacket {
 }
 
 test "client frame limits reject fragmentation and oversized payloads" {
-    try validateClientFrame(true, 0x2, config.MAX_WS_APP_PAYLOAD);
-    try std.testing.expectError(error.FrameTooBig, validateClientFrame(true, 0x2, config.MAX_WS_APP_PAYLOAD + 1));
-    try std.testing.expectError(error.FragmentedDataUnsupported, validateClientFrame(false, 0x2, 2));
-    try std.testing.expectError(error.FragmentedDataUnsupported, validateClientFrame(true, 0x0, 2));
-    try validateClientFrame(true, 0x9, 125);
-    try std.testing.expectError(error.ControlFrameTooBig, validateClientFrame(true, 0x9, 126));
-    try std.testing.expectError(error.FragmentedControlFrame, validateClientFrame(false, 0x9, 0));
+    try validateClientFrame(true, 0, 0x2, config.MAX_WS_APP_PAYLOAD);
+    try std.testing.expectError(error.FrameTooBig, validateClientFrame(true, 0, 0x2, config.MAX_WS_APP_PAYLOAD + 1));
+    try std.testing.expectError(error.FragmentedDataUnsupported, validateClientFrame(false, 0, 0x2, 2));
+    try std.testing.expectError(error.FragmentedDataUnsupported, validateClientFrame(true, 0, 0x0, 2));
+    try validateClientFrame(true, 0, 0x9, 125);
+    try std.testing.expectError(error.ControlFrameTooBig, validateClientFrame(true, 0, 0x9, 126));
+    try std.testing.expectError(error.FragmentedControlFrame, validateClientFrame(false, 0, 0x9, 0));
+    try std.testing.expectError(error.ReservedBitsSet, validateClientFrame(true, 0x40, 0x2, 2));
+}
+
+test "client lengths, headers, text, and close payloads are canonical" {
+    try std.testing.expectEqual(@as(usize, 125), try payloadLength(125, 0));
+    try std.testing.expectEqual(@as(usize, 126), try payloadLength(126, 126));
+    try std.testing.expectEqual(@as(usize, 65_535), try payloadLength(126, 65_535));
+    try std.testing.expectEqual(@as(usize, 65_536), try payloadLength(127, 65_536));
+    try std.testing.expectError(error.NonCanonicalLength, payloadLength(126, 125));
+    try std.testing.expectError(error.NonCanonicalLength, payloadLength(127, 65_535));
+    try std.testing.expectError(error.InvalidPayloadLength, payloadLength(127, @as(u64, 1) << 63));
+
+    try std.testing.expect(headerHasToken(" keep-alive, UpGrAdE ", "upgrade"));
+    try std.testing.expect(!headerHasToken("notupgrade, keep-alive", "upgrade"));
+    try std.testing.expect(validClientKey("dGhlIHNhbXBsZSBub25jZQ=="));
+    try std.testing.expect(!validClientKey("x"));
+    try std.testing.expect(!validClientKey("dGhlIHNhbXBsZSBub25jZQ=A"));
+
+    try validateTextPayload("valid \xe2\x98\x83");
+    try std.testing.expectError(error.InvalidUtf8, validateTextPayload("\xc0\x80"));
+    try validateClosePayload("");
+    try validateClosePayload("\x03\xe8done");
+    try validateClosePayload("\x0b\xb8app");
+    try std.testing.expectError(error.InvalidClosePayload, validateClosePayload("\x03"));
+    try std.testing.expectError(error.InvalidCloseCode, validateClosePayload("\x03\xed"));
+    try std.testing.expectError(error.InvalidCloseCode, validateClosePayload("\x07\xd0"));
+    try std.testing.expectError(error.InvalidUtf8, validateClosePayload("\x03\xe8\xc0\x80"));
 }
 
 test "maximum join packet is 513 bytes and trailing bytes are rejected" {

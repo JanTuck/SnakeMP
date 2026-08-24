@@ -11,8 +11,6 @@ export default class Snake {
         this.score = 0;
         this.bodyLength = 0;
         this.interpolate = false;
-        // New snakes are visually oriented right before their first move.
-        this.heading = "ArrowRight";
     }
 
     // Commit a fully validated v3 absolute keyframe. Packed paths store the
@@ -48,13 +46,6 @@ export default class Snake {
         const previousHead = this.prevSnake[0];
         const motionDx = previousHead === undefined || head === undefined ? 0 : head.x - previousHead.x;
         const motionDy = previousHead === undefined || head === undefined ? 0 : head.y - previousHead.y;
-        // A recovery keyframe may span several turns. Its neck is the current
-        // authoritative heading; net displacement from an old rendered head
-        // is only a fallback for a one-cell snake.
-        const dx = player.cells > 1 ? head.x - this.snake[1].x : motionDx;
-        const dy = player.cells > 1 ? head.y - this.snake[1].y : motionDy;
-        if (Math.abs(dx) > Math.abs(dy)) this.heading = dx < 0 ? "ArrowLeft" : "ArrowRight";
-        else if (dy !== 0) this.heading = dy < 0 ? "ArrowUp" : "ArrowDown";
         this.id = meta[0];
         this.displayName = meta[1];
         this.color = meta[2];
@@ -84,10 +75,6 @@ export default class Snake {
                 cell.x = old[index - 1].x;
                 cell.y = old[index - 1].y;
             }
-            const dx = this.snake[0].x - old[0].x;
-            const dy = this.snake[0].y - old[0].y;
-            if (Math.abs(dx) > Math.abs(dy)) this.heading = dx < 0 ? "ArrowLeft" : "ArrowRight";
-            else if (dy !== 0) this.heading = dy < 0 ? "ArrowUp" : "ArrowDown";
             this.interpolate = true;
         } else {
             this.interpolate = false;

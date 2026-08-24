@@ -1964,22 +1964,24 @@ fn parseWsFrames(c: *Conn, aa: Allocator, data: []u8) !WsResult {
         const b0 = data[off];
         const b1 = data[off + 1];
         const fin = (b0 & 0x80) != 0;
+        const reserved_bits = b0 & 0x70;
         const opcode = b0 & 0x0F;
         const masked = (b1 & 0x80) != 0;
-        var len: usize = b1 & 0x7F;
+        const length_marker = b1 & 0x7F;
+        var len: usize = length_marker;
         var hdr_len: usize = 2;
-        if (len == 126) {
+        if (length_marker == 126) {
             if (data.len - off < 4) break;
-            len = (@as(usize, data[off + 2]) << 8) | data[off + 3];
+            const extended = std.mem.readInt(u16, data[off + 2 ..][0..2], .big);
+            len = try websocket.payloadLength(length_marker, extended);
             hdr_len = 4;
-        } else if (len == 127) {
+        } else if (length_marker == 127) {
             if (data.len - off < 10) break;
             const v = std.mem.readInt(u64, data[off + 2 ..][0..8], .big);
-            if (v > std.math.maxInt(usize)) return error.FrameTooBig;
-            len = @intCast(v);
+            len = try websocket.payloadLength(length_marker, v);
             hdr_len = 10;
         }
-        try websocket.validateClientFrame(fin, opcode, len);
+        try websocket.validateClientFrame(fin, reserved_bits, opcode, len);
         if (!masked) return error.UnmaskedClientFrame; // clients MUST mask
         if (data.len - off < hdr_len + 4 + len) break;
         const key = data[off + hdr_len ..][0..4].*;
@@ -1990,11 +1992,11 @@ fn parseWsFrames(c: *Conn, aa: Allocator, data: []u8) !WsResult {
         if (debug_enabled) _ = websocket_frames_received.fetchAdd(1, .monotonic);
 
         switch (opcode) {
-            0x1 => {}, // text control packets are server-only
+            0x1 => try websocket.validateTextPayload(payload), // text control packets are server-only
             0x2 => handleRawBinary(c, aa, payload),
             0x8 => { // close
-                const echo: []const u8 = if (payload.len >= 2) payload[0..2] else "";
-                connEnqueueFrame(c, 0x8, echo);
+                try websocket.validateClosePayload(payload);
+                connEnqueueFrame(c, 0x8, payload);
                 return .{ .consumed = off, .closed = true };
             },
             0x9 => connEnqueueFrame(c, 0xA, payload), // ws ping -> ws pong
@@ -2037,7 +2039,9 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
         const method = request_line[0..sp1];
         const target = request_line[sp1 + 1 .. sp2];
         const version = request_line[sp2 + 1 ..];
-        if (!std.mem.startsWith(u8, version, "HTTP/")) return false;
+        const http10 = std.mem.eql(u8, version, "HTTP/1.0");
+        const http11 = std.mem.eql(u8, version, "HTTP/1.1");
+        if (!http10 and !http11) return false;
 
         var content_length: ?usize = null;
         var connection_close = false;
@@ -2045,7 +2049,9 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
         var connection_upgrade = false;
         var upgrade_ws = false;
         var ws_key: []const u8 = "";
+        var ws_key_seen = false;
         var ws_version_ok = false;
+        var ws_version_seen = false;
         var body_is_json = false;
         var header_count: usize = 0;
         var lines = std.mem.splitSequence(u8, head[request_line_end + CRLF.len ..], CRLF);
@@ -2065,14 +2071,18 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
                 // combine TE with this Content-Length framing parser.
                 return false;
             } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
-                connection_close = std.ascii.indexOfIgnoreCase(value, "close") != null;
-                connection_keep = std.ascii.indexOfIgnoreCase(value, "keep-alive") != null;
-                connection_upgrade = std.ascii.indexOfIgnoreCase(value, "upgrade") != null;
+                connection_close = connection_close or websocket.headerHasToken(value, "close");
+                connection_keep = connection_keep or websocket.headerHasToken(value, "keep-alive");
+                connection_upgrade = connection_upgrade or websocket.headerHasToken(value, "upgrade");
             } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
-                upgrade_ws = std.ascii.indexOfIgnoreCase(value, "websocket") != null;
+                upgrade_ws = upgrade_ws or websocket.headerHasToken(value, "websocket");
             } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
+                if (ws_key_seen) return false;
+                ws_key_seen = true;
                 ws_key = value;
             } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
+                if (ws_version_seen) return false;
+                ws_version_seen = true;
                 ws_version_ok = std.mem.eql(u8, value, "13");
             } else if (std.ascii.eqlIgnoreCase(name, "content-type")) {
                 body_is_json = std.ascii.indexOfIgnoreCase(value, "application/json") != null;
@@ -2092,7 +2102,9 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
         if (upgrade_ws) {
             const qpos = std.mem.indexOfScalar(u8, target, '?');
             const path = if (qpos) |i| target[0..i] else target;
-            if (!std.mem.eql(u8, method, "GET") or !connection_upgrade or !std.mem.eql(u8, path, "/ws") or ws_key.len == 0 or !ws_version_ok or !doUpgrade(c, aa, ws_key)) {
+            if (!http11 or !std.mem.eql(u8, method, "GET") or !connection_upgrade or !std.mem.eql(u8, path, "/ws") or
+                !websocket.validClientKey(ws_key) or !ws_version_ok or !doUpgrade(c, aa, ws_key))
+            {
                 sendResponse(c, aa, .{ .status = 400, .reason = "Bad Request", .ctype = "text/plain; charset=utf-8", .body = "websocket upgrade rejected", .keep_alive = false });
                 return true;
             }
@@ -2106,7 +2118,6 @@ fn processHttpInput(c: *Conn, aa: Allocator) bool {
             return processWsInput(c, aa);
         }
 
-        const http10 = std.mem.eql(u8, version, "HTTP/1.0");
         const keep_alive = if (http10) connection_keep and !connection_close else !connection_close;
         routeAndRespond(c, aa, method, target, body, body_is_json, keep_alive);
         consumeInput(c, request_len);

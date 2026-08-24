@@ -6,7 +6,6 @@ import { Sprites } from "./sprites.js";
 import { Sfx } from "./audio.js";
 import { Particles } from "./particles.js";
 import { Hud } from "./hud.js";
-import { confirmHeading, resetHeading } from "./userInput.js";
 import { decodeSnapshot } from "./snapshot.js";
 
 // Module scripts run after the DOM is parsed, so the canvas/socket exist
@@ -134,7 +133,6 @@ socket.on("b", (payload) => {
     const frame = decodeSnapshot(payload, roster.length, lastSnapshotSequence, compactPlayers);
     if (frame === null) return;
     const scoreEffects = [];
-    let localHeading = null;
     try {
         for (let index = 0; index < frame.playerCount; index++) {
             const meta = roster[index];
@@ -148,7 +146,6 @@ socket.on("b", (payload) => {
             }
             if (frame.kind === 0) snake.updateKeyframe(meta, frame.view, update);
             else snake.updateDelta(meta, update);
-            if (state.id === socket.id) localHeading = snake.heading;
             state.score = update.score;
             state.bodyLength = update.cells;
             state.snake = snake.snake;
@@ -188,7 +185,6 @@ socket.on("b", (payload) => {
     // Effects are best effort and run only after the authoritative state and
     // sequence are committed. A broken audio/HUD/particle effect must not
     // strand the decoder on an old base sequence with partially applied state.
-    if (localHeading !== null) try { confirmHeading(localHeading); } catch (_) {}
     for (const effect of scoreEffects) {
         try { Particles.burst(effect.x, effect.y, effect.color, effect.local ? 18 : 8); } catch (_) {}
         if (effect.local) {
@@ -200,7 +196,6 @@ socket.on("b", (payload) => {
 });
 
 socket.on('init', (initData) => {
-    resetHeading();
     document.getElementById('game_popup').style.display = 'none';
 
     food = new Food(ctx, initData.food.x, initData.food.y);

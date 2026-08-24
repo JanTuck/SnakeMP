@@ -82,10 +82,13 @@ are destroyed.
 
 The endpoint is `GET /ws` with a standard RFC 6455 version-13 upgrade. The
 server sends standard WebSocket ping frames every 20 seconds and closes a peer
-that has not answered within 15 seconds. Client frames must be masked. Partial
-HTTP requests and fragmented WebSocket messages are accumulated; invalid,
-unmasked, oversized, or structurally inconsistent input is rejected without
-reading outside validated bounds.
+that has not answered within 15 seconds. The HTTP/1.1 upgrade requires exact
+comma-delimited header tokens and a base64 key that decodes to 16 bytes. Client
+frames must be masked. Partial HTTP requests are accumulated, while fragmented
+messages are deliberately unsupported under the bounded application protocol.
+Reserved bits, non-canonical lengths, malformed close payloads, invalid UTF-8,
+unmasked frames, and oversized or structurally inconsistent input are rejected
+without reading outside validated bounds.
 
 There is no Socket.IO/Engine.IO envelope. Hot client messages and world
 snapshots are WebSocket binary frames. Infrequent server control messages are
@@ -106,12 +109,19 @@ join:
 input:
   type:u8 = 2
   direction:u8  // 0 up, 1 down, 2 left, 3 right
+
+visibility hint:
+  type:u8 = 3
+  visible:u8  // 0 hidden, 1 visible
 ```
 
 The join frame length must be exactly `3 + lobby_bytes + username_bytes`, both
 fields must be non-empty, and each is limited to 255 UTF-8 bytes by the packet.
-The input frame must be exactly two bytes. Unknown packet types/directions and
-client text messages have no game effect.
+Input and visibility frames must be exactly two bytes. Directions are absolute;
+the server rejects repeated/reversing turns and owns the two-turn queue. The
+visibility hint changes snapshot delivery cadence, never authoritative
+simulation. Unknown packet types/directions and valid client text messages have
+no game effect.
 
 ### Server-to-client JSON control events
 

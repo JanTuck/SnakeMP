@@ -56,13 +56,12 @@ function frame(bytes, prefix = 0) {
 
   const recoveredSnake = new Snake({ canvas: {} }, ['id', 'name', '#123456']);
   recoveredSnake.snake = [{ x: 10 * 16, y: 10 * 16 }];
-  // Head (18,11), then neck (18,10): the current heading is down even though
-  // net displacement since the last visible frame is mostly rightward.
+  // Head (18,11), then neck (18,10): a recovery jump must decode the packed
+  // body but remain too large for visual interpolation.
   const recoveryBody = new DataView(Uint8Array.from([18, 11, 0]).buffer);
   recoveredSnake.updateKeyframe(['id', 'name', '#123456'], recoveryBody, {
     cells: 2, packed: true, bodyOffset: 0, score: 0,
   });
-  assert.equal(recoveredSnake.heading, 'ArrowDown', 'keyframe neck must determine recovery heading');
   assert.equal(recoveredSnake.interpolate, false, 'multi-tick recovery must not interpolate');
 
   console.log('snapshot v3 production decoder tests: PASS');

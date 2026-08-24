@@ -35,20 +35,38 @@ function post(path, body, type) {
     req.end(payload);
   });
 }
-function rawParts(parts) {
+function rawPartsOutcome(parts) {
   const port = Number(new URL(BASE).port || 80);
   return new Promise((resolve) => {
     let response = '';
+    let settled = false;
     const socket = net.connect(port, '127.0.0.1');
-    const finish = () => { socket.destroy(); resolve(response); };
-    socket.setTimeout(1500, finish);
+    const finish = (reason) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve({ response, reason });
+    };
+    socket.setTimeout(1500, () => finish('timeout'));
     socket.on('data', (chunk) => { response += chunk.toString('utf8'); });
-    socket.on('error', finish);
-    socket.on('end', finish);
+    socket.on('error', () => finish('error'));
+    socket.on('end', () => finish('end'));
     socket.on('connect', async () => {
       for (const part of parts) { socket.write(part); await wait(10); }
     });
   });
+}
+async function rawParts(parts) { return (await rawPartsOutcome(parts)).response; }
+
+function maskedFrame(firstByte, payload) {
+  const body = Buffer.from(payload);
+  const mask = Buffer.from([0x12, 0x34, 0x56, 0x78]);
+  const frame = Buffer.alloc(2 + mask.length + body.length);
+  frame[0] = firstByte;
+  frame[1] = 0x80 | body.length;
+  mask.copy(frame, 2);
+  for (let index = 0; index < body.length; index++) frame[6 + index] = body[index] ^ mask[index & 3];
+  return frame;
 }
 function connect() {
   return new Promise((resolve, reject) => {
@@ -150,6 +168,28 @@ const hasChainedUpLeft = (moves) => {
   check('partial HTTP request is assembled incrementally', partial.startsWith('HTTP/1.1 200'), partial.slice(0, 32));
   await rawParts(['POST /joingame HTTP/1.1\r\nHost: x\r\nContent-Length: nope\r\n\r\n']);
   check('malformed HTTP closes safely and server remains healthy', (await get('/')).status === 200);
+  const validWsHeaders =
+    'Host: 127.0.0.1\r\nUpgrade: WebSocket\r\nConnection: keep-alive, UpGrAdE\r\n' +
+    'Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n';
+  const validUpgrade = await rawParts(['GET /ws HTTP/1.1\r\n' + validWsHeaders]);
+  check('websocket upgrade accepts exact mixed-case header tokens', validUpgrade.startsWith('HTTP/1.1 101'), validUpgrade.slice(0, 32));
+  const invalidKeyUpgrade = await rawParts(['GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n' +
+    'Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: x\r\n\r\n']);
+  check('websocket upgrade rejects keys that do not decode to 16 bytes', invalidKeyUpgrade.startsWith('HTTP/1.1 400'), invalidKeyUpgrade.slice(0, 32));
+  const substringUpgrade = await rawParts(['GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: xwebsocket\r\nConnection: notupgrade\r\n' +
+    'Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n']);
+  check('websocket upgrade rejects header-token substrings', !substringUpgrade.startsWith('HTTP/1.1 101'), substringUpgrade.slice(0, 32));
+  const http10Upgrade = await rawParts(['GET /ws HTTP/1.0\r\n' + validWsHeaders]);
+  check('websocket upgrade requires HTTP/1.1', http10Upgrade.startsWith('HTTP/1.1 400'), http10Upgrade.slice(0, 32));
+  const rsvFrame = await rawPartsOutcome(['GET /ws HTTP/1.1\r\n' + validWsHeaders, maskedFrame(0xC2, [2, 0])]);
+  check('websocket parser rejects reserved bits', rsvFrame.reason !== 'timeout', rsvFrame.reason);
+  const invalidTextFrame = await rawPartsOutcome(['GET /ws HTTP/1.1\r\n' + validWsHeaders, maskedFrame(0x81, [0xC0, 0x80])]);
+  check('websocket parser rejects invalid UTF-8 text', invalidTextFrame.reason !== 'timeout', invalidTextFrame.reason);
+  const invalidCloseFrame = await rawPartsOutcome(['GET /ws HTTP/1.1\r\n' + validWsHeaders, maskedFrame(0x88, [0x03])]);
+  check('websocket parser rejects one-byte close payloads', invalidCloseFrame.reason !== 'timeout', invalidCloseFrame.reason);
+  const nonCanonicalFrame = Buffer.from([0x82, 0xFE, 0x00, 0x02, 0x12, 0x34, 0x56, 0x78, 0x10, 0x34]);
+  const invalidLength = await rawPartsOutcome(['GET /ws HTTP/1.1\r\n' + validWsHeaders, nonCanonicalFrame]);
+  check('websocket parser rejects non-canonical lengths', invalidLength.reason !== 'timeout', invalidLength.reason);
 
   // ---- WS: join, init, movement, input semantics ----
   const a = await connect();
