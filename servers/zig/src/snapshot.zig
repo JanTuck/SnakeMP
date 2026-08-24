@@ -185,7 +185,7 @@ pub fn buildIndependentKeyframeInto(
     sequence: u16,
     allocator: std.mem.Allocator,
 ) !BuildResult {
-    const player_count = @min(lobby.players.count(), MAX_PLAYERS);
+    const player_count = @min(lobby.players.items.len, MAX_PLAYERS);
     buffer.clearRetainingCapacity();
     try buffer.appendSlice(allocator, "SN");
     try buffer.append(allocator, VERSION);
@@ -193,20 +193,20 @@ pub fn buildIndependentKeyframeInto(
     try appendInt(buffer, allocator, u16, sequence);
     try appendInt(buffer, allocator, u16, sequence);
     try buffer.append(allocator, @intCast(player_count));
-    for (lobby.players.values()[0..player_count]) |player| try appendKeyframePlayer(buffer, allocator, player);
+    for (lobby.players.items[0..player_count]) |player| try appendKeyframePlayer(buffer, allocator, player);
     try appendWorld(buffer, allocator, lobby, now);
     return .{ .bytes = buffer.items, .kind = .keyframe, .sequence = sequence };
 }
 
 pub fn buildInto(buffer: *std.ArrayListUnmanaged(u8), lobby: *model.Lobby, now: i64, allocator: std.mem.Allocator) !BuildResult {
-    const player_count = @min(lobby.players.count(), MAX_PLAYERS);
+    const player_count = @min(lobby.players.items.len, MAX_PLAYERS);
     var current_states: [MAX_PLAYERS]model.SnapshotPlayerState = undefined;
     var changes: [MAX_PLAYERS]Transition = undefined;
-    for (lobby.players.values()[0..player_count], 0..) |player, index| current_states[index] = stateFor(player);
+    for (lobby.players.items[0..player_count], 0..) |player, index| current_states[index] = stateFor(player);
 
     var delta_ok = lobby.snapshot_valid and player_count == lobby.snapshot_player_count and lobby.snapshot_since_keyframe < KEYFRAME_INTERVAL - 1;
     if (delta_ok) {
-        for (lobby.players.values()[0..player_count], 0..) |player, index| {
+        for (lobby.players.items[0..player_count], 0..) |player, index| {
             changes[index] = transition(player, current_states[index], lobby.snapshot_previous[index]);
             if (changes[index].mode == .invalid) {
                 delta_ok = false;
@@ -225,12 +225,12 @@ pub fn buildInto(buffer: *std.ArrayListUnmanaged(u8), lobby: *model.Lobby, now: 
     try appendInt(buffer, allocator, u16, sequence);
     try appendInt(buffer, allocator, u16, if (kind == .keyframe) sequence else base_sequence);
     try buffer.append(allocator, @intCast(player_count));
-    for (lobby.players.values()[0..player_count], 0..) |player, index| {
+    for (lobby.players.items[0..player_count], 0..) |player, index| {
         if (kind == .keyframe) try appendKeyframePlayer(buffer, allocator, player) else try appendDeltaPlayer(buffer, allocator, current_states[index], lobby.snapshot_previous[index], changes[index]);
     }
     try appendWorld(buffer, allocator, lobby, now);
 
-    if (lobby.players.count() <= MAX_PLAYERS) {
+    if (lobby.players.items.len <= MAX_PLAYERS) {
         @memcpy(lobby.snapshot_previous[0..player_count], current_states[0..player_count]);
         lobby.snapshot_valid = true;
         lobby.snapshot_player_count = @intCast(player_count);
@@ -257,7 +257,7 @@ test "v3 keyframes and direction deltas have stable golden bytes" {
     try player.snake.append(allocator, .{ .x = 2 * model.CELL, .y = 3 * model.CELL });
     var lobby = model.Lobby{ .id = @constCast("test"), .food = .{ .x = 0, .y = 0 } };
     defer lobby.players.deinit(allocator);
-    try lobby.players.put(allocator, player.id, &player);
+    try lobby.players.append(allocator, &player);
     var wire: std.ArrayListUnmanaged(u8) = .empty;
     defer wire.deinit(allocator);
 
@@ -301,7 +301,7 @@ test "independent keyframe preserves delta history and sequence wraps" {
     try player.snake.append(allocator, .{ .x = model.CELL, .y = model.CELL });
     var lobby = model.Lobby{ .id = @constCast("test"), .food = .{ .x = 0, .y = 0 } };
     defer lobby.players.deinit(allocator);
-    try lobby.players.put(allocator, player.id, &player);
+    try lobby.players.append(allocator, &player);
     var wire: std.ArrayListUnmanaged(u8) = .empty;
     defer wire.deinit(allocator);
 

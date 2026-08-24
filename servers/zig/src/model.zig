@@ -142,7 +142,9 @@ pub const Lobby = struct {
     worker_assigned: bool = false,
     mutex: std.Io.Mutex = .init,
     rng: std.Random.DefaultPrng = undefined,
-    players: std.StringArrayHashMapUnmanaged(*Player) = .{},
+    /// Stable insertion order is protocol-significant; membership is capped at
+    /// 16, so a pointer list is smaller and cheaper than a string hash map.
+    players: std.ArrayListUnmanaged(*Player) = .empty,
     food: CellPos,
     bonus: std.ArrayListUnmanaged(BonusApple) = .empty,
     drops: std.ArrayListUnmanaged(Drop) = .empty,

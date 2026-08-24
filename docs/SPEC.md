@@ -14,9 +14,9 @@ transport.
   sequentially each tick, and uses a 128 KiB stack plus a retained per-tick
   arena. Empty lobbies are detached during the next maintenance cycle, and an
   empty worker is stopped immediately.
-- Each lobby has a mutex, private PRNG, stable insertion-ordered player map, and
-  retained snapshot buffer. The cross-thread lock order is worker, lobby,
-  connection membership, then connection output, which prevents
+- Each lobby has a mutex, private PRNG, stable insertion-ordered player pointer
+  list, and retained snapshot buffer. The cross-thread lock order is worker,
+  lobby, connection membership, then connection output, which prevents
   player/connection use-after-free while the reactor and game workers run
   concurrently.
 - Ready sockets use direct nonblocking writes. Per-connection output storage is
@@ -91,7 +91,9 @@ frames must be masked. Partial HTTP requests are accumulated, while fragmented
 messages are deliberately unsupported under the bounded application protocol.
 Reserved bits, non-canonical lengths, malformed close payloads, invalid UTF-8,
 unmasked frames, and oversized or structurally inconsistent input are rejected
-without reading outside validated bounds.
+without reading outside validated bounds. A valid client Close is serialized
+after every earlier server frame and atomically seals publication, so no data
+frame can be queued after the Close reply.
 
 There is no Socket.IO/Engine.IO envelope. Hot client messages and world
 snapshots are WebSocket binary frames. Infrequent server control messages are

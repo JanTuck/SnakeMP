@@ -112,7 +112,7 @@ pub fn main() !void {
             .conn = &connection,
         };
         players[index] = player;
-        try lobby.players.put(allocator, player.id, player);
+        try lobby.players.append(allocator, player);
     }
     defer for (&storage) |*player| player.snake.deinit(allocator);
 

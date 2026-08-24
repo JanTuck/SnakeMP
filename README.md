@@ -63,6 +63,7 @@ npm run test:memory
 npm run test:lobbies
 npm run bench:http-pipeline
 npm run bench:lobby-reap
+npm run bench:player-container
 node benchmarks/wire-format-bench.js
 ```
 

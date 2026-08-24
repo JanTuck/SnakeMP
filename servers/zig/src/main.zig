@@ -215,7 +215,7 @@ fn randomCell(l: *Lobby) CellPos {
 }
 
 fn snakeOccupies(l: *Lobby, cell: CellPos) bool {
-    for (l.players.values()) |p| {
+    for (l.players.items) |p| {
         for (p.snake.items) |s| {
             if (s.x == cell.x and s.y == cell.y) return true;
         }
@@ -308,19 +308,6 @@ fn hueToRgb(p: f64, q: f64, t_in: f64) f64 {
 
 fn collidedWall(h: CellPos) bool {
     return h.x > GRID_W - CELL or h.x < 0 or h.y > GRID_H - CELL or h.y < 0;
-}
-
-/// Exact high-cap override fallback. Canonical lobbies use collision.Index;
-/// this retains semantics if an operator raises the cap above 16 players.
-fn findCollidedOther(l: *Lobby, p: *Player) ?*Player {
-    const head = p.snake.items[0];
-    for (l.players.values()) |other| {
-        if (other == p) continue;
-        for (other.snake.items) |segment| {
-            if (segment.x == head.x and segment.y == head.y) return other;
-        }
-    }
-    return null;
 }
 
 // ------------------------------------------------------------------ connection
@@ -553,12 +540,9 @@ fn connQueueResponse(c: *Conn, header: []const u8, body: []const u8, body_static
     }
 }
 
-/// Fast path uses one writev syscall and performs no allocation or copy.
-/// Infrequent control frames are copied only when a socket applies backpressure.
-fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
-    c.output_mutex.lockUncancelable(g_io);
-    defer c.output_mutex.unlock(g_io);
-    if (c.closing or c.poisoned) return;
+/// Caller holds output_mutex. Fast path uses one writev syscall and performs no
+/// allocation or copy; backpressured control frames retain an owned suffix.
+fn connEnqueueFrameLocked(c: *Conn, opcode: u8, payload: []const u8) void {
     if (debug_enabled) _ = websocket_frames_sent.fetchAdd(1, .monotonic);
     var hdr: [10]u8 = undefined;
     const hlen = wsHeader(&hdr, opcode, payload.len);
@@ -595,6 +579,24 @@ fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
             },
         }
     }
+}
+
+fn connEnqueueFrame(c: *Conn, opcode: u8, payload: []const u8) void {
+    c.output_mutex.lockUncancelable(g_io);
+    defer c.output_mutex.unlock(g_io);
+    if (c.closing or c.poisoned) return;
+    connEnqueueFrameLocked(c, opcode, payload);
+}
+
+/// Serialize the Close frame after every earlier publication, then seal the
+/// output queue before releasing its mutex. Lobby workers can therefore never
+/// publish a data frame after Close.
+fn connEnqueueClose(c: *Conn, payload: []const u8) void {
+    c.output_mutex.lockUncancelable(g_io);
+    defer c.output_mutex.unlock(g_io);
+    if (c.closing or c.poisoned) return;
+    connEnqueueFrameLocked(c, 0x8, payload);
+    c.closing = true;
 }
 
 /// Publish one immutable binary snapshot to a connection. All connections in
@@ -712,7 +714,7 @@ fn totalPlayersLocked() usize {
 }
 
 fn broadcastLobby(l: *Lobby, frame: []const u8) void {
-    for (l.players.values()) |p| connEnqueueText(p.conn, frame);
+    for (l.players.items) |p| connEnqueueText(p.conn, frame);
 }
 
 fn nextBackgroundSnapshot(now: i64) i64 {
@@ -754,7 +756,7 @@ fn broadcastBinarySnapshot(l: *Lobby, frame: *model.SharedFrame, now: i64, seque
         if (debug_enabled and accounting.frames_sent != 0) _ = websocket_frames_sent.fetchAdd(accounting.frames_sent, .monotonic);
     }
 
-    for (l.players.values()) |player| {
+    for (l.players.items) |player| {
         const c = player.conn;
         if (c.snapshot_hidden.load(.acquire)) {
             if (c.next_background_snapshot_ms.load(.acquire) > now) continue;
@@ -783,7 +785,10 @@ fn broadcastBinarySnapshot(l: *Lobby, frame: *model.SharedFrame, now: i64, seque
 }
 
 fn detachPlayer(l: *Lobby, p: *Player) void {
-    if (!l.players.orderedRemove(p.id)) return;
+    const index = for (l.players.items, 0..) |candidate, at| {
+        if (candidate == p) break at;
+    } else return;
+    _ = l.players.orderedRemove(index);
     l.roster_dirty = true;
     _ = total_players.fetchSub(1, .acq_rel);
     p.conn.membership_mutex.lockUncancelable(g_io);
@@ -832,7 +837,7 @@ fn gameWorkerLoop(worker: *GameWorker) void {
         const tick_now = unixMillis();
         for (worker.lobbies.items) |lobby| {
             lobby.mutex.lockUncancelable(g_io);
-            if (lobby.players.count() > 0) tickLobby(lobby, tick_now, arena.allocator());
+            if (lobby.players.items.len > 0) tickLobby(lobby, tick_now, arena.allocator());
             lobby.mutex.unlock(g_io);
         }
         worker.mutex.unlock(g_io);
@@ -861,7 +866,7 @@ fn createGameWorker(initial_lobby: ?*Lobby) !*GameWorker {
 fn workerEstimatedCostLocked(worker: *GameWorker) u64 {
     var total: u64 = 0;
     for (worker.lobbies.items) |lobby| {
-        total +|= worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.count());
+        total +|= worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.items.len);
     }
     return total;
 }
@@ -923,7 +928,7 @@ fn retireLightestGameWorker(now_ms: i64, aa: Allocator) bool {
     const source = game_workers.items[source_index];
     while (source.lobbies.items.len > 0) {
         const lobby = source.lobbies.items[source.lobbies.items.len - 1];
-        const cost = worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.count());
+        const cost = worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.items.len);
         var target_index: ?usize = null;
         for (game_workers.items, 0..) |target, index| {
             if (index == source_index or target.lobbies.items.len >= lobbies_per_worker) continue;
@@ -979,7 +984,7 @@ fn redistributeGameWorkers(now_ms: i64, aa: Allocator) void {
         var best_improvement: u64 = 0;
         for (source.lobbies.items, 0..) |lobby, index| {
             if (lobby.last_migrated_ms != 0 and now_ms - lobby.last_migrated_ms < worker_balance.migration_cooldown_ms) continue;
-            const cost = worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.count());
+            const cost = worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.items.len);
             const improvement = worker_balance.moveImprovementNs(loads[heavy_index], loads[destination_index], cost);
             if (improvement > best_improvement) {
                 best_lobby_index = index;
@@ -1070,7 +1075,7 @@ fn deactivateEmptyLobbies() void {
         while (lobby_index < worker.lobbies.items.len) {
             const lobby = worker.lobbies.items[lobby_index];
             lobby.mutex.lockUncancelable(g_io);
-            const empty = lobby.players.count() == 0;
+            const empty = lobby.players.items.len == 0;
             if (empty) lobby.worker_assigned = false;
             lobby.mutex.unlock(g_io);
             if (empty) {
@@ -1241,7 +1246,7 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
     }
-    if (target.players.count() >= max_players_per_lobby) {
+    if (target.players.items.len >= max_players_per_lobby) {
         target.mutex.unlock(g_io);
         sendGameError(c, ERR_LOBBY_FULL, aa);
         return;
@@ -1282,7 +1287,7 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
     };
     defer aa.free(init_frame);
 
-    target.players.put(galloc, p.id, p) catch {
+    target.players.append(galloc, p) catch {
         discardPreparedPlayerLocked(target, p, activated_worker);
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
@@ -1387,7 +1392,7 @@ fn openDropLocked(l: *Lobby, p: *Player, aa: Allocator) void {
 fn buildRoster(l: *Lobby) ![]const u8 {
     l.roster_wire.clearRetainingCapacity();
     try l.roster_wire.appendSlice(galloc, "[\"r\",[");
-    for (l.players.values(), 0..) |player, index| {
+    for (l.players.items, 0..) |player, index| {
         if (index != 0) try l.roster_wire.append(galloc, ',');
         try l.roster_wire.append(galloc, '[');
         try jsString(&l.roster_wire, galloc, player.id);
@@ -1440,13 +1445,13 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
 
     // 3. per-player simulation, insertion order. Deaths are tombstoned and
     //    destroyed after the broadcast (the snapshot keeps borrowing them).
-    const player_count = l.players.count();
+    const player_count = l.players.items.len;
     if (player_count > binary_snapshot.MAX_PLAYERS) return;
     var snapshot_storage: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
-    @memcpy(snapshot_storage[0..player_count], l.players.values());
+    @memcpy(snapshot_storage[0..player_count], l.players.items);
     const snapshot = snapshot_storage[0..player_count];
 
-    // Death processing mutates the ordered player map, so retain the initial
+    // Death processing mutates the ordered player list, so retain the initial
     // insertion order on the worker stack and destroy tombstones after fanout.
     var graveyard_storage: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
     var graveyard_len: usize = 0;
@@ -1457,9 +1462,7 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
 
     for (snapshot, 0..) |p, slot| {
         // skip players killed earlier in this same tick
-        if (collision_index.tracksPlayers()) {
-            if (!collision_index.isActive(slot)) continue;
-        } else if (l.players.get(p.id) == null) continue;
+        if (!collision_index.isActive(slot)) continue;
 
         const head = p.snake.items[0];
 
@@ -1475,12 +1478,7 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
         }
 
         // b. head vs any segment of another snake: both die
-        const collision_hit: ?collision.Hit = if (collision_index.tracksPlayers())
-            collision_index.otherAt(slot, p)
-        else if (findCollidedOther(l, p)) |other|
-            .{ .player = other, .slot = 0 }
-        else
-            null;
+        const collision_hit = collision_index.otherAt(slot, p);
         if (collision_hit) |hit| {
             const other = hit.player;
             sendDeathEvent(p.conn, p.score, aa);
@@ -1615,7 +1613,7 @@ fn reapIdleLobbies(now: i64) void {
             continue;
         }
         l.mutex.lockUncancelable(g_io);
-        const empty = l.players.count() == 0;
+        const empty = l.players.items.len == 0;
         if (!empty) {
             l.last_empty_at = 0;
         } else if (l.last_empty_at == 0) l.last_empty_at = now;
@@ -1784,7 +1782,7 @@ fn buildStats(aa: Allocator) ![]u8 {
         defer l.mutex.unlock(g_io);
         lobby_stats[lobby_index] = .{
             .id = l.id,
-            .players = l.players.count(),
+            .players = l.players.items.len,
             .drops = l.drops.items.len,
             .bonus = l.bonus.items.len,
             .golden = l.golden != null,
@@ -2027,7 +2025,7 @@ fn parseWsFrames(c: *Conn, aa: Allocator, data: []u8) !WsResult {
             0x2 => handleRawBinary(c, aa, payload),
             0x8 => { // close
                 try websocket.validateClosePayload(payload);
-                connEnqueueFrame(c, 0x8, payload);
+                connEnqueueClose(c, payload);
                 return .{ .consumed = off, .closed = true };
             },
             0x9 => connEnqueueFrame(c, 0xA, payload), // ws ping -> ws pong
@@ -2482,6 +2480,32 @@ test "output queue compacts released prefixes and drops oversized idle storage" 
     try std.testing.expectEqual(@as(usize, 0), connection.output.capacity);
 }
 
+test "websocket close seals output after all earlier frames" {
+    galloc = std.testing.allocator;
+    g_io = std.testing.io;
+    var connection = Conn{ .fd = -1, .mode = .websocket };
+    defer connection.output.deinit(galloc);
+
+    const prior = try galloc.dupe(u8, "data");
+    try connection.output.append(galloc, .{ .owned = prior });
+    connection.output_bytes = prior.len - 2;
+    connection.output_offset = 2;
+
+    connEnqueueClose(&connection, "\x03\xe8bye");
+    try std.testing.expect(connection.closing);
+    try std.testing.expectEqual(@as(usize, 2), connection.output.items.len);
+    try std.testing.expectEqual(@as(usize, 2), connection.output_offset);
+    try std.testing.expectEqualSlices(u8, &.{ 0x88, 5, 0x03, 0xe8, 'b', 'y', 'e' }, connection.output.items[1].owned);
+
+    connEnqueueFrame(&connection, 0x1, "must-not-follow-close");
+    try std.testing.expectEqual(@as(usize, 2), connection.output.items.len);
+
+    for (connection.output.items) |output| releasePending(output);
+    connection.output.clearRetainingCapacity();
+    connection.output_bytes = 0;
+    connection.output_offset = 0;
+}
+
 test "color conversion clamps floating point edge values" {
     try std.testing.expectEqual(@as(u8, 0), colorByte(-0.000_001));
     try std.testing.expectEqual(@as(u8, 127), colorByte(0.5));
@@ -2549,7 +2573,7 @@ test "compact roster and tick preserve world information" {
     var lobby = Lobby{ .id = @constCast("test"), .food = .{ .x = 0, .y = 0 } };
     defer lobby.players.deinit(galloc);
     defer lobby.roster_wire.deinit(galloc);
-    try lobby.players.put(galloc, player.id, &player);
+    try lobby.players.append(galloc, &player);
 
     try std.testing.expectEqualStrings("[\"r\",[[\"sid\",\"name\",\"#abcdef\"]]]", try buildRoster(&lobby));
     var wire: std.ArrayListUnmanaged(u8) = .empty;

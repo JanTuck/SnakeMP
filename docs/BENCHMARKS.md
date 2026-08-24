@@ -112,7 +112,22 @@ Player identities now borrow the owning connection's inline 22-byte session ID
 instead of allocating a duplicate. At 12,000 players this deterministically
 removes 12,000 live allocations, 264,000 requested bytes, and about 384,000
 bytes of allocator size-class slots. The connection outlives its player, and
-teardown removes the lobby-map key before releasing either object.
+teardown removes the lobby membership entry before releasing either object.
+
+Lobby membership is capped at 16 and needs stable iteration, append, and
+known-pointer ordered removal—not key lookup—so it now uses a pointer list
+instead of a string hash map. `npm run bench:player-container` validates exact
+insertion/removal order and measures the median of nine ReleaseFast samples:
+
+| 16-player container | Live requested | Allocations | Fill | Remove/refill |
+|---|---:|---:|---:|---:|
+| String array map | 712 B | 3 | 136 ns | 47 ns |
+| Pointer array list | 136 B | 1 | 39 ns | 8 ns |
+
+This cuts persistent requested container memory by 80.9%, makes a full-lobby
+fill 3.49x faster, and makes ordered removal/refill 5.88x faster. Across 750
+full lobbies the requested backing-memory reduction is about 432,000 bytes;
+actual RSS depends on allocator size classes.
 
 ## Snapshot v3 production-encoder benchmark
 
