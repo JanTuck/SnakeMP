@@ -164,7 +164,10 @@ function game(overrides = {}) {
     },
     fire(name, value) { for (const handler of handlers.get(name) || []) handler(value); },
   };
-  const window = { name: overrides.windowName || '' };
+  const window = {
+    name: overrides.windowName || '',
+    location: { replaced: '', replace(value) { this.replaced = value; } },
+  };
   const session = overrides.session || storage();
   const local = overrides.local || storage();
   vm.runInNewContext(gameSource, {
@@ -174,10 +177,26 @@ function game(overrides = {}) {
     sessionStorage: session,
     localStorage: local,
     socket,
+    fetch: overrides.fetch,
     TextEncoder,
     JSON,
   }, { filename: 'client/game.html:inline' });
   return { window, session, local, elements, form, button, socket, emitted };
+}
+
+{
+  const page = game({
+    fetch() {
+      return {
+        then(resolve) {
+          resolve({ redirected: true });
+          return { catch() {} };
+        },
+      };
+    },
+  });
+  page.socket.fire('game_error', 'That game does not exist any more');
+  assert.equal(page.window.location.replaced, '/?error=unknown-game', 'a stale lobby tab recovers after an in-memory server restart');
 }
 
 {

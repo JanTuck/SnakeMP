@@ -180,7 +180,17 @@
             socket.emit('clientReady', savedUsername, LOBBY_ID, savedPassword);
         }
     });
-    socket.on('game_error', () => setJoinPending(false));
+    socket.on('game_error', () => {
+        setJoinPending(false);
+        // A container refresh clears in-memory lobbies while an already-open
+        // tab can still show its old join dialog. Confirm the route after an
+        // error and recover to the landing page only when that lobby is gone;
+        // an existing passworded lobby must remain available for a retry.
+        if (typeof fetch !== 'function') return;
+        fetch(location.pathname, { method: 'HEAD', cache: 'no-store' }).then((response) => {
+            if (response.redirected) window.location.replace('/?error=unknown-game');
+        }).catch(() => { /* reconnect handling remains authoritative */ });
+    });
 
 </script>
 </body>
