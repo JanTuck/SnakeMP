@@ -75,7 +75,7 @@ transport.on('connect', () => {
 first.open();
 assert.equal(first.sent.length, 2);
 assert.deepEqual(Array.from(first.sent[0]), [3, 1]);
-assert.deepEqual(Array.from(first.sent[1]), [1, 4, 6, 114, 111, 111, 109, 195, 133, 108, 105, 99, 101]);
+assert.deepEqual(Array.from(first.sent[1]), [1, 4, 6, 0, 114, 111, 111, 109, 195, 133, 108, 105, 99, 101]);
 
 // Visibility is a two-byte delivery hint and is reasserted on reconnect.
 fakeDocument.hidden = true;
@@ -138,5 +138,26 @@ transport.emit('clientReady', '🐍'.repeat(63), 'room');
 assert.equal(second.sent.length, beforeOversize + 1); // 252 UTF-8 bytes is valid
 transport.emit('clientReady', '🐍'.repeat(64), 'room');
 assert.equal(second.sent.length, beforeOversize + 1);
+
+// Passwords are exact opaque values with a 64-byte UTF-8 bound. Missing
+// passwords remain compatible with public lobbies.
+transport.emit('clientReady', 'Alice', 'room', '  exact pass  ');
+assert.deepEqual(Array.from(second.sent.at(-1)), [
+  1, 4, 5, 14,
+  ...Buffer.from('room'), ...Buffer.from('Alice'), ...Buffer.from('  exact pass  '),
+]);
+
+const beforePasswordBounds = second.sent.length;
+transport.emit('clientReady', 'Alice', 'room', 'x'.repeat(64));
+assert.equal(second.sent.length, beforePasswordBounds + 1);
+assert.equal(second.sent.at(-1)[3], 64);
+
+transport.emit('clientReady', 'Alice', 'room', '🔐'.repeat(16));
+assert.equal(second.sent.length, beforePasswordBounds + 2, '16 four-byte code points fit exactly');
+assert.equal(second.sent.at(-1)[3], 64);
+
+transport.emit('clientReady', 'Alice', 'room', '🔐'.repeat(17));
+transport.emit('clientReady', 'Alice', 'room', 'x'.repeat(65));
+assert.equal(second.sent.length, beforePasswordBounds + 2, 'oversize passwords are rejected before send');
 
 console.log('transport protocol tests: PASS');

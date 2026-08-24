@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const collision = @import("src/collision.zig");
+const config = @import("src/config.zig");
 const model = @import("src/model.zig");
 
 const player_count = 16;
@@ -78,9 +79,10 @@ pub fn main() !void {
         };
         players[player_index] = player;
         for (0..max_snake_length) |segment_index| {
-            const local_row = segment_index / 120;
-            const within_row = segment_index % 120;
-            const x_cell = if ((local_row & 1) == 0) within_row else 119 - within_row;
+            const cols: usize = @intCast(config.GRID_COLS);
+            const local_row = segment_index / cols;
+            const within_row = segment_index % cols;
+            const x_cell = if ((local_row & 1) == 0) within_row else cols - 1 - within_row;
             try player.snake.append(allocator, .{
                 .x = @intCast(x_cell * 16),
                 .y = @intCast((player_index * 3 + local_row) * 16),

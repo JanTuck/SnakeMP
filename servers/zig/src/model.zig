@@ -168,6 +168,14 @@ pub const PendingOutput = union(enum) {
 
 pub const Lobby = struct {
     id: []u8,
+    /// Lobby passwords are never retained in plaintext. A fixed-size digest
+    /// also keeps every lobby allocation-free regardless of protection.
+    password_salt: [16]u8 = @splat(0),
+    password_hash: [32]u8 = @splat(0),
+    password_protected: bool = false,
+    /// The creator fixes this for the lobby lifetime. Classical mode contains
+    /// only the main food pickup: no drops, bonus apples, or golden apples.
+    classical: bool = false,
     /// Reactor-owned. Generated lobbies do not acquire a simulation thread
     /// until their first successful player join.
     worker_assigned: bool = false,

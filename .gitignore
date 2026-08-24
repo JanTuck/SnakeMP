@@ -1,25 +1,33 @@
 node_modules/
 .scratch/
 .idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
 npm-debug.log*
+*.log
 
-# language-port build artifacts
-target/
+# local configuration, test coverage, and generated benchmark captures
+.env
+.env.*
+!.env.example
+coverage/
+.nyc_output/
+benchmarks/results/
+benchmarks/*.cpuprofile
+benchmarks/*.heapprofile
+benchmarks/*.jsonl
+
+# Zig build artifacts
 zig-cache/
 .zig-cache/
 .zig-global-cache/
 .zig-cache-*/
 .zig-global-cache-*/
 zig-out/
-.gocache/
-server-zig/snek-zig
-server-go/snek-go
-server-bun/dist/
-servers/bun/dist/
-servers/go/internal/generated/
-servers/go/snek-go
 servers/zig/src/generated/
 servers/zig/snek-zig
 servers/zig/snek-zig-*
 *.o
-*.pdb

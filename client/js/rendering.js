@@ -5,6 +5,7 @@ import { Sfx } from "./audio.js";
 import { Particles } from "./particles.js";
 import { Hud, Motion } from "./hud.js";
 import { decodeSnapshot } from "./snapshot.js";
+import { resetDirection, syncDirection } from "./userInput.js";
 
 // Module scripts run after the DOM is parsed, so the canvas/socket exist
 // already. Wiring handlers here instead of inside window.onload avoids a
@@ -150,6 +151,18 @@ socket.on("b", (payload) => {
             }
             if (frame.kind === 0) snake.updateKeyframe(meta, frame.view, update);
             else snake.updateDelta(meta, update);
+            if (meta[0] === socket.id) {
+                const head = snake.snake[0];
+                const previousHead = snake.prevSnake[0];
+                if (head !== undefined && previousHead !== undefined) {
+                    const dx = head.x - previousHead.x;
+                    const dy = head.y - previousHead.y;
+                    if (dx > 0 && dy === 0) syncDirection('ArrowRight');
+                    else if (dx < 0 && dy === 0) syncDirection('ArrowLeft');
+                    else if (dy > 0 && dx === 0) syncDirection('ArrowDown');
+                    else if (dy < 0 && dx === 0) syncDirection('ArrowUp');
+                }
+            }
             state.score = update.score;
             state.bodyLength = update.cells;
             state.snake = snake.snake;
@@ -201,9 +214,12 @@ socket.on("b", (payload) => {
 
 socket.on('init', (initData) => {
     document.getElementById('game_popup').style.display = 'none';
+    Hud.setMode(initData.classical === true);
 
     food = { x: initData.food.x, y: initData.food.y };
     gameOver = false;
+    resetDirection();
+    gameOverMenu?.destroy?.();
     gameOverMenu = null;
     isSetup = true;
     lastFrameAt = 0;
@@ -238,6 +254,7 @@ socket.on('feed', (item) => {
 
 socket.on('death', (score) => {
     gameOver = true; // Stop drawing ticks over the game over screen.
+    resetDirection();
     Sfx.death();
     shakeUntil = performance.now() + 450;
     // Burst where OUR snake actually died (last known head position).
@@ -261,7 +278,7 @@ function drawWorld(now) {
     // Main apple with a gentle bob so the board feels alive.
     if (food !== null) {
         const bob = Math.sin(now / 220) * 1.5;
-        drawSprite('apple', food.x, food.y + bob, 16);
+        drawSprite('apple', food.x - 2, food.y - 2 + bob, 20);
     }
 
     // Bonus apples, slightly smaller with a soft pulse.

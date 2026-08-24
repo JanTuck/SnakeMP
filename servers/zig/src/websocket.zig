@@ -21,7 +21,7 @@ pub fn header(out: *[10]u8, opcode: u8, len: usize) usize {
 }
 
 pub const ClientPacket = union(enum) {
-    join: struct { lobby_id: []const u8, username: []const u8 },
+    join: struct { lobby_id: []const u8, username: []const u8, password: []const u8 },
     direction: model.Direction,
     visibility: bool,
 };
@@ -95,13 +95,18 @@ pub fn clientPacket(payload: []const u8) ?ClientPacket {
     if (payload.len == 0 or payload.len > config.MAX_WS_APP_PAYLOAD) return null;
     return switch (payload[0]) {
         1 => blk: {
-            if (payload.len < 3) break :blk null;
+            if (payload.len < 4) break :blk null;
             const lobby_len: usize = payload[1];
             const username_len: usize = payload[2];
-            if (lobby_len == 0 or username_len == 0 or 3 + lobby_len + username_len != payload.len) break :blk null;
+            const password_len: usize = payload[3];
+            if (lobby_len == 0 or username_len == 0 or password_len > config.MAX_LOBBY_PASSWORD_BYTES or
+                4 + lobby_len + username_len + password_len != payload.len) break :blk null;
+            const username_at = 4 + lobby_len;
+            const password_at = username_at + username_len;
             break :blk .{ .join = .{
-                .lobby_id = payload[3 .. 3 + lobby_len],
-                .username = payload[3 + lobby_len ..],
+                .lobby_id = payload[4..username_at],
+                .username = payload[username_at..password_at],
+                .password = payload[password_at..],
             } };
         },
         2 => if (payload.len == 2) .{ .direction = switch (payload[1]) {
@@ -160,21 +165,28 @@ test "client lengths, headers, text, and close payloads are canonical" {
     try std.testing.expectError(error.InvalidUtf8, validateClosePayload("\x03\xe8\xc0\x80"));
 }
 
-test "maximum join packet is 513 bytes and trailing bytes are rejected" {
-    var maximum_join: [513]u8 = undefined;
+test "maximum join packet includes bounded password and rejects trailing bytes" {
+    var maximum_join: [578]u8 = undefined;
     maximum_join[0] = 1;
     maximum_join[1] = 255;
     maximum_join[2] = 255;
-    @memset(maximum_join[3..258], 'l');
-    @memset(maximum_join[258..513], 'u');
+    maximum_join[3] = config.MAX_LOBBY_PASSWORD_BYTES;
+    @memset(maximum_join[4..259], 'l');
+    @memset(maximum_join[259..514], 'u');
+    @memset(maximum_join[514..578], 'p');
     const parsed = clientPacket(&maximum_join).?.join;
     try std.testing.expectEqual(@as(usize, 255), parsed.lobby_id.len);
     try std.testing.expectEqual(@as(usize, 255), parsed.username.len);
+    try std.testing.expectEqual(@as(usize, config.MAX_LOBBY_PASSWORD_BYTES), parsed.password.len);
 
-    var trailing: [514]u8 = undefined;
-    @memcpy(trailing[0..513], &maximum_join);
-    trailing[513] = 0;
+    var trailing: [579]u8 = undefined;
+    @memcpy(trailing[0..578], &maximum_join);
+    trailing[578] = 0;
     try std.testing.expect(clientPacket(&trailing) == null);
+
+    var oversized_password = maximum_join;
+    oversized_password[3] = config.MAX_LOBBY_PASSWORD_BYTES + 1;
+    try std.testing.expect(clientPacket(&oversized_password) == null);
 
     var oversized: [config.MAX_WS_APP_PAYLOAD + 1]u8 = @splat(0);
     oversized[0] = 2;

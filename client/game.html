@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>Snek | Game</title>
     <link rel="icon" href="/img/snek.png">
     <link rel="stylesheet" href="/css/game.css">
@@ -10,19 +10,31 @@
 <body>
 <p id="game_error" role="alert"></p>
 <div class="background_blur" id="game_popup">
-    <div class="popup">
+    <div class="popup" role="dialog" aria-modal="true" aria-labelledby="join_title" aria-describedby="join_context">
         <section class="popup_content">
-            <h1>Choose your username</h1>
+            <div class="popup-heading">
+                <h1 id="join_title">Enter the arena</h1>
+                <p id="join_context">Lobby <strong id="lobby_ref">12345</strong> is ready. Choose how you appear to the other players.</p>
+            </div>
             <form id="join_form">
-                <label for="username">Username (4&ndash;16 characters)</label>
-                <input id="username" type="text" required placeholder="Username"
-                       minlength="4" maxlength="16" autocomplete="nickname">
-                <button type="submit" class="btn"><span>Join</span></button>
+                <div class="field">
+                    <label for="username">Player name <span>4&ndash;16 characters</span></label>
+                    <input id="username" name="username" type="text" required placeholder="Choose a name"
+                           minlength="4" maxlength="16" autocomplete="nickname" spellcheck="false">
+                </div>
+                <div class="field">
+                    <label for="lobby_password">Lobby password <span>Optional</span></label>
+                    <input id="lobby_password" name="lobby_password" type="password"
+                           placeholder="Leave blank for open lobbies" maxlength="64"
+                           autocomplete="current-password">
+                </div>
+                <button type="submit" class="btn"><span>Join lobby</span><span aria-hidden="true">&rarr;</span></button>
             </form>
+            <p class="popup-footnote">Arrow keys or WASD to steer. Space activates your boost.</p>
         </section>
     </div>
 </div>
-<canvas id="canvas" aria-label="Snake game board" width="1920" height="960">
+<canvas id="canvas" aria-label="Snake game board" width="2048" height="1152">
 </canvas>
 <aside id="hud" aria-label="Game status"></aside>
 <script src="/js/transport.js"></script>
@@ -30,37 +42,93 @@
 <script src="/js/rendering.js" type="module"></script>
 <script>
     // This page always belongs to the lobby in its URL: /game/<id>.
-    const LOBBY_ID = decodeURIComponent(location.pathname.split('/').filter(Boolean)[1] || '') || '12345';
+    const LOBBY_ID = decodeURIComponent(location.pathname.split('/').filter(Boolean).pop() || '') || '12345';
+    document.getElementById('lobby_ref').textContent = LOBBY_ID;
     //Set last used username if present
     let domUsername = document.getElementById('username');
+    const domPassword = document.getElementById('lobby_password');
+    const joinForm = document.getElementById('join_form');
+    const joinButton = joinForm.querySelector('button[type="submit"]');
     let savedUsername = null;
+    let savedPassword = '';
     let hasJoined = false;
+    let joinPending = false;
     try {
         savedUsername = localStorage.getItem("snake_username");
         if (savedUsername !== null) {
             domUsername.value = savedUsername;
         }
     } catch (e) { /* storage unavailable; keep default */ }
+    let passwordLoaded = false;
+    try {
+        const lobbyPasswordKey = `snek:lobby-password:${LOBBY_ID}`;
+        const lobbyPassword = sessionStorage.getItem(lobbyPasswordKey);
+        if (lobbyPassword !== null) {
+            savedPassword = lobbyPassword;
+            passwordLoaded = true;
+        } else {
+            const createdPassword = sessionStorage.getItem('snek:create-password');
+            if (createdPassword !== null) {
+                sessionStorage.removeItem('snek:create-password');
+                sessionStorage.setItem(lobbyPasswordKey, createdPassword);
+                savedPassword = createdPassword;
+                passwordLoaded = true;
+            }
+        }
+    } catch (e) { /* storage unavailable; leave the password empty */ }
+    if (!passwordLoaded && window.name.startsWith('snek-password-handoff:')) {
+        try {
+            const handoff = JSON.parse(window.name.slice('snek-password-handoff:'.length));
+            window.name = '';
+            if (handoff && typeof handoff.password === 'string' &&
+                (handoff.kind === 'create' || (handoff.kind === 'lobby' && handoff.lobby === LOBBY_ID))) {
+                savedPassword = handoff.password;
+            }
+        } catch (e) { window.name = ''; }
+    }
+    if (domPassword !== null) domPassword.value = savedPassword;
     domUsername.focus();
 
-    document.getElementById('join_form').addEventListener('submit', (event) => {
+    function setJoinPending(pending) {
+        joinPending = pending;
+        joinButton.disabled = pending;
+        joinForm.setAttribute('aria-busy', pending ? 'true' : 'false');
+    }
+
+    joinForm.addEventListener('submit', (event) => {
         event.preventDefault(); // Stay on the page; the form must not reload it.
+        if (joinPending) return;
         const username = domUsername.value;
-        socket.emit('clientReady', username, LOBBY_ID);
+        const password = domPassword?.value || '';
+        const passwordValid = new TextEncoder().encode(password).length <= 64;
+        if (domPassword !== null) {
+            domPassword.setCustomValidity(passwordValid ? '' : 'Password must be 64 UTF-8 bytes or fewer.');
+        }
+        if (!passwordValid) {
+            domPassword?.reportValidity();
+            return;
+        }
+        savedUsername = username;
+        savedPassword = password;
         hasJoined = true;
+        setJoinPending(true);
+        socket.emit('clientReady', username, LOBBY_ID, password);
         try {
             localStorage.setItem("snake_username", username);
-            savedUsername = username; // Reconnects replay the last used name.
         } catch (e) { /* storage unavailable */ }
+        try {
+            sessionStorage.setItem(`snek:lobby-password:${LOBBY_ID}`, password);
+        } catch (e) { /* storage unavailable; reconnect still uses memory */ }
     });
 
     // After a reconnect the server sees a brand new socket, so rejoin
     // automatically with the last used username.
     socket.on('connect', () => {
         if (hasJoined && savedUsername !== null) {
-            socket.emit('clientReady', savedUsername, LOBBY_ID);
+            socket.emit('clientReady', savedUsername, LOBBY_ID, savedPassword);
         }
     });
+    socket.on('game_error', () => setJoinPending(false));
 
 </script>
 </body>

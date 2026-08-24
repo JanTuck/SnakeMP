@@ -145,8 +145,6 @@ const hasChainedUpLeft = (moves) => {
   // ---- HTTP surface ----
   const home = await get('/');
   check('GET / serves index', home.status === 200 && home.body.includes('Snek'), 'status=' + home.status);
-  const lobbyPage = await get('/lobby.html');
-  check('GET /lobby.html serves shared client', lobbyPage.status === 200 && lobbyPage.body.includes('Lobby'), 'status=' + lobbyPage.status);
   const clientScript = await get('/js/rendering.js');
   check('GET /js/rendering.js serves shared client', clientScript.status === 200 && clientScript.body.length > 100, 'status=' + clientScript.status);
   const socketClient = await get('/js/transport.js');

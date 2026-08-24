@@ -29,7 +29,7 @@ function collectModuleGraph(entry) {
 }
 
 const graph = collectModuleGraph(path.join(clientRoot, 'js/rendering.js'));
-assert.strictEqual(graph.size, 9, 'rendering module graph changed; update the production asset expectation deliberately');
+assert.strictEqual(graph.size, 10, 'rendering module graph changed; update the production asset expectation deliberately');
 for (const filename of graph) {
   const route = '/' + path.relative(clientRoot, filename).split(path.sep).join('/');
   assert(manifest.includes(`.path = "${route}"`), `browser dependency is not embedded: ${route}`);

@@ -35,8 +35,11 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
 
 ## Board and movement
 
-- Board: 1920 x 960 logical pixels.
-- Cell: 16 pixels, so the board is 120 x 60 cells.
+- Board: 2048 x 1152 logical pixels, an exact 16:9 playfield that maps directly
+  to 1280 x 720, 1920 x 1080, and 2560 x 1440 displays. The browser maps the
+  complete board to the viewport at other aspect ratios; it never crops or
+  extends the authoritative collision area.
+- Cell: 16 logical pixels, so the board is 128 x 72 square cells (9,216 total).
 - A snake is stored as ordered cells, head first, and moves one cell per tick.
 - A stationary snake (no accepted direction yet) does not move or die.
 - Input is a queue of at most two turns. A new turn is rejected if it repeats
@@ -47,6 +50,11 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
 
 - Lobby ids are created by `POST /generateid` as
   `id-<base36-random><base36-time>`.
+- The creator may set an exact UTF-8 password of at most 64 bytes and may make
+  the lobby classical. Passwords are stored only as salted SHA-256 digests and
+  compared with the standard library's timing-safe primitive. Classical mode
+  is immutable for the lobby lifetime and disables drops, bonus apples, and
+  golden apples.
 - Lobby `12345` always exists and is never deleted.
 - At most 4096 lobbies exist by default, including `12345`
   (`SNEK_MAX_LOBBIES`). At capacity, `POST /generateid` returns HTTP 503 without
@@ -55,7 +63,7 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
   lifecycle test/deployment value with `SNEK_LOBBY_IDLE_MS`.
 - Default global capacity is 100 players (`SNEK_MAX_PLAYERS`).
 - Default lobby capacity is 16 players (`SNEK_MAX_PLAYERS_PER_LOBBY`). Snapshot
-  v3 has a one-byte player count, but the canonical browser deliberately
+  v4 has a five-bit player count, but the canonical browser deliberately
   enforces the tested 16-player lobby bound; do not raise the per-lobby value
   without changing and testing both protocol peers.
 - Full-server rejection is `game_error: "Server is full, try again later"`.
@@ -70,13 +78,15 @@ The join fields are UTF-8 byte strings in client binary packet type 1. The
 username is trimmed, must be 4..16 Unicode code points, accepts ASCII letters,
 digits, underscore, hyphen, and space, and permits valid non-ASCII code points.
 Invalid data produces
-`["game_error","Invalid username"]`; an unknown lobby produces
-`["game_error","That game does not exist any more"]`.
+`["game_error","Invalid username"]`; an unknown lobby or failed password
+authentication produces the same generic
+`["game_error","That game does not exist any more"]` response.
 
 On success the server:
 
 1. creates and commits the player at a random free cell;
-2. sends `init` with scale and food to the joining connection;
+2. sends `init` with scale, food, and the lobby's classical-mode flag to the
+   joining connection;
 3. marks the lobby roster dirty;
 4. sends a `join` feed event to lobby members;
 5. sends the new roster before the next binary snapshot.
@@ -112,8 +122,10 @@ join:
   type:u8 = 1
   lobby_utf8_bytes:u8
   username_utf8_bytes:u8
+  password_utf8_bytes:u8
   lobby:[u8; lobby_utf8_bytes]
   username:[u8; username_utf8_bytes]
+  password:[u8; password_utf8_bytes]
 
 input:
   type:u8 = 2
@@ -124,8 +136,10 @@ visibility hint:
   visible:u8  // 0 hidden, 1 visible
 ```
 
-The join frame length must be exactly `3 + lobby_bytes + username_bytes`, both
-fields must be non-empty, and each is limited to 255 UTF-8 bytes by the packet.
+The join frame is `[1,lobby_len,username_len,password_len,lobby,username,password]`
+and its length must be exactly `4 + lobby_bytes + username_bytes + password_bytes`.
+Lobby and username must be non-empty and are limited to 255 UTF-8 bytes;
+password is exact (not trimmed), may be empty, and is limited to 64 UTF-8 bytes.
 Input and visibility frames must be exactly two bytes. Directions are absolute;
 the server rejects repeated/reversing turns and owns the two-turn queue. The
 visibility hint changes snapshot delivery cadence, never authoritative
@@ -138,7 +152,7 @@ Each event is one JSON array whose first element is the event name:
 
 ```json
 ["id", "base64url-connection-id"]
-["init", {"scale": 16, "food": {"x": 0, "y": 0}}]
+["init", {"scale": 16, "food": {"x": 0, "y": 0}, "classical": false}]
 ["r", [["id", "displayName", "#rrggbb"]]]
 ["updateFood", {"x": 0, "y": 0}]
 ["death", 12]
@@ -210,7 +224,7 @@ hidden-document throttling. This bounds recovery without per-client snapshots.
 The client checks magic, version, header/world reserved bits, sequence
 relationship, roster/player agreement, flags and packed-body padding, all
 section counts, remaining length
-before every read, gameplay bounds (16 players, 7,200 cells, 12 bonus apples,
+before every read, gameplay bounds (16 players, 9,216 cells, 12 bonus apples,
 two drops), golden presence, and exact end-of-frame alignment. Malformed,
 truncated, or out-of-sequence snapshots are ignored without mutating game
 state.
@@ -223,8 +237,9 @@ bound.
 
 For each lobby, under its ownership lock:
 
-1. expire drops and the golden apple;
-2. schedule drops (12-20 s, at most two) and a golden apple (25-40 s, one);
+1. expire drops and the golden apple (skipped in classical mode);
+2. schedule drops (12-20 s, at most two) and a golden apple (25-40 s, one;
+   skipped in classical mode);
 3. reap disconnected players;
 4. for each player in insertion order: resolve wall/self and player collisions,
    food/pickups, one queued turn, growth, then movement;
@@ -242,9 +257,12 @@ A free cell contains no snake, food, bonus apple, drop, or golden apple.
 - `GET /` and `/index.html`: landing page
 - `GET /game/:id`: game page if the lobby exists, otherwise `302 /`
 - `GET /game.html`: `302 /` (lobby gate)
-- `POST /generateid`: create lobby and `303 /game/<id>`
-- `POST /joingame`: URL-encoded or JSON `gameId`, then a valid-game redirect or
-  `303 /?error=unknown-game`
+- `POST /generateid`: URL-encoded optional `password` and `classical` checkbox;
+  create the lobby and return `303 /game/<id>`. Invalid or oversized passwords
+  return HTTP 400 without creating a lobby.
+- `POST /joingame`: URL-encoded or JSON `gameId` and optional `password`, then
+  an authenticated-game redirect or `303 /?error=unknown-game`. Missing/wrong
+  credentials deliberately use the same response as an unknown lobby id.
 - `/css/*`, `/js/*`, and `/img/*`: compile-time embedded
   canonical client assets
 - `GET /debug/stats`: available only with `SNEK_DEBUG=1`; includes RSS,

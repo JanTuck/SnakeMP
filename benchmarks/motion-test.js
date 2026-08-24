@@ -17,7 +17,7 @@ const path = require('node:path');
 
   const source = fs.readFileSync(path.join(__dirname, '..', 'client', 'js', 'hud.js'), 'utf8');
   const moduleUrl = 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
-  const { Motion } = await import(moduleUrl);
+  const { Motion, Hud } = await import(moduleUrl);
   assert.equal(requestedQuery, '(prefers-reduced-motion: reduce)');
 
   function target() {
@@ -79,9 +79,36 @@ const path = require('node:path');
   preference.matches = false;
   assert.equal(Motion.feed({}), null, 'animation remains progressive enhancement without Element.animate');
 
+  const elements = new Map();
+  function element() {
+    return {
+      textContent: '', hidden: false, title: '', dataset: {},
+      children: [],
+      append(...children) { this.children.push(...children); },
+      setAttribute(name, value) { this[name] = value; },
+      classList: { toggle() {} },
+    };
+  }
+  for (const id of ['hud', 'hud_score', 'hud_board', 'hud_you', 'hud_points', 'hud_length', 'hud_rows', 'hud_feed', 'hud_mute', 'hud_mode']) {
+    elements.set(id, element());
+  }
+  global.document = {
+    getElementById(id) { return elements.get(id) || null; },
+    createElement() { return element(); },
+  };
+  Hud.setMode(true);
+  Hud.init();
+  assert.equal(elements.get('hud_mode').textContent, 'Classical', 'mode received before HUD initialization must be retained');
+  assert.match(elements.get('hud_board')['aria-label'], /special pickups are disabled/);
+  Hud.setMode(false);
+  assert.equal(elements.get('hud_mode').textContent, 'Arcade');
+  assert.match(elements.get('hud_board')['aria-label'], /special pickups are enabled/);
+
+  delete global.document;
   delete global.window;
-  console.log('native motion tests: PASS (4 transitions, repeated calls, reduced motion)');
+  console.log('native motion/HUD tests: PASS (4 transitions, reduced motion, game mode label)');
 })().catch((error) => {
+  delete global.document;
   delete global.window;
   console.error(error.stack || error);
   process.exitCode = 1;

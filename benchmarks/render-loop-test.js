@@ -28,6 +28,7 @@ const vm = require('node:vm');
   let particlesActive = false;
   let particleUpdates = 0;
   let lastParticleDt = 0;
+  const modes = [];
   const Particles = {
     burst() { particlesActive = true; },
     hasActive() { return particlesActive; },
@@ -39,11 +40,11 @@ const vm = require('node:vm');
     clearRect() {}, save() {}, restore() {}, translate() {}, drawImage() {},
   };
   const canvas = {
-    width: 1920,
-    height: 960,
+    width: 2048,
+    height: 1152,
     getContext() { return ctx; },
     addEventListener() {},
-    getBoundingClientRect() { return { left: 0, top: 0, width: 1920, height: 960 }; },
+    getBoundingClientRect() { return { left: 0, top: 0, width: 2048, height: 1152 }; },
   };
   ctx.canvas = canvas;
   const elements = {
@@ -67,9 +68,11 @@ const vm = require('node:vm');
     Sprites: { async load() {}, get() { return undefined; } },
     Sfx: { muted: false, death() {}, toggle() { return false; } },
     Particles,
-    Hud: { init() {}, setMuted() {}, feed() {}, update() {}, popScore() {} },
+    Hud: { init() {}, setMode(classical) { modes.push(classical); }, setMuted() {}, feed() {}, update() {}, popScore() {} },
     Motion: { canvas() {}, popup() {} },
     decodeSnapshot() { return null; },
+    resetDirection() {},
+    syncDirection() {},
     document: {
       getElementById(id) { return elements[id]; },
       querySelector() { return {}; },
@@ -87,9 +90,11 @@ const vm = require('node:vm');
 
   assert.equal(queuedFrames.length, 0, 'the join screen must not start an idle render loop');
 
-  socket.emitEvent('init', { food: { x: 10, y: 20 } });
+  socket.emitEvent('init', { food: { x: 10, y: 20 }, classical: true });
+  assert.deepEqual(modes, [true], 'classical init state must reach the HUD mode label');
   assert.equal(queuedFrames.length, 1, 'initial game setup must start rendering');
-  socket.emitEvent('init', { food: { x: 10, y: 20 } });
+  socket.emitEvent('init', { food: { x: 10, y: 20 }, classical: false });
+  assert.deepEqual(modes, [true, false], 'arcade init state must reach the HUD mode label');
   assert.equal(queuedFrames.length, 1, 'repeated setup must not queue duplicate frames');
 
   queuedFrames.shift()(100);

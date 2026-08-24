@@ -34,6 +34,24 @@ function frame(bytes, prefix = 0) {
   assert.ok(benchmarkKeyframe, 'benchmark decoder must accept the production keyframe layout');
   assert.deepEqual(benchmarkKeyframe.world.players[0].snake, [{ x: 32, y: 48 }]);
 
+  const boardEdge = frame([
+    0x53, 0x4e, 4, 1, 0, 1,
+    0, 0, 0, 0, 1, 0x80, 127, 71, 0,
+  ]);
+  assert.ok(decodeSnapshot(boardEdge, 1, null, []), '128 x 72 board must accept its final cell');
+  assert.deepEqual(
+    decodeBinary(boardEdge, [['id', 'name', '#123456']], null, null)?.world.players[0].snake,
+    [{ x: 2032, y: 1136 }],
+    'benchmark decoder must map the final cell into the 2048 x 1152 playfield',
+  );
+  const beyondBoard = frame([
+    0x53, 0x4e, 4, 1, 0, 1,
+    0, 0, 0, 0, 1, 0x80, 128, 72, 0,
+  ]);
+  assert.equal(decodeSnapshot(beyondBoard, 1, null, []), null, 'cell 128,72 must remain outside the board');
+  assert.equal(decodeBinary(beyondBoard, [['id', 'name', '#123456']], null, null), null,
+    'benchmark decoder must reject coordinates outside the canonical board');
+
   const current = [{ score: 0, snake: [{ x: 32, y: 48 }] }];
   const unchanged = frame([0x53, 0x4e, 4, 2, 0, 0x81, 0, 0]);
   const decodedUnchanged = decodeSnapshot(unchanged, 1, 1, current);

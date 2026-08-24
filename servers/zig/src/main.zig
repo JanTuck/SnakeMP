@@ -43,8 +43,15 @@ const extractJsonField = text.extractJsonField;
 const GRID_W = config.GRID_W;
 const GRID_H = config.GRID_H;
 const CELL: i32 = model.CELL;
-const COLS: i32 = GRID_W / CELL;
-const ROWS: i32 = GRID_H / CELL;
+const COLS: i32 = config.GRID_COLS;
+const ROWS: i32 = config.GRID_ROWS;
+
+comptime {
+    if (GRID_W != COLS * CELL or GRID_H != ROWS * CELL)
+        @compileError("world dimensions must be exact cell multiples");
+    if (COLS > @as(i32, std.math.maxInt(u8)) + 1 or ROWS > @as(i32, std.math.maxInt(u8)) + 1)
+        @compileError("snapshot cell coordinates must fit on the u8 wire");
+}
 
 const TICK_NS = config.TICK_NS;
 const BACKGROUND_SNAPSHOT_MS = config.BACKGROUND_SNAPSHOT_MS;
@@ -55,6 +62,7 @@ const DEFAULT_LOBBIES_PER_WORKER = config.LOBBIES_PER_WORKER;
 const GAME_WORKER_STACK = config.GAME_WORKER_STACK;
 const DEFAULT_LOBBY_IDLE_DELETE_MS = config.LOBBY_IDLE_DELETE_MS;
 const DEFAULT_LOBBY_ID = config.DEFAULT_LOBBY_ID;
+const MAX_LOBBY_PASSWORD_BYTES = config.MAX_LOBBY_PASSWORD_BYTES;
 const BONUS_CAP = config.BONUS_CAP;
 const DROP_MAX = config.DROP_MAX;
 const DROP_TTL_MS = config.DROP_TTL_MS;
@@ -222,6 +230,15 @@ fn randomCell(l: *Lobby) CellPos {
     return .{ .x = cx * CELL, .y = cy * CELL };
 }
 
+/// Keep new players in the central half of the arena. They still spawn at a
+/// random free cell, but always have enough reaction room to choose an initial
+/// direction before a wall can become an immediate hazard.
+fn randomSpawnCell(l: *Lobby) CellPos {
+    const cx = l.rng.random().intRangeLessThan(i32, COLS / 4, COLS - COLS / 4);
+    const cy = l.rng.random().intRangeLessThan(i32, ROWS / 4, ROWS - ROWS / 4);
+    return .{ .x = cx * CELL, .y = cy * CELL };
+}
+
 fn snakeOccupies(l: *Lobby, cell: CellPos) bool {
     for (l.players.items) |p| {
         for (p.snake.items) |s| {
@@ -266,12 +283,12 @@ fn randomFreeCell(l: *Lobby) ?CellPos {
 
 /// Join spawn: avoid snakes (inner retries) and food, up to 100 attempts.
 fn pickSpawnCell(l: *Lobby) CellPos {
-    var pos = randomCell(l);
+    var pos = randomSpawnCell(l);
     var attempt: usize = 0;
     while (attempt < 100) : (attempt += 1) {
         var t: usize = 0;
         while (t < 1000) : (t += 1) {
-            pos = randomCell(l);
+            pos = randomSpawnCell(l);
             if (!snakeOccupies(l, pos)) break;
         }
         if (!(pos.x == l.food.x and pos.y == l.food.y)) return pos;
@@ -1180,10 +1197,56 @@ fn destroyLobby(l: *Lobby) void {
     galloc.destroy(l);
 }
 
-fn createLobbyLocked(id: []u8) !*Lobby {
+const PasswordError = error{InvalidPassword};
+
+fn checkedPassword(raw: ?[]const u8) PasswordError![]const u8 {
+    const password = raw orelse "";
+    if (password.len > MAX_LOBBY_PASSWORD_BYTES or !std.unicode.utf8ValidateSlice(password)) {
+        return error.InvalidPassword;
+    }
+    // Control bytes are surprising in HTML forms and unsafe to copy through
+    // logs or diagnostics. Printable ASCII and valid non-ASCII UTF-8 remain
+    // otherwise unrestricted; spaces are significant and are not trimmed.
+    for (password) |byte| {
+        if (byte < 0x20 or byte == 0x7f) return error.InvalidPassword;
+    }
+    return password;
+}
+
+fn hashPassword(salt: *const [16]u8, password: []const u8) [32]u8 {
+    var digest: [32]u8 = undefined;
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(salt);
+    hasher.update(password);
+    hasher.final(&digest);
+    return digest;
+}
+
+fn constantTimeDigestEql(left: *const [32]u8, right: *const [32]u8) bool {
+    return std.crypto.timing_safe.eql([32]u8, left.*, right.*);
+}
+
+fn lobbyAcceptsPassword(l: *const Lobby, supplied: []const u8) bool {
+    if (!l.password_protected) return true;
+    if (checkedPassword(supplied)) |password| {
+        const supplied_hash = hashPassword(&l.password_salt, password);
+        return constantTimeDigestEql(&l.password_hash, &supplied_hash);
+    } else |_| return false;
+}
+
+fn createLobbyLocked(id: []u8, password: []const u8, classical: bool) !*Lobby {
     const l = try galloc.create(Lobby);
     const seed = rng_prng.random().int(u64);
-    l.* = .{ .id = id, .food = undefined };
+    var password_salt: [16]u8 = undefined;
+    rng_prng.random().bytes(&password_salt);
+    l.* = .{
+        .id = id,
+        .password_salt = password_salt,
+        .password_hash = if (password.len == 0) @splat(0) else hashPassword(&password_salt, password),
+        .password_protected = password.len != 0,
+        .classical = classical,
+        .food = undefined,
+    };
     l.rng = std.Random.DefaultPrng.init(seed);
     l.food = randomCell(l);
     lobbies.put(galloc, id, l) catch |e| {
@@ -1277,7 +1340,7 @@ fn discardPreparedPlayerLocked(target: *Lobby, player: *Player, activated_worker
     target.mutex.lockUncancelable(g_io);
 }
 
-fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_arg: ?[]const u8) void {
+fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_arg: ?[]const u8, password: []const u8) void {
     // Already playing on this socket: silently ignore (rejoin guard).
     c.membership_mutex.lockUncancelable(g_io);
     const already_playing = c.player != null;
@@ -1291,7 +1354,9 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
         return;
     }
     const lobby = if (lobby_arg) |lid| lobbies.get(lid) else null;
-    if (lobby == null) {
+    // Authentication failures deliberately share the unknown-lobby response:
+    // neither HTTP nor WebSocket joins disclose whether an id is protected.
+    if (lobby == null or !lobbyAcceptsPassword(lobby.?, password)) {
         sendGameError(c, ERR_UNKNOWN_GAME, aa);
         return;
     }
@@ -1345,7 +1410,7 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
 
     var init_args: Buf = .empty;
     defer init_args.deinit(aa);
-    pf(&init_args, aa, ",{{\"scale\":16,\"food\":{{\"x\":{d},\"y\":{d}}}}}", .{ target.food.x, target.food.y }) catch {
+    pf(&init_args, aa, ",{{\"scale\":16,\"food\":{{\"x\":{d},\"y\":{d}}},\"classical\":{}}}", .{ target.food.x, target.food.y, target.classical }) catch {
         discardPreparedPlayerLocked(target, p, activated_worker);
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
@@ -1489,8 +1554,10 @@ fn applyMoveAndCheckWall(player: *Player, slot: usize, collision_index: *collisi
 fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
     const t0 = monoNanos();
 
-    // 1. expire pickups past their TTL
-    {
+    // Classical lobbies contain only main food, so their hot path skips all
+    // special-pickup expiry and scheduling work as well as their game rules.
+    if (!l.classical) {
+        // 1. expire pickups past their TTL
         var di: usize = 0;
         while (di < l.drops.items.len) {
             if (l.drops.items[di].expires_at <= now) {
@@ -1500,18 +1567,17 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
         if (l.golden) |g| {
             if (g.expires_at <= now) l.golden = null;
         }
-    }
-
-    // 2. schedules: first drop ~8s, first golden ~20s, then 12-20s / 25-40s
-    if (l.next_drop_at == 0) l.next_drop_at = now + 8000;
-    if (l.next_golden_at == 0) l.next_golden_at = now + 20000;
-    if (now >= l.next_drop_at and l.drops.items.len < DROP_MAX) {
-        spawnDropLocked(l, now, aa);
-        l.next_drop_at = now + 12000 + l.rng.random().intRangeLessThan(i64, 0, 8000);
-    }
-    if (now >= l.next_golden_at and l.golden == null) {
-        spawnGoldenLocked(l, now);
-        l.next_golden_at = now + 25000 + l.rng.random().intRangeLessThan(i64, 0, 15000);
+        // 2. schedules: first drop ~8s, first golden ~20s, then 12-20s / 25-40s
+        if (l.next_drop_at == 0) l.next_drop_at = now + 8000;
+        if (l.next_golden_at == 0) l.next_golden_at = now + 20000;
+        if (now >= l.next_drop_at and l.drops.items.len < DROP_MAX) {
+            spawnDropLocked(l, now, aa);
+            l.next_drop_at = now + 12000 + l.rng.random().intRangeLessThan(i64, 0, 8000);
+        }
+        if (now >= l.next_golden_at and l.golden == null) {
+            spawnGoldenLocked(l, now);
+            l.next_golden_at = now + 25000 + l.rng.random().intRangeLessThan(i64, 0, 15000);
+        }
     }
 
     // 3. per-player simulation, insertion order. Deaths are tombstoned and
@@ -1574,8 +1640,9 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
             broadcastUpdateFood(l, aa);
         }
 
-        // d. bonus apples (every apple matching the head)
-        {
+        // d-f. Special pickups do not exist in classical mode.
+        if (!l.classical) {
+            // bonus apples (every apple matching the head)
             var bi = l.bonus.items.len;
             while (bi > 0) {
                 bi -= 1;
@@ -1585,19 +1652,16 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
                     p.eat(1, 1);
                 }
             }
-        }
-
-        // e. golden apple
-        if (l.golden) |g| {
-            if (head.x == g.pos.x and head.y == g.pos.y) {
-                l.golden = null;
-                p.eat(GOLDEN_POINTS, 1);
-                broadcastGoldenFeed(l, p, aa);
+            // golden apple
+            if (l.golden) |g| {
+                if (head.x == g.pos.x and head.y == g.pos.y) {
+                    l.golden = null;
+                    p.eat(GOLDEN_POINTS, 1);
+                    broadcastGoldenFeed(l, p, aa);
+                }
             }
-        }
 
-        // f. supply crates
-        {
+            // supply crates
             var di = l.drops.items.len;
             while (di > 0) {
                 di -= 1;
@@ -1977,6 +2041,21 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
 
     if (is_post) {
         if (std.mem.eql(u8, dec_path, "/generateid")) {
+            const raw_password = if (body.len > 0) extractFormField(aa, body, "password") else null;
+            const password = checkedPassword(raw_password) catch {
+                return sendResponse(c, aa, .{
+                    .status = 400,
+                    .reason = "Bad Request",
+                    .ctype = "text/plain; charset=utf-8",
+                    .body = "Password must be valid text of at most 64 bytes",
+                    .keep_alive = keep_alive,
+                });
+            };
+            const classical_value = if (body.len > 0) extractFormField(aa, body, "classical") else null;
+            const classical = if (classical_value) |value|
+                std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "on") or std.ascii.eqlIgnoreCase(value, "true")
+            else
+                false;
             if (lobbies.count() >= max_lobbies) {
                 return sendResponse(c, aa, .{
                     .status = 503,
@@ -1995,7 +2074,7 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
             const owned = galloc.dupe(u8, new_id) catch {
                 return sendServerError(c, aa);
             };
-            _ = createLobbyLocked(owned) catch {
+            _ = createLobbyLocked(owned, password, classical) catch {
                 galloc.free(owned);
                 return sendServerError(c, aa);
             };
@@ -2005,15 +2084,18 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
         }
         if (std.mem.eql(u8, dec_path, "/joingame")) {
             var game_id: ?[]const u8 = null;
+            var password: []const u8 = "";
             if (body.len > 0) {
                 if (body_is_json) game_id = extractJsonField(aa, body, "gameId");
                 if (game_id == null) game_id = extractFormField(aa, body, "gameId");
+                if (body_is_json) password = extractJsonField(aa, body, "password") orelse "";
+                if (password.len == 0) password = extractFormField(aa, body, "password") orelse "";
             }
             var loc: []const u8 = "/?error=unknown-game";
             if (game_id) |raw| {
                 const trimmed = jsTrim(raw);
-                const exists = lobbies.contains(trimmed);
-                if (exists) {
+                const lobby = lobbies.get(trimmed);
+                if (lobby != null and lobbyAcceptsPassword(lobby.?, password)) {
                     const enc = uriEncodeComponent(aa, trimmed);
                     loc = std.fmt.allocPrint(aa, "/game/{s}", .{enc}) catch "/?error=unknown-game";
                 }
@@ -2070,7 +2152,7 @@ fn handleRawBinary(c: *Conn, aa: Allocator, payload: []const u8) void {
     }
     const packet = websocket.clientPacket(payload) orelse return;
     switch (packet) {
-        .join => |join| handleClientReady(c, aa, join.username, join.lobby_id),
+        .join => |join| handleClientReady(c, aa, join.username, join.lobby_id, join.password),
         .direction => |direction| handleKeyPress(c, direction),
         .visibility => |visible| handleVisibility(c, visible),
     }
@@ -2533,7 +2615,7 @@ pub fn main(init: std.process.Init) !void {
     {
         const def_id = try galloc.dupe(u8, DEFAULT_LOBBY_ID);
         errdefer galloc.free(def_id);
-        _ = try createLobbyLocked(def_id);
+        _ = try createLobbyLocked(def_id, "", false);
     }
 
     const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
@@ -2719,20 +2801,71 @@ test "color conversion clamps floating point edge values" {
 
 test "binary client packets reject malformed and partial input" {
     try std.testing.expect(websocket.clientPacket(&.{}) == null);
-    try std.testing.expect(websocket.clientPacket(&.{ 1, 5, 4, '1' }) == null);
-    try std.testing.expect(websocket.clientPacket(&.{ 1, 0, 1, 'x' }) == null);
+    try std.testing.expect(websocket.clientPacket(&.{ 1, 5, 4, 0, '1' }) == null);
+    try std.testing.expect(websocket.clientPacket(&.{ 1, 0, 1, 0, 'x' }) == null);
     try std.testing.expect(websocket.clientPacket(&.{2}) == null);
     try std.testing.expect(websocket.clientPacket(&.{ 2, 4 }) == null);
     try std.testing.expect(websocket.clientPacket(&.{3}) == null);
     try std.testing.expect(websocket.clientPacket(&.{ 3, 2 }) == null);
     try std.testing.expect(websocket.clientPacket(&.{ 3, 1, 0 }) == null);
     try std.testing.expect(websocket.clientPacket(&.{ 4, 0 }) == null);
-    const joined = websocket.clientPacket(&.{ 1, 5, 4, '1', '2', '3', '4', '5', 'n', 'a', 'm', 'e' }).?;
+    const joined = websocket.clientPacket(&.{ 1, 5, 4, 2, '1', '2', '3', '4', '5', 'n', 'a', 'm', 'e', 'p', 'w' }).?;
     try std.testing.expectEqualStrings("12345", joined.join.lobby_id);
     try std.testing.expectEqualStrings("name", joined.join.username);
+    try std.testing.expectEqualStrings("pw", joined.join.password);
     try std.testing.expectEqual(Direction.left, websocket.clientPacket(&.{ 2, 2 }).?.direction);
     try std.testing.expectEqual(false, websocket.clientPacket(&.{ 3, 0 }).?.visibility);
     try std.testing.expectEqual(true, websocket.clientPacket(&.{ 3, 1 }).?.visibility);
+}
+
+test "lobby passwords are bounded, validated, and authenticated exactly" {
+    var oversized: [MAX_LOBBY_PASSWORD_BYTES + 1]u8 = @splat('p');
+    try std.testing.expectError(error.InvalidPassword, checkedPassword(&oversized));
+    try std.testing.expectError(error.InvalidPassword, checkedPassword("bad\x00password"));
+    try std.testing.expectError(error.InvalidPassword, checkedPassword("bad\xc0\x80"));
+    try std.testing.expectEqualStrings(" exact pass ", try checkedPassword(" exact pass "));
+
+    const salt = [_]u8{0x5a} ** 16;
+    var protected = Lobby{
+        .id = @constCast("protected"),
+        .password_salt = salt,
+        .password_hash = hashPassword(&salt, "correct horse"),
+        .password_protected = true,
+        .food = .{ .x = 0, .y = 0 },
+    };
+    try std.testing.expect(!lobbyAcceptsPassword(&protected, ""));
+    try std.testing.expect(!lobbyAcceptsPassword(&protected, "wrong horse"));
+    try std.testing.expect(lobbyAcceptsPassword(&protected, "correct horse"));
+
+    protected.password_protected = false;
+    try std.testing.expect(lobbyAcceptsPassword(&protected, ""));
+}
+
+test "classical lobby ticks never schedule special pickups" {
+    galloc = std.testing.allocator;
+    g_io = std.testing.io;
+    defer drainSnapshotPool();
+
+    var lobby = Lobby{
+        .id = @constCast("classical"),
+        .classical = true,
+        .food = .{ .x = 0, .y = 0 },
+        // These would cause immediate spawns in a standard lobby.
+        .next_drop_at = 1,
+        .next_golden_at = 1,
+    };
+    lobby.rng = std.Random.DefaultPrng.init(42);
+    defer lobby.drops.deinit(galloc);
+    defer lobby.bonus.deinit(galloc);
+    defer lobby.roster_wire.deinit(galloc);
+    defer lobby.players.deinit(galloc);
+
+    for (0..8) |index| tickLobby(&lobby, 100_000 + @as(i64, @intCast(index)), std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), lobby.drops.items.len);
+    try std.testing.expectEqual(@as(usize, 0), lobby.bonus.items.len);
+    try std.testing.expectEqual(@as(?model.Golden, null), lobby.golden);
+    try std.testing.expectEqual(@as(i64, 1), lobby.next_drop_at);
+    try std.testing.expectEqual(@as(i64, 1), lobby.next_golden_at);
 }
 
 test "keypress queues a turn for the current lobby membership" {

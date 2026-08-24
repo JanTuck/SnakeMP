@@ -73,7 +73,7 @@ class RawSocket {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(packet);
     else if (this.pending.length < 8) this.pending.push(packet);
   }
-  emit(name, first, second) {
+  emit(name, first, second, third) {
     if (name === 'keyPress') {
       const code = directionCode[first];
       if (code !== undefined) this.send(Buffer.from([2, code]));
@@ -82,8 +82,9 @@ class RawSocket {
     if (name !== 'clientReady') return this;
     const username = Buffer.from(String(first));
     const lobby = Buffer.from(String(second));
-    if (!username.length || username.length > 255 || !lobby.length || lobby.length > 255) return this;
-    this.send(Buffer.concat([Buffer.from([1, lobby.length, username.length]), lobby, username]));
+    const password = Buffer.from(third == null ? '' : String(third));
+    if (!username.length || username.length > 255 || !lobby.length || lobby.length > 255 || password.length > 64) return this;
+    this.send(Buffer.concat([Buffer.from([1, lobby.length, username.length, password.length]), lobby, username, password]));
     return this;
   }
   close() {

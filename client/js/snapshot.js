@@ -1,9 +1,9 @@
 const MAX_PLAYERS = 16;
-const MAX_CELLS = 7200;
 const MAX_BONUS = 12;
 const MAX_DROPS = 2;
-const COLS = 120;
-const ROWS = 60;
+const COLS = 128;
+const ROWS = 72;
+const MAX_CELLS = COLS * ROWS;
 
 const players = Array.from({ length: MAX_PLAYERS }, () => ({
     score: 0, cells: 0, packed: false, bodyOffset: 0,

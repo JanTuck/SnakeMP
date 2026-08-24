@@ -10,11 +10,11 @@ const config = @import("config.zig");
 const model = @import("model.zig");
 
 pub const max_indexed_players: usize = 16;
-const cols: usize = @intCast(@divExact(config.GRID_W, model.CELL));
-const rows: usize = @intCast(@divExact(config.GRID_H, model.CELL));
-const cell_count = cols * rows;
+const cols: usize = @intCast(config.GRID_COLS);
+const rows: usize = @intCast(config.GRID_ROWS);
+const cell_count = config.MAX_CELLS;
 const Mask = u16;
-// Below this estimated scan work, the tiny direct loops beat clearing 7,200
+// Below this estimated scan work, the tiny direct loops beat clearing 9,216
 // grid cells. This keeps one-cell/short-snake mass workloads on the lean path.
 const min_estimated_comparisons: usize = 16_384;
 
@@ -284,7 +284,25 @@ test "short lobbies retain the exact lower-cost scan path" {
 }
 
 test "index stays comfortably within the 128 KiB worker stack" {
-    try std.testing.expect(@sizeOf(Index) <= 16 * 1024);
+    try std.testing.expect(@sizeOf(Index) <= config.GAME_WORKER_STACK / 4);
+}
+
+test "index covers the full 128 by 72 canonical board" {
+    try std.testing.expectEqual(@as(usize, 128), cols);
+    try std.testing.expectEqual(@as(usize, 72), rows);
+    try std.testing.expectEqual(@as(usize, 9_216), cell_count);
+
+    var conn: model.Conn = .{ .fd = -1 };
+    var cells = [_]model.CellPos{.{
+        .x = config.GRID_W - model.CELL,
+        .y = config.GRID_H - model.CELL,
+    }};
+    var player = testPlayer(&conn, &cells);
+    const players = [_]*model.Player{&player};
+    const index = Index.buildForced(&players);
+    try std.testing.expectEqual(@as(Mask, 1), index.maskAt(cells[0]));
+    try std.testing.expectEqual(@as(Mask, 0), index.maskAt(.{ .x = config.GRID_W, .y = cells[0].y }));
+    try std.testing.expectEqual(@as(Mask, 0), index.maskAt(.{ .x = cells[0].x, .y = config.GRID_H }));
 }
 
 test "checked lookup rejects positions between authoritative cells" {

@@ -25,6 +25,12 @@ inputs are two small binary packet types and each 15 Hz world update is a
 bounds-checked binary snapshot. JSON is reserved for infrequent control events
 such as initialization, roster changes, errors, and the activity feed.
 
+The authoritative playfield is 2048 x 1152 logical pixels: 128 x 72 square
+cells at 16 pixels per cell. Its exact 16:9 shape maps directly to 720p,
+1080p, and 1440p displays. The browser preserves the legacy full-viewport
+presentation at other window shapes, so every visible edge remains the real
+collision boundary rather than a decorative extension or hidden crop.
+
 ## Build and run
 
 Production requires Zig and Linux; Node.js is not needed to build or run the
@@ -37,6 +43,33 @@ bash servers/zig/build-assets.sh
   -femit-bin=snek-zig --cache-dir .zig-cache --global-cache-dir .zig-global-cache)
 PORT=3000 servers/zig/snek-zig
 ```
+
+### Minimal Docker runtime
+
+[`start-docker.sh`](start-docker.sh) builds the asset-embedded static Zig
+executable on the host, builds a runtime-only `scratch` image, starts it as an
+unprivileged user, and verifies the root HTTP route. The Dockerfile deliberately
+does not compile the application or contain a compiler, shell, package manager,
+source tree, or separate web assets.
+
+```bash
+./start-docker.sh
+# http://127.0.0.1:9687/
+```
+
+The script replaces a running container with the configured name and leaves the
+new container running in the background. Its optional overrides are:
+
+- `ZIG_BIN` for a non-default Zig executable
+- `SNEK_DOCKER_IMAGE` (default `snakemp:local`)
+- `SNEK_DOCKER_CONTAINER` (default `snakemp`)
+- `SNEK_DOCKER_PORT` for the published host port (default `9687`)
+
+For example, `SNEK_DOCKER_PORT=8080 ./start-docker.sh` publishes host port 8080
+to the server's fixed container port 9687. The image serves HTTP and WebSockets;
+terminate HTTPS at a reverse proxy and forward it to that port. Runtime
+`SNEK_*` capacity overrides listed below are passed through when set in the
+script's environment.
 
 Useful runtime overrides are:
 

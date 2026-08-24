@@ -56,6 +56,7 @@ export const Motion = Object.freeze({
 });
 
 let els = null;
+let classicalMode = false;
 const lastMe = { id: null, name: '', score: 0, length: 0 };
 let scoreVisible = false;
 let boardVisible = false;
@@ -113,21 +114,24 @@ export const Hud = {
 
         root.innerHTML = `
             <section class="hud-panel hud-score" id="hud_score" aria-label="Your game stats" hidden>
-                <span class="hud-you" id="hud_you"></span>
+                <span class="hud-identity">
+                    <span class="hud-label">Player</span>
+                    <span class="hud-you" id="hud_you"></span>
+                </span>
                 <span class="hud-stat hud-stat-score" title="Score">
                     <svg aria-hidden="true" viewBox="0 0 20 20"><path d="m10 2.5 2.2 4.45 4.92.72-3.56 3.47.84 4.9L10 13.72l-4.4 2.32.84-4.9-3.56-3.47 4.92-.72L10 2.5Z"/></svg>
-                    <span id="hud_points">0</span><span class="sr-only"> points</span>
+                    <span><span class="hud-label">Score</span><span id="hud_points">0</span><span class="sr-only"> points</span></span>
                 </span>
                 <span class="hud-stat" title="Snake length">
                     <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M3 5h7a3 3 0 0 1 0 6H8a3 3 0 0 0 0 6h9"/><path d="m14 13 3 3-3 3"/></svg>
-                    <span id="hud_length">0</span><span class="sr-only"> segments</span>
+                    <span><span class="hud-label">Length</span><span id="hud_length">0</span><span class="sr-only"> segments</span></span>
                 </span>
             </section>
 
             <section class="hud-panel hud-board" id="hud_board" aria-labelledby="hud_board_title" hidden>
                 <header class="hud-board-header">
-                    <h2 id="hud_board_title">Leaderboard</h2>
-                    <span>Score</span>
+                    <h2 id="hud_board_title">Standings</h2>
+                    <span><strong id="hud_mode">Arcade</strong> / Pts</span>
                 </header>
                 <ol class="hud-rows" id="hud_rows"></ol>
             </section>
@@ -164,7 +168,18 @@ export const Hud = {
             rows: rowElements,
             feed: document.getElementById('hud_feed'),
             mute: document.getElementById('hud_mute'),
+            mode: document.getElementById('hud_mode'),
         };
+        this.setMode(classicalMode);
+    },
+
+    setMode(classical) {
+        classicalMode = classical === true;
+        if (els === null) return;
+        setText(els.mode, classicalMode ? 'Classical' : 'Arcade');
+        els.board.setAttribute('aria-label', classicalMode
+            ? 'Classical mode standings; special pickups are disabled'
+            : 'Arcade mode standings; special pickups are enabled');
     },
 
     setMuted(muted) {

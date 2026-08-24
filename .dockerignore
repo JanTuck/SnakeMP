@@ -1,0 +1,6 @@
+# The runtime image only needs the already-built, asset-embedded executable.
+**
+!Dockerfile
+!servers/
+!servers/zig/
+!servers/zig/snek-zig

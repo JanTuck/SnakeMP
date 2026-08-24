@@ -3,85 +3,208 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="theme-color" content="#20242f">
-    <title>Snek — The multiplayer snake</title>
+    <meta name="theme-color" content="#11151d">
+    <title>Snek — Multiplayer snake</title>
     <link rel="icon" href="/img/snek.png">
-    <link rel="stylesheet" href="css/index.css">
+    <link rel="stylesheet" href="/css/index.css">
 </head>
 <body>
+    <a class="skip-link" href="#play">Skip to game controls</a>
+
+    <header class="site-header">
+        <a class="wordmark" href="/" aria-label="Snek home">
+            <img src="/img/snek.png" alt="" width="48" height="48">
+            <span>Snek</span>
+        </a>
+        <p class="server-state"><span aria-hidden="true"></span> Server online</p>
+    </header>
+
     <main class="landing">
-        <section class="intro" aria-labelledby="page-title">
-            <div class="brand">
-                <img class="brand-snek" src="/img/snek.png" alt="" width="72" height="72">
-                <div>
-                    <h1 id="page-title">Snek</h1>
-                    <p class="tagline">The multiplayer snake</p>
+        <section class="arena-intro" aria-labelledby="page-title">
+            <div class="intro-copy">
+                <h1 id="page-title">Outmove<br>the room.</h1>
+                <p>Fast multiplayer snake. Open a lobby, send the link, and make every turn count.</p>
+            </div>
+
+            <div class="arena-window" aria-label="A Snek game board with apples and a supply crate" role="img">
+                <div class="arena-bar" aria-hidden="true">
+                    <span>Live arena</span>
+                    <span class="arena-readout">128 × 72</span>
+                </div>
+                <div class="board-preview" aria-hidden="true">
+                    <span class="snake-cell snake-head"></span>
+                    <span class="snake-cell snake-2"></span>
+                    <span class="snake-cell snake-3"></span>
+                    <span class="snake-cell snake-4"></span>
+                    <span class="snake-cell snake-5"></span>
+                    <span class="snake-cell snake-6"></span>
+                    <img class="pickup pickup-apple" src="/img/apple.png" alt="" width="72" height="72">
+                    <img class="pickup pickup-crate" src="/img/crate.png" alt="" width="72" height="72">
+                    <img class="pickup pickup-golden" src="/img/golden.png" alt="" width="72" height="72">
                 </div>
             </div>
 
-            <div class="board-preview" aria-hidden="true">
-                <span class="snake-cell snake-cell-1"></span>
-                <span class="snake-cell snake-cell-2"></span>
-                <span class="snake-cell snake-cell-3"></span>
-                <span class="snake-cell snake-cell-4"></span>
-                <span class="snake-cell snake-cell-5"></span>
-                <img class="preview-pickup preview-apple" src="/img/apple.png" alt="" width="72" height="72">
-                <img class="preview-pickup preview-golden" src="/img/golden.png" alt="" width="72" height="72">
-            </div>
-
-            <ul class="hints" aria-label="Game objectives">
-                <li><img src="/img/apple.png" alt="" width="72" height="72"><span>Eat apples</span></li>
-                <li><img src="/img/crate.png" alt="" width="72" height="72"><span>Crack supply crates</span></li>
-                <li><img src="/img/golden.png" alt="" width="72" height="72"><span>Catch the golden apple</span></li>
+            <ul class="game-notes" aria-label="Game highlights">
+                <li><strong>Instant</strong><span>No account needed</span></li>
+                <li><strong>Private</strong><span>Optional password</span></li>
+                <li><strong>Flexible</strong><span>Classical or powered-up</span></li>
             </ul>
         </section>
 
-        <section class="play-panel" aria-labelledby="join-title">
-            <header class="panel-header">
-                <h2 id="join-title">Join a game</h2>
-                <p>Enter a game ID or create a fresh arena.</p>
+        <section class="play-console" id="play" aria-labelledby="play-title">
+            <header class="console-header">
+                <div>
+                    <h2 id="play-title">Enter the arena</h2>
+                    <p>Join an existing room or launch your own.</p>
+                </div>
+                <span class="console-mark" aria-hidden="true">Lobby control</span>
             </header>
 
-            <p id="join_error" role="alert" hidden></p>
+            <p class="form-error" id="join_error" role="alert" hidden></p>
 
-            <form method="post" action="/joingame" class="join-form">
-                <label for="gameId">Game ID or link</label>
-                <input
-                    id="gameId"
-                    name="gameId"
-                    type="text"
-                    placeholder="e.g. 12345"
-                    autocomplete="off"
-                    autocapitalize="none"
-                    spellcheck="false"
-                    enterkeyhint="go"
-                >
-                <button class="btn btn-join" type="submit">
-                    <svg class="btn-icon" aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><path d="m7 4 6 6-6 6"/></svg>
-                    <span>Join game</span>
-                </button>
+            <form method="post" action="/joingame" class="console-form join-form">
+                <fieldset>
+                    <legend>Join a lobby</legend>
+                    <div class="form-row join-fields">
+                        <div class="field field-code">
+                            <label for="gameId">Lobby code or link</label>
+                            <input id="gameId" name="gameId" type="text" placeholder="12345" maxlength="128" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="next" required>
+                        </div>
+                        <div class="field">
+                            <label for="joinPassword">Password <span>optional</span></label>
+                            <input id="joinPassword" name="password" type="password" maxlength="64" autocomplete="current-password" placeholder="If required" enterkeyhint="go">
+                        </div>
+                    </div>
+                    <button class="button button-primary" type="submit">
+                        <span>Join lobby</span>
+                        <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><path d="m7 4 6 6-6 6"/></svg>
+                    </button>
+                </fieldset>
             </form>
 
-            <div class="divider" role="separator"><span>or</span></div>
+            <div class="console-divider" aria-hidden="true"><span>or create</span></div>
 
-            <form method="post" action="/generateid" class="create-form">
-                <button class="btn btn-create" type="submit">
-                    <svg class="btn-icon" aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><path d="M10 4v12M4 10h12"/></svg>
-                    <span>Create a new game</span>
-                </button>
-                <p class="form-hint">Get a link you can send to friends.</p>
+            <form method="post" action="/generateid" class="console-form create-form">
+                <fieldset>
+                    <legend>New lobby</legend>
+                    <div class="field">
+                        <label for="createPassword">Lobby password <span>optional</span></label>
+                        <input id="createPassword" name="password" type="password" maxlength="64" autocomplete="new-password" placeholder="Leave blank for open access">
+                    </div>
+
+                    <label class="mode-control" for="classical">
+                        <input id="classical" name="classical" type="checkbox" value="1">
+                        <span class="check-control" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="m3 8 3 3 7-7"/></svg></span>
+                        <span class="mode-copy">
+                            <strong>Classical mode</strong>
+                            <small>Apples only. No golden apples or supply drops.</small>
+                        </span>
+                    </label>
+
+                    <button class="button button-secondary" type="submit">
+                        <span>Create lobby</span>
+                        <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><path d="M10 4v12M4 10h12"/></svg>
+                    </button>
+                    <p class="form-note">You’ll get a shareable link immediately.</p>
+                </fieldset>
             </form>
         </section>
     </main>
 
+    <footer class="site-footer">
+        <span>Snek multiplayer</span>
+        <span>One link. One arena.</span>
+    </footer>
+
     <script>
         (function () {
-            var params = new URLSearchParams(window.location.search);
-            if (params.get('error') === 'unknown-game') {
-                var el = document.getElementById('join_error');
-                el.textContent = 'That game ID does not exist. Double-check it or create a new game.';
-                el.hidden = false;
+            var errors = {
+                'unknown-game': 'That lobby does not exist. Check the code or password, or create a new one.'
+            };
+            var error = new URLSearchParams(window.location.search).get('error');
+            var errorElement = document.getElementById('join_error');
+            if (errors[error]) {
+                errorElement.textContent = errors[error];
+                errorElement.hidden = false;
             }
+
+            var joinForm = document.querySelector('.join-form');
+            var createForm = document.querySelector('.create-form');
+            var gameId = document.getElementById('gameId');
+            var joinPassword = document.getElementById('joinPassword');
+            var createPassword = document.getElementById('createPassword');
+            var joinSubmitting = false;
+            var createSubmitting = false;
+            var handoffPrefix = 'snek-password-handoff:';
+
+            function passwordFits(input) {
+                var valid = new TextEncoder().encode(input.value).length <= 64;
+                input.setCustomValidity(valid ? '' : 'Password must be 64 UTF-8 bytes or fewer.');
+                if (!valid) input.reportValidity();
+                return valid;
+            }
+
+            function rememberPassword(key, value, fallback) {
+                try {
+                    sessionStorage.setItem(key, value);
+                } catch (_) {
+                    // window.name survives this same-tab redirect even when
+                    // storage is disabled. The game page consumes it once.
+                    try { window.name = handoffPrefix + JSON.stringify(fallback); } catch (_) {}
+                }
+            }
+
+            function normalizedLobbyId(value) {
+                var trimmed = value.trim();
+                if (!trimmed) return '';
+                try {
+                    var url = new URL(trimmed);
+                    var match = url.pathname.match(/\/game\/([^/]+)\/?$/);
+                    if (match) return decodeURIComponent(match[1]);
+                    var segments = url.pathname.split('/').filter(Boolean);
+                    return segments.length ? decodeURIComponent(segments[segments.length - 1]) : trimmed;
+                } catch (_) {
+                    var pieces = trimmed.split('/').filter(Boolean);
+                    return pieces.length ? pieces[pieces.length - 1] : trimmed;
+                }
+            }
+
+            gameId.addEventListener('change', function () {
+                var normalized = normalizedLobbyId(gameId.value);
+                if (normalized) gameId.value = normalized;
+            });
+
+            joinForm.addEventListener('submit', function (event) {
+                if (joinSubmitting) {
+                    event.preventDefault();
+                    return;
+                }
+                var lobbyId = normalizedLobbyId(gameId.value);
+                if (!lobbyId || !passwordFits(joinPassword)) {
+                    event.preventDefault();
+                    return;
+                }
+                gameId.value = lobbyId;
+                rememberPassword('snek:lobby-password:' + lobbyId, joinPassword.value,
+                    { kind: 'lobby', lobby: lobbyId, password: joinPassword.value });
+                joinSubmitting = true;
+                joinForm.querySelector('button[type="submit"]').disabled = true;
+            });
+
+            createForm.addEventListener('submit', function (event) {
+                if (createSubmitting) {
+                    event.preventDefault();
+                    return;
+                }
+                if (!passwordFits(createPassword)) {
+                    event.preventDefault();
+                    return;
+                }
+                rememberPassword('snek:create-password', createPassword.value,
+                    { kind: 'create', password: createPassword.value });
+                createSubmitting = true;
+                createForm.querySelector('button[type="submit"]').disabled = true;
+            });
         })();
     </script>
 </body>

@@ -2,6 +2,8 @@
  * can use several CPU cores instead of becoming the measured bottleneck. */
 const io = require('./socket');
 
+const BOARD_CELLS = 128 * 72;
+
 try { delete globalThis.WebSocket; } catch (_) {}
 
 const sockets = [];
@@ -104,7 +106,7 @@ function addOne(job) {
           const encoded = view.getUint16(offset + 4, true);
           const cells = encoded & 0x7fff;
           const packed = (encoded & 0x8000) !== 0;
-          if (cells === 0 || cells > 7200) return invalid();
+          if (cells === 0 || cells > BOARD_CELLS) return invalid();
           state.cells[i] = cells;
           offset += 6 + (packed ? 2 + Math.ceil((cells - 1) / 4) : cells * 2);
         } else {

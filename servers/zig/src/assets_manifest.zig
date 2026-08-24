@@ -23,16 +23,11 @@ pub const assets = [_]Asset{
     .{ .path = "/", .ctype = HTML, .body = index_html },
     .{ .path = "/index.html", .ctype = HTML, .body = index_html },
     .{ .path = "/game.html", .ctype = HTML, .body = game_html },
-    .{ .path = "/lobby.html", .ctype = HTML, .body = @embedFile("generated/client/lobby.html") },
-
     .{ .path = "/css/game.css", .ctype = CSS, .body = @embedFile("generated/client/css/game.css") },
     .{ .path = "/css/index.css", .ctype = CSS, .body = @embedFile("generated/client/css/index.css") },
 
-    .{ .path = "/js/layout/animations.js", .ctype = JS, .body = @embedFile("generated/client/js/layout/animations.js") },
     .{ .path = "/js/menu/menu.js", .ctype = JS, .body = @embedFile("generated/client/js/menu/menu.js") },
     .{ .path = "/js/menu/gameOverMenu.js", .ctype = JS, .body = @embedFile("generated/client/js/menu/gameOverMenu.js") },
-    .{ .path = "/js/overlays/feedElement.js", .ctype = JS, .body = @embedFile("generated/client/js/overlays/feedElement.js") },
-    .{ .path = "/js/overlays/playerfeed.js", .ctype = JS, .body = @embedFile("generated/client/js/overlays/playerfeed.js") },
     .{ .path = "/js/snapshot.js", .ctype = JS, .body = @embedFile("generated/client/js/snapshot.js") },
     .{ .path = "/js/transport.js", .ctype = JS, .body = @embedFile("generated/client/js/transport.js") },
     .{ .path = "/js/userInput.js", .ctype = JS, .body = @embedFile("generated/client/js/userInput.js") },
@@ -46,10 +41,6 @@ pub const assets = [_]Asset{
     .{ .path = "/img/apple.png", .ctype = PNG, .body = @embedFile("generated/client/img/apple.png") },
     .{ .path = "/img/crate.png", .ctype = PNG, .body = @embedFile("generated/client/img/crate.png") },
     .{ .path = "/img/golden.png", .ctype = PNG, .body = @embedFile("generated/client/img/golden.png") },
-    .{ .path = "/img/bolt.png", .ctype = PNG, .body = @embedFile("generated/client/img/bolt.png") },
-    .{ .path = "/img/crown.png", .ctype = PNG, .body = @embedFile("generated/client/img/crown.png") },
-    .{ .path = "/img/party.png", .ctype = PNG, .body = @embedFile("generated/client/img/party.png") },
-    .{ .path = "/img/sparkles.png", .ctype = PNG, .body = @embedFile("generated/client/img/sparkles.png") },
     .{ .path = "/img/snek.png", .ctype = PNG, .body = @embedFile("generated/client/img/snek.png") },
     .{ .path = "/img/CREDITS.md", .ctype = MD, .body = @embedFile("generated/client/img/CREDITS.md") },
 };

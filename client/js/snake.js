@@ -118,7 +118,15 @@ export default class Snake {
             if (i === 0) {
                 // Head: slightly larger, full colour, with eyes.
                 ctx.fillStyle = this.color;
-                this.roundRect(x + 0.5, y + 0.5, s - 1, s - 1, 4);
+                ctx.save();
+                ctx.shadowColor = "rgba(10, 12, 17, 0.34)";
+                ctx.shadowBlur = 3;
+                this.roundRect(x - 1, y - 1, s + 2, s + 2, 5);
+                ctx.shadowBlur = 0;
+                ctx.strokeStyle = "rgba(10, 12, 17, 0.7)";
+                ctx.lineWidth = 1.25;
+                ctx.stroke();
+                ctx.restore();
                 const dx = c.x - (prev[0] ? prev[0].x : c.x);
                 const dy = c.y - (prev[0] ? prev[0].y : c.y);
                 const len = Math.abs(dx) + Math.abs(dy);
@@ -150,12 +158,21 @@ export default class Snake {
     }
 
     drawDisplayName(){
-        this.ctx.fillStyle = "black";
-        this.ctx.font = "15px Arial";
-        this.ctx.textAlign = "center";
         const head = this.snake[0];
+        if (head === undefined) return;
+        const ctx = this.ctx;
+        const centerX = head.x + this.scale / 2;
         // Flip the label below the head when it would clip at the top edge.
-        const y = head.y < 30 ? head.y + this.scale + 18 : head.y - 10;
-        this.ctx.fillText(this.displayName, head.x, y);
+        const baseline = head.y < 34 ? head.y + this.scale + 25 : head.y - 11;
+        ctx.save();
+        ctx.font = '700 20px "Segoe UI", Arial, sans-serif';
+        ctx.textAlign = "center";
+        ctx.textBaseline = "alphabetic";
+        const labelWidth = Math.ceil(ctx.measureText(this.displayName).width) + 16;
+        ctx.fillStyle = "rgba(13, 16, 22, 0.86)";
+        this.roundRect(centerX - labelWidth / 2, baseline - 21, labelWidth, 27, 6);
+        ctx.fillStyle = "#fffaf1";
+        ctx.fillText(this.displayName, centerX, baseline);
+        ctx.restore();
     }
 }

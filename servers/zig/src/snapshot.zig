@@ -22,6 +22,7 @@
 //! roster changes invalidate history.
 
 const std = @import("std");
+const config = @import("config.zig");
 const model = @import("model.zig");
 
 pub const VERSION: u8 = 4;
@@ -35,6 +36,13 @@ const WORLD_BONUS_MASK: u8 = 0x0f;
 const WORLD_DROP_MASK: u8 = 0x03;
 const WORLD_DROP_SHIFT: u3 = 4;
 const WORLD_GOLDEN_BIT: u8 = 0x40;
+
+comptime {
+    if (config.GRID_COLS > @as(i32, std.math.maxInt(u8)) + 1 or config.GRID_ROWS > @as(i32, std.math.maxInt(u8)) + 1)
+        @compileError("canonical board coordinates must fit in snapshot cell bytes");
+    if (config.MAX_CELLS > @as(usize, CELL_COUNT_MASK))
+        @compileError("canonical board cell count must fit in the snapshot cell count");
+}
 
 pub const Kind = enum(u8) { keyframe = 0, delta = 1 };
 pub const BuildResult = struct { bytes: []const u8, kind: Kind, sequence: u16 };
@@ -98,7 +106,7 @@ fn appendPackedBody(buffer: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allo
 
 fn appendKeyframePlayer(buffer: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, player: *const model.Player) !void {
     try appendInt(buffer, allocator, i32, protocolScore(player.score));
-    const count: u16 = @intCast(@min(player.snake.items.len, CELL_COUNT_MASK));
+    const count: u16 = @intCast(@min(player.snake.items.len, config.MAX_CELLS));
     const positions = player.snake.items[0..count];
     const is_packed = canPack(positions);
     try appendInt(buffer, allocator, u16, count | if (is_packed) PACKED_BIT else 0);
@@ -113,7 +121,7 @@ fn appendKeyframePlayer(buffer: *std.ArrayListUnmanaged(u8), allocator: std.mem.
 }
 
 fn stateFor(player: *const model.Player) model.SnapshotPlayerState {
-    const count: u16 = @intCast(@min(player.snake.items.len, CELL_COUNT_MASK));
+    const count: u16 = @intCast(@min(player.snake.items.len, config.MAX_CELLS));
     const head = player.snake.items[0];
     return .{
         .score = protocolScore(player.score),
@@ -134,7 +142,7 @@ fn movementDirection(previous: model.SnapshotPlayerState, current: model.Snapsho
 }
 
 fn transition(player: *const model.Player, current: model.SnapshotPlayerState, previous: model.SnapshotPlayerState) Transition {
-    if (player.snake.items.len == 0 or player.snake.items.len > CELL_COUNT_MASK) return .{ .mode = .invalid };
+    if (player.snake.items.len == 0 or player.snake.items.len > config.MAX_CELLS) return .{ .mode = .invalid };
     if (current.cells == previous.cells and current.head_x == previous.head_x and current.head_y == previous.head_y) return .{ .mode = .unchanged };
     const direction = movementDirection(previous, current) orelse return .{ .mode = .invalid };
     const mode: CellMode = if (current.cells == previous.cells)
@@ -296,6 +304,34 @@ test "v4 keyframes and direction deltas have stable golden bytes" {
         'S',  'N', 4, 4, 0, 0x81,
         0x1e, 1,   0, 0, 0, 0,
     }, grown.bytes);
+}
+
+test "v4 board-edge coordinates have stable golden bytes" {
+    const allocator = std.testing.allocator;
+    var connection = model.Conn{ .fd = -1 };
+    var player = model.Player{
+        .id = @constCast("edge"),
+        .name = @constCast("edge"),
+        .color_hex = @constCast("#123456"),
+        .conn = &connection,
+    };
+    defer player.snake.deinit(allocator);
+    try player.snake.append(allocator, .{
+        .x = config.GRID_W - model.CELL,
+        .y = config.GRID_H - model.CELL,
+    });
+    var lobby = model.Lobby{ .id = @constCast("edge"), .food = .{ .x = 0, .y = 0 } };
+    defer lobby.players.deinit(allocator);
+    try lobby.players.append(allocator, &player);
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(allocator);
+
+    const keyframe = try buildInto(&wire, &lobby, 0, allocator);
+    try std.testing.expectEqualSlices(u8, &.{
+        'S', 'N', 4, 1, 0, 1,
+        0,   0,   0, 0, 1, 0x80,
+        127, 71,  0,
+    }, keyframe.bytes);
 }
 
 test "v4 packs world counts and golden presence into one stable byte" {

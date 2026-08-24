@@ -1,5 +1,12 @@
 'use strict';
 
+const BOARD_COLUMNS = 128;
+const BOARD_ROWS = 72;
+const CELL_SIZE = 16;
+const BOARD_WIDTH = BOARD_COLUMNS * CELL_SIZE;
+const BOARD_HEIGHT = BOARD_ROWS * CELL_SIZE;
+const BOARD_CELLS = BOARD_COLUMNS * BOARD_ROWS;
+
 function asView(payload) {
   if (payload instanceof ArrayBuffer) return new DataView(payload);
   if (ArrayBuffer.isView(payload)) return new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
@@ -28,7 +35,7 @@ function decodeBinary(payload, roster, previous, lastSequence) {
       const encoded = view.getUint16(at, true); at += 2;
       const packed = (encoded & 0x8000) !== 0;
       const cells = encoded & 0x7fff;
-      if (cells === 0 || cells > 7200) return null;
+      if (cells === 0 || cells > BOARD_CELLS) return null;
       const snake = new Array(cells);
       if (packed) {
         const bytes = Math.ceil((cells - 1) / 4);
@@ -40,8 +47,8 @@ function decodeBinary(payload, roster, previous, lastSequence) {
             if (direction === 0) y--; else if (direction === 1) y++;
             else if (direction === 2) x--; else x++;
           }
-          if (x < 0 || x >= 120 || y < 0 || y >= 60) return null;
-          snake[c] = { x: x * 16, y: y * 16 };
+          if (x < 0 || x >= BOARD_COLUMNS || y < 0 || y >= BOARD_ROWS) return null;
+          snake[c] = { x: x * CELL_SIZE, y: y * CELL_SIZE };
         }
         if (bytes > 0 && ((cells - 1) & 3) !== 0) {
           const usedBits = ((cells - 1) & 3) * 2;
@@ -52,8 +59,8 @@ function decodeBinary(payload, roster, previous, lastSequence) {
         if (at + cells * 2 > view.byteLength) return null;
         for (let c = 0; c < cells; c++) {
           const x = view.getUint8(at++), y = view.getUint8(at++);
-          if (x >= 120 || y >= 60) return null;
-          snake[c] = { x: x * 16, y: y * 16 };
+          if (x >= BOARD_COLUMNS || y >= BOARD_ROWS) return null;
+          snake[c] = { x: x * CELL_SIZE, y: y * CELL_SIZE };
         }
       }
       players[i] = { id: meta[0], displayName: meta[1], color: meta[2], score, bodyLength: cells, snake };
@@ -73,9 +80,9 @@ function decodeBinary(payload, roster, previous, lastSequence) {
       else {
         const direction = (flags >> 3) & 3;
         const head = { x: old.snake[0].x, y: old.snake[0].y };
-        if (direction === 0) head.y -= 16; else if (direction === 1) head.y += 16;
-        else if (direction === 2) head.x -= 16; else head.x += 16;
-        if (head.x < 0 || head.x >= 1920 || head.y < 0 || head.y >= 960) return null;
+        if (direction === 0) head.y -= CELL_SIZE; else if (direction === 1) head.y += CELL_SIZE;
+        else if (direction === 2) head.x -= CELL_SIZE; else head.x += CELL_SIZE;
+        if (head.x < 0 || head.x >= BOARD_WIDTH || head.y < 0 || head.y >= BOARD_HEIGHT) return null;
         const length = old.snake.length + (mode === 2 ? 1 : 0);
         snake = new Array(length);
         snake[0] = head;
@@ -95,15 +102,15 @@ function decodeBinary(payload, roster, previous, lastSequence) {
   const bonus = new Array(bonusCount);
   for (let i = 0; i < bonusCount; i++) {
     const x = view.getUint8(at++), y = view.getUint8(at++);
-    if (x >= 120 || y >= 60) return null;
-    bonus[i] = { x: x * 16, y: y * 16 };
+    if (x >= BOARD_COLUMNS || y >= BOARD_ROWS) return null;
+    bonus[i] = { x: x * CELL_SIZE, y: y * CELL_SIZE };
   }
   if (dropCount > 2 || at + dropCount * 4 > view.byteLength) return null;
   const drops = new Array(dropCount);
   for (let i = 0; i < dropCount; i++) {
     const cellX = view.getUint8(at++), cellY = view.getUint8(at++);
-    if (cellX >= 120 || cellY >= 60) return null;
-    const x = cellX * 16, y = cellY * 16;
+    if (cellX >= BOARD_COLUMNS || cellY >= BOARD_ROWS) return null;
+    const x = cellX * CELL_SIZE, y = cellY * CELL_SIZE;
     const ttl = view.getUint16(at, true); at += 2;
     drops[i] = { id: '', x, y, ttl };
   }
@@ -111,8 +118,8 @@ function decodeBinary(payload, roster, previous, lastSequence) {
   let golden = null;
   if (hasGolden) {
     const x = view.getUint8(at++), y = view.getUint8(at++);
-    if (x >= 120 || y >= 60) return null;
-    golden = { x: x * 16, y: y * 16, ttl: view.getUint16(at, true) };
+    if (x >= BOARD_COLUMNS || y >= BOARD_ROWS) return null;
+    golden = { x: x * CELL_SIZE, y: y * CELL_SIZE, ttl: view.getUint16(at, true) };
   }
   return { world: { players, bonus, drops, golden }, sequence };
 }

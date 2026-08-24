@@ -78,7 +78,7 @@
                 setTimeout(() => this.connect(), delay);
             };
         }
-        emit(name, first, second) {
+        emit(name, first, second, third) {
             if (name === 'keyPress') {
                 const code = directionCode[first];
                 // Stale direction input is worse than dropped input: after a
@@ -91,13 +91,19 @@
             if (name !== 'clientReady') return;
             const username = encoder.encode(String(first));
             const lobby = encoder.encode(String(second));
-            if (username.length === 0 || username.length > 255 || lobby.length === 0 || lobby.length > 255) return;
-            const packet = new Uint8Array(3 + lobby.length + username.length);
+            // Passwords are opaque user input. Preserve whitespace and other
+            // characters exactly; only the protocol's UTF-8 byte bound applies.
+            const password = encoder.encode(third == null ? '' : String(third));
+            if (username.length === 0 || username.length > 255 ||
+                lobby.length === 0 || lobby.length > 255 || password.length > 64) return;
+            const packet = new Uint8Array(4 + lobby.length + username.length + password.length);
             packet[0] = 1;
             packet[1] = lobby.length;
             packet[2] = username.length;
-            packet.set(lobby, 3);
-            packet.set(username, 3 + lobby.length);
+            packet[3] = password.length;
+            packet.set(lobby, 4);
+            packet.set(username, 4 + lobby.length);
+            packet.set(password, 4 + lobby.length + username.length);
             if (this.ws.readyState === WebSocket.OPEN) {
                 this.pendingJoin = null;
                 this.ws.send(packet);
