@@ -2,6 +2,10 @@
 const parts = [];
 
 export const Particles = {
+    hasActive() {
+        return parts.length !== 0;
+    },
+
     burst(x, y, color, n = 12, speed = 2.6) {
         for (let i = 0; i < n; i++) {
             const angle = Math.random() * Math.PI * 2;

@@ -6,7 +6,7 @@ up to 4.67 GHz) and Zig 0.16.0 `-O ReleaseFast -fstrip`.
 ## Outcome
 
 The production result is a Zig-only server using raw RFC 6455 WebSockets,
-binary input, binary snapshot v3, one epoll I/O reactor, and game workers that
+binary input, binary snapshot v4, one epoll I/O reactor, and game workers that
 expand at 128 lobbies per worker. The measured 12,000-player configuration used
 750 lobbies, six game workers, and seven process threads in total.
 
@@ -129,20 +129,24 @@ fill 3.49x faster, and makes ordered removal/refill 5.88x faster. Across 750
 full lobbies the requested backing-memory reduction is about 432,000 bytes;
 actual RSS depends on allocator size classes.
 
-## Snapshot v3 production-encoder benchmark
+## Snapshot v4 production-encoder benchmark
 
 The current encoder was measured directly in Zig with 16 players, a retained
 output buffer, periodic keyframes, and stationary and moving delta streams. The
 harness reports the median of five samples and is reproducible with
 `cd servers/zig && zig run -O ReleaseFast bench_snapshot.zig`.
 
-| Cells/player | Stream | v3 ns/frame | v3 payload B/frame |
+| Cells/player | Stream | v4 ns/frame | v4 payload B/frame |
 |---:|---|---:|---:|
-| 1 | keyframe / stationary / moving | 240 / 138 / 209 | 140 / 31.73 / 31.73 |
-| 18 | keyframe / stationary / moving | 1,101 / 167 / 337 | 220 / 34.40 / 34.40 |
-| 256 | keyframe / stationary / moving | 13,463 / 572 / 1,083 | 1,164 / 65.89 / 65.89 |
+| 1 | keyframe / stationary / moving | 237 / 131 / 203 | 135 / 26.73 / 26.73 |
+| 18 | keyframe / stationary / moving | 1,094 / 159 / 342 | 215 / 29.40 / 29.40 |
+| 256 | keyframe / stationary / moving | 13,324 / 562 / 1,067 | 1,159 / 60.89 / 60.89 |
 
-Against the immediately preceding v2 encoder on the same harness, direction
+Snapshot v4 removes the redundant delta base sequence and packs kind/player
+count plus all world counts/presence, removing five bytes from every frame.
+The representative 16-player, 18-cell stream fell from 34.40 B in v3 to
+29.40 B in v4, a 14.5% application-payload reduction, while wrapping `u16`
+continuity remains exact. Against v2 on the same harness, direction
 deltas removed two absolute-coordinate bytes from every moving player row.
 Moving streams fell by 47-49% for one- and 18-cell snakes (31.9% at 256 cells,
 where periodic keyframes dominate more bytes), while encode time fell by
@@ -150,8 +154,8 @@ where periodic keyframes dominate more bytes), while encode time fell by
 14-19% faster at one and 18 cells because player transition state is computed
 once per frame.
 
-A separate 1,000-client v3 loopback run held all 1,000 clients with zero join
-failures or sampled disconnects, a 0.9992 configured-tick ratio, and
+A separate preceding 1,000-client v3 loopback run held all 1,000 clients with
+zero join failures or sampled disconnects, a 0.9992 configured-tick ratio, and
 66.659/67.449/68.864 ms cadence p50/p95/p99. It measured 34.48 B average
 userspace WebSocket write, 515,575 B/s egress, 8.97% CPU, and 2,838,528 B RSS.
 The earlier 1,000-player v2 scaling row below measured 172.11 B average wire and
@@ -281,6 +285,35 @@ and fails if the deleted vendor file or route returns. The server does not
 compress assets, so the 71,873-byte external-JavaScript reduction is also the
 loopback transfer reduction; the removed classic script was render-blocking,
 whereas the retained game entry points are modules or the required transport.
+
+The client render loop now starts only after game setup, runs continuously
+during play, drains the game-over particle tail, and then stops until another
+render-producing event. This removes the otherwise permanent display-rate
+callback (typically 60 callbacks/s) on the join screen and after game over.
+The source-backed render-loop regression covers start, request coalescing,
+active cadence, particle drain, long-idle restart, and rejoin.
+
+The final server hot-path pass made three smaller measured changes:
+
+- Authoritative snake cells skip redundant grid-alignment divisions in the
+  indexed collision path while the public lookup remains checked. ReleaseFast
+  normalized collision work improved 7.4%, 7.4%, and 13.6% at 64, 128, and 256
+  cells respectively (about 9.5% equal-weight average).
+- Direction input no longer reacquires the membership mutex after the lobby
+  mutex has made membership stable. This removes one acquire/unlock pair per
+  accepted direction packet and reduces synchronization calls in that handler
+  from six to four.
+- Reactor-owned receive counters use ordinary wrapping increments instead of
+  atomics, and rejected output publications no longer inflate the WebSocket
+  frame counter.
+
+`/debug/stats` continues to use Zig's typed `std.json` serializer; manual
+serialization and pre-sizing did not show a justified advantage. Rounding
+diagnostic averages to three decimals reduced a representative 750-lobby
+payload from 256,116 to 234,941 bytes (-8.27%). Freeing the JSON and temporary
+stats arrays in allocation-reverse order reduced a 100-request pipelined arena
+run from 19.63 MB to 1.38 MB of backing allocation requests (-93%) and from
+eight to four child allocations.
 
 Backpressured output queues now compact released descriptor prefixes after 64
 items once the prefix is at least half the array, retain at most 256 descriptors

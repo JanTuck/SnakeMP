@@ -29,12 +29,12 @@ function joinPacket(name, lobby) {
 }
 
 function snapshotHeader(data) {
-  if (data.length < 9 || data[0] !== 0x53 || data[1] !== 0x4e || data[2] !== 3) return null;
-  const kind = data[3];
-  if (kind > 1) return null;
-  const item = { at: performance.now(), kind, sequence: data.readUInt16LE(4), head: null };
+  if (data.length < 6 || data[0] !== 0x53 || data[1] !== 0x4e || data[2] !== 4 || (data[5] & 0x60) !== 0) return null;
+  const kind = data[5] >>> 7;
+  const players = data[5] & 0x1f;
+  const item = { at: performance.now(), kind, sequence: data.readUInt16LE(3), head: null };
   // A one-player keyframe starts with score:i32, cells:u16, then absolute head.
-  if (kind === 0 && data[8] === 1 && data.length >= 17) item.head = `${data[15]},${data[16]}`;
+  if (kind === 0 && players === 1 && data.length >= 14) item.head = `${data[12]},${data[13]}`;
   return item;
 }
 

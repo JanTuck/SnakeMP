@@ -6,19 +6,19 @@ function asView(payload) {
   return null;
 }
 
-// Transactional benchmark/parity decoder for the production v3 keyframe and
+// Transactional benchmark/parity decoder for the production v4 keyframe and
 // delta protocol. A rejected frame never replaces the last valid world.
 function decodeBinary(payload, roster, previous, lastSequence) {
   const view = asView(payload);
-  if (!view || view.byteLength < 12 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 3) return null;
-  const kind = view.getUint8(3);
-  if (kind > 1) return null;
-  const sequence = view.getUint16(4, true);
-  const base = view.getUint16(6, true);
-  const count = view.getUint8(8);
+  if (!view || view.byteLength < 7 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 4) return null;
+  const sequence = view.getUint16(3, true);
+  const header = view.getUint8(5);
+  if ((header & 0x60) !== 0) return null;
+  const kind = header >>> 7;
+  const count = header & 0x1f;
   if (count !== roster.length || count > 16) return null;
-  if (kind === 0 ? base !== sequence : (!previous || base !== lastSequence || sequence !== ((base + 1) & 0xffff))) return null;
-  let at = 9;
+  if (kind === 1 && (!previous || !Number.isInteger(lastSequence) || sequence !== ((lastSequence + 1) & 0xffff))) return null;
+  let at = 6;
   const players = new Array(count);
   for (let i = 0; i < count; i++) {
     const meta = roster[i];
@@ -43,10 +43,18 @@ function decodeBinary(payload, roster, previous, lastSequence) {
           if (x < 0 || x >= 120 || y < 0 || y >= 60) return null;
           snake[c] = { x: x * 16, y: y * 16 };
         }
+        if (bytes > 0 && ((cells - 1) & 3) !== 0) {
+          const usedBits = ((cells - 1) & 3) * 2;
+          if ((view.getUint8(at + bytes - 1) >> usedBits) !== 0) return null;
+        }
         at += bytes;
       } else {
         if (at + cells * 2 > view.byteLength) return null;
-        for (let c = 0; c < cells; c++) snake[c] = { x: view.getUint8(at++) * 16, y: view.getUint8(at++) * 16 };
+        for (let c = 0; c < cells; c++) {
+          const x = view.getUint8(at++), y = view.getUint8(at++);
+          if (x >= 120 || y >= 60) return null;
+          snake[c] = { x: x * 16, y: y * 16 };
+        }
       }
       players[i] = { id: meta[0], displayName: meta[1], color: meta[2], score, bodyLength: cells, snake };
     } else {
@@ -78,23 +86,34 @@ function decodeBinary(payload, roster, previous, lastSequence) {
     }
   }
   if (at >= view.byteLength) return null;
-  const bonusCount = view.getUint8(at++);
+  const worldHeader = view.getUint8(at++);
+  if ((worldHeader & 0x80) !== 0) return null;
+  const bonusCount = worldHeader & 0x0f;
+  const dropCount = (worldHeader >>> 4) & 3;
+  const hasGolden = (worldHeader & 0x40) !== 0;
   if (bonusCount > 12 || at + bonusCount * 2 > view.byteLength) return null;
   const bonus = new Array(bonusCount);
-  for (let i = 0; i < bonusCount; i++) bonus[i] = { x: view.getUint8(at++) * 16, y: view.getUint8(at++) * 16 };
-  if (at >= view.byteLength) return null;
-  const dropCount = view.getUint8(at++);
+  for (let i = 0; i < bonusCount; i++) {
+    const x = view.getUint8(at++), y = view.getUint8(at++);
+    if (x >= 120 || y >= 60) return null;
+    bonus[i] = { x: x * 16, y: y * 16 };
+  }
   if (dropCount > 2 || at + dropCount * 4 > view.byteLength) return null;
   const drops = new Array(dropCount);
   for (let i = 0; i < dropCount; i++) {
-    const x = view.getUint8(at++) * 16, y = view.getUint8(at++) * 16;
+    const cellX = view.getUint8(at++), cellY = view.getUint8(at++);
+    if (cellX >= 120 || cellY >= 60) return null;
+    const x = cellX * 16, y = cellY * 16;
     const ttl = view.getUint16(at, true); at += 2;
     drops[i] = { id: '', x, y, ttl };
   }
-  if (at >= view.byteLength) return null;
-  const hasGolden = view.getUint8(at++);
-  if (hasGolden > 1 || at + hasGolden * 4 !== view.byteLength) return null;
-  const golden = hasGolden ? { x: view.getUint8(at++) * 16, y: view.getUint8(at++) * 16, ttl: view.getUint16(at, true) } : null;
+  if (at + (hasGolden ? 4 : 0) !== view.byteLength) return null;
+  let golden = null;
+  if (hasGolden) {
+    const x = view.getUint8(at++), y = view.getUint8(at++);
+    if (x >= 120 || y >= 60) return null;
+    golden = { x: x * 16, y: y * 16, ttl: view.getUint16(at, true) };
+  }
   return { world: { players, bonus, drops, golden }, sequence };
 }
 

@@ -3,9 +3,9 @@
  * Project server-to-client snapshot bandwidth when background tabs receive
  * visibility-aware keyframes at 1 Hz instead of the foreground 15 Hz stream.
  *
- * Delta and keyframe payloads differ substantially in snapshot v3, so they
+ * Delta and keyframe payloads differ substantially in snapshot v4, so they
  * must be supplied separately. Comma-separated lists are paired by position:
- *   DELTA_BYTES=28,32 KEYFRAME_BYTES=220,300 CLIENTS=12000 \
+ *   DELTA_BYTES=23,32 KEYFRAME_BYTES=215,300 CLIENTS=12000 \
  *     node benchmarks/visibility-bandwidth.js
  */
 'use strict';
@@ -13,10 +13,10 @@
 const assert = require('node:assert/strict');
 
 // The 18-cell sample is the representative production-encoder measurement in
-// docs/BENCHMARKS.md. Its 34.40 B periodic-stream mean consists of a 220 B
-// keyframe every 30 frames and 28 B dependent deltas.
+// docs/BENCHMARKS.md. Its 29.40 B periodic-stream mean consists of a 215 B
+// keyframe every 30 frames and 23 B dependent deltas.
 const DEFAULT_SAMPLES = [
-  { name: 'v3-16-player-18-cell', deltaBytes: 28, keyframeBytes: 220 },
+  { name: 'v4-16-player-18-cell', deltaBytes: 23, keyframeBytes: 215 },
 ];
 
 function finitePositive(name, raw, fallback) {
@@ -146,7 +146,7 @@ const output = {
     byteScope: 'application snapshot payload only; excludes WebSocket/TCP/IP/TLS framing, control events, and client-to-server inputs',
     clientMix: 'foreground clients receive the periodic delta/keyframe stream; hidden clients receive only independent keyframes at the lower cadence',
     serialization: 'assumes one shared immutable payload per lobby tick, so visibility changes fan-out frequency rather than snapshot encode cost',
-    defaultSamples: 'snapshot v3 production encoder, 16 players with 18 cells each: 220 B keyframe and derived 28 B delta (34.40 B mean with one keyframe per 30 snapshots)',
+    defaultSamples: 'snapshot v4 production encoder, 16 players with 18 cells each: 215 B keyframe and derived 23 B delta (29.40 B mean with one keyframe per 30 snapshots)',
     projectionOnly: 'this is deterministic bandwidth arithmetic, not an end-to-end network or CPU benchmark',
   },
   projections,

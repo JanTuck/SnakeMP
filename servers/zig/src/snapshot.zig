@@ -1,7 +1,9 @@
 //! Versioned binary world snapshots with bounded, recoverable temporal deltas.
 //!
 //! Frame header (little endian):
-//!   "SN", version:u8, kind:u8, sequence:u16, base_sequence:u16, players:u8
+//!   "SN", version:u8, sequence:u16, kind_and_players:u8
+//! `kind_and_players` bit 7 selects a delta, bits 0..4 hold the player count,
+//! and bits 5..6 are zero. Sequence continuity names the delta base implicitly.
 //!
 //! Keyframe player:
 //!   score:i32, cells:u16, body
@@ -13,17 +15,26 @@
 //! shifted, or shifted-and-grown; bit 2 marks a score; bits 3..4 encode the
 //! new-head direction for a moving snake. The client reconstructs the adjacent
 //! head from its previous state, avoiding two coordinate bytes per move.
-//! A delta names its exact base sequence. Missed deltas are therefore ignored
-//! until the next periodic keyframe, and roster changes invalidate history.
+//! World counts share one byte: bonus count in bits 0..3, drop count in bits
+//! 4..5, golden presence in bit 6, and bit 7 zero.
+//! A delta must be the wrapping successor of the client's accepted sequence.
+//! Missed deltas are therefore ignored until the next periodic keyframe, and
+//! roster changes invalidate history.
 
 const std = @import("std");
 const model = @import("model.zig");
 
-pub const VERSION: u8 = 3;
+pub const VERSION: u8 = 4;
 pub const KEYFRAME_INTERVAL: u8 = 30;
 pub const MAX_PLAYERS: usize = 16;
 pub const PACKED_BIT: u16 = 0x8000;
 pub const CELL_COUNT_MASK: u16 = 0x7fff;
+const HEADER_KIND_BIT: u8 = 0x80;
+const HEADER_PLAYER_MASK: u8 = 0x1f;
+const WORLD_BONUS_MASK: u8 = 0x0f;
+const WORLD_DROP_MASK: u8 = 0x03;
+const WORLD_DROP_SHIFT: u3 = 4;
+const WORLD_GOLDEN_BIT: u8 = 0x40;
 
 pub const Kind = enum(u8) { keyframe = 0, delta = 1 };
 pub const BuildResult = struct { bytes: []const u8, kind: Kind, sequence: u16 };
@@ -148,26 +159,36 @@ fn appendDeltaPlayer(buffer: *std.ArrayListUnmanaged(u8), allocator: std.mem.All
     if (current.score != previous.score) try appendInt(buffer, allocator, i32, current.score);
 }
 
+fn appendHeader(buffer: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, kind: Kind, sequence: u16, player_count: usize) !void {
+    std.debug.assert(player_count <= MAX_PLAYERS);
+    try buffer.appendSlice(allocator, "SN");
+    try buffer.append(allocator, VERSION);
+    try appendInt(buffer, allocator, u16, sequence);
+    const kind_bit: u8 = if (kind == .delta) HEADER_KIND_BIT else 0;
+    try buffer.append(allocator, kind_bit | (@as(u8, @intCast(player_count)) & HEADER_PLAYER_MASK));
+}
+
 fn appendWorld(buffer: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, lobby: *model.Lobby, now: i64) !void {
-    const bonus_count = @min(lobby.bonus.items.len, std.math.maxInt(u8));
-    try buffer.append(allocator, @intCast(bonus_count));
+    const bonus_count = @min(lobby.bonus.items.len, WORLD_BONUS_MASK);
+    const drop_count = @min(lobby.drops.items.len, WORLD_DROP_MASK);
+    const golden_bit: u8 = if (lobby.golden != null) WORLD_GOLDEN_BIT else 0;
+    const world = @as(u8, @intCast(bonus_count)) |
+        (@as(u8, @intCast(drop_count)) << WORLD_DROP_SHIFT) | golden_bit;
+    try buffer.append(allocator, world);
     for (lobby.bonus.items[0..bonus_count]) |bonus| {
         try buffer.append(allocator, cell(bonus.pos.x));
         try buffer.append(allocator, cell(bonus.pos.y));
     }
-    const drop_count = @min(lobby.drops.items.len, std.math.maxInt(u8));
-    try buffer.append(allocator, @intCast(drop_count));
     for (lobby.drops.items[0..drop_count]) |drop| {
         try buffer.append(allocator, cell(drop.pos.x));
         try buffer.append(allocator, cell(drop.pos.y));
         try appendInt(buffer, allocator, u16, ttl(drop.expires_at, now));
     }
     if (lobby.golden) |golden| {
-        try buffer.append(allocator, 1);
         try buffer.append(allocator, cell(golden.pos.x));
         try buffer.append(allocator, cell(golden.pos.y));
         try appendInt(buffer, allocator, u16, ttl(golden.expires_at, now));
-    } else try buffer.append(allocator, 0);
+    }
 }
 
 pub fn invalidate(lobby: *model.Lobby) void {
@@ -187,12 +208,7 @@ pub fn buildIndependentKeyframeInto(
 ) !BuildResult {
     const player_count = @min(lobby.players.items.len, MAX_PLAYERS);
     buffer.clearRetainingCapacity();
-    try buffer.appendSlice(allocator, "SN");
-    try buffer.append(allocator, VERSION);
-    try buffer.append(allocator, @intFromEnum(Kind.keyframe));
-    try appendInt(buffer, allocator, u16, sequence);
-    try appendInt(buffer, allocator, u16, sequence);
-    try buffer.append(allocator, @intCast(player_count));
+    try appendHeader(buffer, allocator, .keyframe, sequence, player_count);
     for (lobby.players.items[0..player_count]) |player| try appendKeyframePlayer(buffer, allocator, player);
     try appendWorld(buffer, allocator, lobby, now);
     return .{ .bytes = buffer.items, .kind = .keyframe, .sequence = sequence };
@@ -215,16 +231,10 @@ pub fn buildInto(buffer: *std.ArrayListUnmanaged(u8), lobby: *model.Lobby, now: 
         }
     }
     const kind: Kind = if (delta_ok) .delta else .keyframe;
-    const base_sequence = lobby.snapshot_sequence;
-    const sequence = base_sequence +% 1;
+    const sequence = lobby.snapshot_sequence +% 1;
 
     buffer.clearRetainingCapacity();
-    try buffer.appendSlice(allocator, "SN");
-    try buffer.append(allocator, VERSION);
-    try buffer.append(allocator, @intFromEnum(kind));
-    try appendInt(buffer, allocator, u16, sequence);
-    try appendInt(buffer, allocator, u16, if (kind == .keyframe) sequence else base_sequence);
-    try buffer.append(allocator, @intCast(player_count));
+    try appendHeader(buffer, allocator, kind, sequence, player_count);
     for (lobby.players.items[0..player_count], 0..) |player, index| {
         if (kind == .keyframe) try appendKeyframePlayer(buffer, allocator, player) else try appendDeltaPlayer(buffer, allocator, current_states[index], lobby.snapshot_previous[index], changes[index]);
     }
@@ -244,7 +254,7 @@ pub fn build(buffer: *std.ArrayListUnmanaged(u8), lobby: *model.Lobby, now: i64,
     return buildInto(buffer, lobby, now, allocator);
 }
 
-test "v3 keyframes and direction deltas have stable golden bytes" {
+test "v4 keyframes and direction deltas have stable golden bytes" {
     const allocator = std.testing.allocator;
     var connection = model.Conn{ .fd = -1 };
     var player = model.Player{
@@ -264,18 +274,18 @@ test "v3 keyframes and direction deltas have stable golden bytes" {
     const keyframe = try buildInto(&wire, &lobby, 0, allocator);
     try std.testing.expectEqual(Kind.keyframe, keyframe.kind);
     try std.testing.expectEqualSlices(u8, &.{
-        'S', 'N', 3, 0, 1, 0,    1, 0, 1,
-        0,   0,   0, 0, 1, 0x80, 2, 3, 0,
-        0,   0,
+        'S', 'N', 4, 1, 0, 1,
+        0,   0,   0, 0, 1, 0x80,
+        2,   3,   0,
     }, keyframe.bytes);
 
     const unchanged = try buildInto(&wire, &lobby, 0, allocator);
     try std.testing.expectEqual(Kind.delta, unchanged.kind);
-    try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', 3, 1, 2, 0, 1, 0, 1, 0, 0, 0, 0 }, unchanged.bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', 4, 2, 0, 0x81, 0, 0 }, unchanged.bytes);
 
     player.snake.items[0].x += model.CELL;
     const shifted = try buildInto(&wire, &lobby, 0, allocator);
-    try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', 3, 1, 3, 0, 2, 0, 1, 0x19, 0, 0, 0 }, shifted.bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', 4, 3, 0, 0x81, 0x19, 0 }, shifted.bytes);
 
     const old_head = player.snake.items[0];
     try player.snake.append(allocator, old_head);
@@ -283,9 +293,31 @@ test "v3 keyframes and direction deltas have stable golden bytes" {
     player.score = 1;
     const grown = try buildInto(&wire, &lobby, 0, allocator);
     try std.testing.expectEqualSlices(u8, &.{
-        'S',  'N', 3, 1, 4, 0, 3, 0, 1,
-        0x1e, 1,   0, 0, 0, 0, 0, 0,
+        'S',  'N', 4, 4, 0, 0x81,
+        0x1e, 1,   0, 0, 0, 0,
     }, grown.bytes);
+}
+
+test "v4 packs world counts and golden presence into one stable byte" {
+    const allocator = std.testing.allocator;
+    var lobby = model.Lobby{ .id = @constCast("test"), .food = .{ .x = 0, .y = 0 } };
+    defer lobby.bonus.deinit(allocator);
+    defer lobby.drops.deinit(allocator);
+    try lobby.bonus.append(allocator, .{ .pos = .{ .x = 4 * model.CELL, .y = 5 * model.CELL } });
+    try lobby.drops.append(allocator, .{
+        .pos = .{ .x = 6 * model.CELL, .y = 7 * model.CELL },
+        .expires_at = 1234,
+    });
+    lobby.golden = .{ .pos = .{ .x = 8 * model.CELL, .y = 9 * model.CELL }, .expires_at = 4321 };
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(allocator);
+
+    const keyframe = try buildInto(&wire, &lobby, 100, allocator);
+    try std.testing.expectEqualSlices(u8, &.{
+        'S',  'N', 4, 1,    0,    0,
+        0x51, 4,   5, 6,    7,    0x6e,
+        0x04, 8,   9, 0x7d, 0x10,
+    }, keyframe.bytes);
 }
 
 test "independent keyframe preserves delta history and sequence wraps" {
@@ -323,5 +355,5 @@ test "independent keyframe preserves delta history and sequence wraps" {
     const wrapped = try buildInto(&wire, &lobby, 0, allocator);
     try std.testing.expectEqual(Kind.delta, wrapped.kind);
     try std.testing.expectEqual(@as(u16, 0), wrapped.sequence);
-    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0xff, 0xff }, wrapped.bytes[4..8]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0x81 }, wrapped.bytes[3..6]);
 }

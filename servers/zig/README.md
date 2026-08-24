@@ -57,7 +57,7 @@ workers stop immediately, before lobby-id reaping.
 - `src/model.zig` - player, lobby, connection, turn queue, and movement state
 - `src/websocket.zig` - WebSocket header generation and fixed binary client
   packet validation
-- `src/snapshot.zig` - little-endian binary snapshot v3 keyframe/delta encoder
+- `src/snapshot.zig` - little-endian binary snapshot v4 keyframe/delta encoder
   with explicit clamps and no native-struct wire casts
 - `src/json.zig` - infrequent JSON control-event construction and escaping
 - `src/text.zig` - username, URI, form, and small JSON-field validation helpers

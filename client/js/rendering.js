@@ -32,7 +32,16 @@ let lastSnapshotSequence = null;
 let lastTickAt = 0;
 let shakeUntil = 0;
 let lastFrameAt = 0;
+let renderReady = false;
+let framePending = false;
 const prevScores = new Map();
+
+function requestFrame(resuming = false) {
+    if (!renderReady || framePending) return;
+    if (resuming) lastFrameAt = 0;
+    framePending = true;
+    requestAnimationFrame(frame);
+}
 
 function showError(message) {
     let domError = document.getElementById('game_error');
@@ -197,7 +206,9 @@ socket.on('init', (initData) => {
     gameOver = false;
     gameOverMenu = null;
     isSetup = true;
+    lastFrameAt = 0;
     Motion.canvas(canvas);
+    requestFrame();
 });
 
 socket.on('game_error', (errorMessage) => {
@@ -220,6 +231,7 @@ socket.on('feed', (item) => {
         const victim = (world.players || []).find((p) => p.displayName === item.who);
         if (victim !== undefined) {
             Particles.burst(victim.snake[0].x + 8, victim.snake[0].y + 8, victim.color, 24, 4);
+            requestFrame(true);
         }
     }
 });
@@ -237,6 +249,7 @@ socket.on('death', (score) => {
     gameOverMenu = new GameOverMenu(ctx);
     gameOverMenu.setScore(score);
     gameOverMenu.draw();
+    requestFrame(true);
 });
 
 socket.on('disconnect', () => {
@@ -283,7 +296,7 @@ function drawWorld(now) {
 }
 
 function frame(now) {
-    requestAnimationFrame(frame);
+    framePending = false;
     const dt = lastFrameAt === 0 ? 16 : now - lastFrameAt;
     lastFrameAt = now;
     if (!isSetup) return;
@@ -293,8 +306,14 @@ function frame(now) {
         // the once-drawn menu) while particles finish flying.
         Particles.update(dt);
         Particles.draw(ctx);
+        if (Particles.hasActive()) requestFrame();
         return;
     }
+
+    // Active play always animates interpolation and world pickups. Queue the
+    // next frame before drawing so an optional visual effect cannot strand the
+    // authoritative game loop if it throws.
+    requestFrame();
 
     const t = Math.min(1, (now - lastTickAt) / TICK_MS);
     ctx.clearRect(0, 0, canvas.width, canvas.height);
@@ -323,5 +342,6 @@ function frame(now) {
         Hud.setMuted(Sfx.toggle());
     });
     Motion.popup(document.querySelector('#game_popup .popup'));
-    requestAnimationFrame(frame);
+    renderReady = true;
+    if (isSetup) requestFrame();
 })();

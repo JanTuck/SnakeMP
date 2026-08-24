@@ -151,7 +151,7 @@ the same insertion order, eliminating per-tick ids, names, colors, keys, and
 object nesting. Feed types are `join`, `death`, `golden`, `drop-incoming`, and
 `drop-open`, with only the fields needed by that event.
 
-### Server-to-client binary snapshot v3
+### Server-to-client binary snapshot v4
 
 All multibyte fields are **little-endian**. Coordinates are one-byte grid-cell
 indices and the browser multiplies them by 16. No native Zig struct, padding,
@@ -160,11 +160,12 @@ pointer, or uninitialized byte crosses the wire.
 ```text
 header:
   magic:[u8;2] = "SN"
-  version:u8 = 3
-  kind:u8                 // 0 keyframe, 1 dependent delta
+  version:u8 = 4
   sequence:u16
-  base_sequence:u16       // sequence for keyframes, prior sequence for deltas
-  player_count:u8
+  kind_and_players:u8
+    // bit 7: 0 keyframe, 1 dependent delta
+    // bits 0..4: player count (0..16)
+    // bits 5..6: reserved and zero
 
 keyframe player, repeated player_count times:
   score:i32
@@ -184,26 +185,31 @@ delta player, repeated player_count times:
     // bits 5..7: reserved and zero
   if score bit: score:i32
 
-bonus_count:u8
+world:u8
+  // bits 0..3: bonus count (0..12)
+  // bits 4..5: drop count (0..2)
+  // bit 6: golden present
+  // bit 7: reserved and zero
+
 repeat bonus_count times: x_cell:u8, y_cell:u8
 
-drop_count:u8
 repeat drop_count times: x_cell:u8, y_cell:u8, ttl_ms:u16
 
-golden_present:u8  // 0 or 1
-if 1: x_cell:u8, y_cell:u8, ttl_ms:u16
+if golden present: x_cell:u8, y_cell:u8, ttl_ms:u16
 ```
 
-A keyframe is complete and has `base_sequence == sequence`. A delta is accepted
-only when its base equals the client's last accepted sequence and its sequence
-is the wrapping next `u16`. Moving delta rows reconstruct the new head as one
-adjacent cell in the encoded direction; the existing body shifts behind it.
+A keyframe is complete and resets sequence continuity. A delta is accepted only
+when its sequence is the wrapping next `u16` after the client's last accepted
+sequence; the former explicit base field was exactly redundant with this check.
+Moving delta rows reconstruct the new head as one adjacent cell in the encoded
+direction; the existing body shifts behind it.
 The server emits a keyframe at least every 30 snapshots, whenever membership or
 an unsupported transition invalidates history, and when a client returns from
 hidden-document throttling. This bounds recovery without per-client snapshots.
 
-The client checks magic, version, kind, sequence relationship, roster/player
-agreement, flags and packed-body padding, all section counts, remaining length
+The client checks magic, version, header/world reserved bits, sequence
+relationship, roster/player agreement, flags and packed-body padding, all
+section counts, remaining length
 before every read, gameplay bounds (16 players, 7,200 cells, 12 bonus apples,
 two drops), golden presence, and exact end-of-frame alignment. Malformed,
 truncated, or out-of-sequence snapshots are ignored without mutating game

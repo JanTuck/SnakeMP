@@ -50,12 +50,16 @@ pub const Player = struct {
     }
 
     pub fn applyMove(player: *Player, allocator: std.mem.Allocator) void {
+        const direction = if (player.queue_len > 0) player.queue[0] else player.dir orelse return;
+        // Reserve before consuming the turn. Allocation failure must not leave
+        // a player facing a new direction without performing the matching move.
+        if (player.pending_growth > 0) player.snake.ensureUnusedCapacity(allocator, 1) catch return;
+
         if (player.queue_len > 0) {
-            player.dir = player.queue[0];
+            player.dir = direction;
             if (player.queue_len > 1) player.queue[0] = player.queue[1];
             player.queue_len -= 1;
         }
-        const direction = player.dir orelse return;
         var head = player.snake.items[0];
         switch (direction) {
             .up => head.y -= CELL,
@@ -65,7 +69,7 @@ pub const Player = struct {
         }
         if (player.pending_growth > 0) {
             const tail = player.snake.items[player.snake.items.len - 1];
-            player.snake.append(allocator, tail) catch return;
+            player.snake.appendAssumeCapacity(tail);
             player.pending_growth -= 1;
         }
         var i = player.snake.items.len - 1;
@@ -73,6 +77,33 @@ pub const Player = struct {
         player.snake.items[0] = head;
     }
 };
+
+test "growth allocation failure leaves movement state unchanged" {
+    var storage: [@sizeOf(CellPos)]u8 align(@alignOf(CellPos)) = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&storage);
+    const allocator = fixed.allocator();
+
+    var connection: Conn = .{ .fd = -1 };
+    var player: Player = .{
+        .id = "id",
+        .name = @constCast("name"),
+        .color_hex = @constCast("#fff"),
+        .conn = &connection,
+    };
+    defer player.snake.deinit(allocator);
+    try player.snake.ensureTotalCapacityPrecise(allocator, 1);
+    player.snake.appendAssumeCapacity(.{ .x = CELL, .y = CELL });
+    player.pending_growth = 1;
+    player.queue[0] = .right;
+    player.queue_len = 1;
+
+    player.applyMove(allocator);
+
+    try std.testing.expectEqual(@as(?Direction, null), player.dir);
+    try std.testing.expectEqual(@as(usize, 1), player.queue_len);
+    try std.testing.expectEqual(@as(i64, 1), player.pending_growth);
+    try std.testing.expectEqualSlices(CellPos, &.{.{ .x = CELL, .y = CELL }}, player.snake.items);
+}
 
 pub const BonusApple = struct { pos: CellPos };
 pub const Drop = struct { pos: CellPos, expires_at: i64 };

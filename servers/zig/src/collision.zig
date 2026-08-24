@@ -77,7 +77,7 @@ pub const Index = struct {
         for (players, 0..) |player, slot| {
             if (scanSelf(player)) index.self_hits |= bit(slot);
             for (player.snake.items) |position| {
-                if (cellIndex(position)) |cell| index.cells[cell] |= bit(slot);
+                if (cellIndexAligned(position)) |cell| index.cells[cell] |= bit(slot);
             }
         }
         return index;
@@ -101,7 +101,7 @@ pub const Index = struct {
     pub fn otherAt(index: *const Index, slot: usize, player: *const model.Player) ?Hit {
         std.debug.assert(index.tracked);
         if (!index.enabled) return scanOther(index.players[0..index.count], index.active, player);
-        const cell = cellIndex(player.snake.items[0]) orelse return null;
+        const cell = cellIndexAligned(player.snake.items[0]) orelse return null;
         const candidates = index.cells[cell] & ~bit(slot);
         if (candidates == 0) return null;
         const other_slot: usize = @intCast(@ctz(candidates));
@@ -115,7 +115,7 @@ pub const Index = struct {
         if (!index.enabled) return;
         const keep = ~bit(slot);
         for (player.snake.items) |position| {
-            if (cellIndex(position)) |cell| index.cells[cell] &= keep;
+            if (cellIndexAligned(position)) |cell| index.cells[cell] &= keep;
         }
         index.self_hits &= keep;
     }
@@ -131,11 +131,11 @@ pub const Index = struct {
         // A non-growth move drops the old tail before inserting the new head.
         // This intentionally permits moving into the cell just vacated by it.
         if (player.snake.items.len == before.len) {
-            if (cellIndex(before.tail)) |tail_cell| index.cells[tail_cell] &= ~player_bit;
+            if (cellIndexAligned(before.tail)) |tail_cell| index.cells[tail_cell] &= ~player_bit;
         }
 
         index.self_hits &= ~player_bit;
-        if (cellIndex(new_head)) |head_cell| {
+        if (cellIndexAligned(new_head)) |head_cell| {
             if ((index.cells[head_cell] & player_bit) != 0) index.self_hits |= player_bit;
             index.cells[head_cell] |= player_bit;
         }
@@ -180,8 +180,16 @@ inline fn same(a: model.CellPos, b: model.CellPos) bool {
 }
 
 inline fn cellIndex(position: model.CellPos) ?usize {
-    if (position.x < 0 or position.y < 0 or position.x >= config.GRID_W or position.y >= config.GRID_H) return null;
     if (@mod(position.x, model.CELL) != 0 or @mod(position.y, model.CELL) != 0) return null;
+    return cellIndexAligned(position);
+}
+
+/// Authoritative snake coordinates originate on the cell grid and move by one
+/// full cell. Keep the assertion in safety builds without rechecking the same
+/// invariant for every segment in optimized production builds.
+inline fn cellIndexAligned(position: model.CellPos) ?usize {
+    std.debug.assert(@mod(position.x, model.CELL) == 0 and @mod(position.y, model.CELL) == 0);
+    if (position.x < 0 or position.y < 0 or position.x >= config.GRID_W or position.y >= config.GRID_H) return null;
     const x: usize = @intCast(@divExact(position.x, model.CELL));
     const y: usize = @intCast(@divExact(position.y, model.CELL));
     return y * cols + x;
@@ -277,4 +285,13 @@ test "short lobbies retain the exact lower-cost scan path" {
 
 test "index stays comfortably within the 128 KiB worker stack" {
     try std.testing.expect(@sizeOf(Index) <= 16 * 1024);
+}
+
+test "checked lookup rejects positions between authoritative cells" {
+    var conn: model.Conn = .{ .fd = -1 };
+    var cells = [_]model.CellPos{.{ .x = 16, .y = 16 }};
+    var player = testPlayer(&conn, &cells);
+    const players = [_]*model.Player{&player};
+    const index = Index.buildForced(&players);
+    try std.testing.expectEqual(@as(Mask, 0), index.maskAt(.{ .x = 17, .y = 16 }));
 }

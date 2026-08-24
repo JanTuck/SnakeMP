@@ -102,10 +102,14 @@ var shutting_down: std.atomic.Value(bool) = .init(false);
 var listen_fd: posix.fd_t = -1;
 var epoll_fd: posix.fd_t = -1;
 var connections: std.AutoHashMapUnmanaged(posix.fd_t, *Conn) = .empty;
+// Bytes count successful kernel writes. Frames count complete direct writes or
+// frames whose unsent bytes were accepted by the bounded output queue.
 var network_bytes_sent: std.atomic.Value(u64) = .init(0);
-var network_bytes_received: std.atomic.Value(u64) = .init(0);
+// Only the epoll reactor reads sockets and builds the debug response, so these
+// receive-side counters do not need cross-thread atomic read-modify-writes.
+var network_bytes_received: u64 = 0;
 var websocket_frames_sent: std.atomic.Value(u64) = .init(0);
-var websocket_frames_received: std.atomic.Value(u64) = .init(0);
+var websocket_frames_received: u64 = 0;
 var input_event_ns_total: u64 = 0;
 var input_events: u64 = 0;
 var snapshot_pool_mutex: std.Io.Mutex = .init;
@@ -419,21 +423,33 @@ fn appendBorrowedOutput(c: *Conn, bytes: []const u8) bool {
 /// including dependent deltas. Never remove the head after a partial write:
 /// websocket frame bytes may not be interleaved.
 fn coalesceForKeyframe(c: *Conn) void {
-    var index: usize = c.output_head;
-    while (index < c.output.items.len) {
-        if (index == c.output_head and c.output_offset != 0) {
-            index += 1;
-            continue;
-        }
-        switch (c.output.items[index]) {
-            .owned, .borrowed => index += 1,
+    var read = c.output_head;
+    var write = c.output_head;
+
+    // A partially written websocket frame must remain at the head: emitting a
+    // keyframe before its suffix would interleave frame bytes on the wire.
+    if (read < c.output.items.len and c.output_offset != 0) {
+        read += 1;
+        write += 1;
+    }
+
+    // Compact retained controls in one stable pass. Repeated orderedRemove
+    // shifted the remaining suffix once per stale snapshot and became
+    // quadratic for deep backpressure queues.
+    while (read < c.output.items.len) : (read += 1) {
+        const output = c.output.items[read];
+        switch (output) {
+            .owned, .borrowed => {
+                if (write != read) c.output.items[write] = output;
+                write += 1;
+            },
             .shared => |frame| {
                 c.output_bytes -= frame.len();
                 releaseSharedFrame(frame);
-                _ = c.output.orderedRemove(index);
             },
         }
     }
+    c.output.shrinkRetainingCapacity(write);
 }
 
 fn appendSharedOutput(c: *Conn, frame: *model.SharedFrame, offset: usize) bool {
@@ -549,11 +565,14 @@ fn connQueueResponse(c: *Conn, header: []const u8, body: []const u8, body_static
 /// Caller holds output_mutex. Fast path uses one writev syscall and performs no
 /// allocation or copy; backpressured control frames retain an owned suffix.
 fn connEnqueueFrameLocked(c: *Conn, opcode: u8, payload: []const u8) void {
-    if (debug_enabled) _ = websocket_frames_sent.fetchAdd(1, .monotonic);
+    var accepted = false;
+    defer {
+        if (debug_enabled and accepted) _ = websocket_frames_sent.fetchAdd(1, .monotonic);
+    }
     var hdr: [10]u8 = undefined;
     const hlen = wsHeader(&hdr, opcode, payload.len);
     if (!outputEmpty(c)) {
-        _ = appendOwnedOutput(c, hdr[0..hlen], payload);
+        accepted = appendOwnedOutput(c, hdr[0..hlen], payload);
         return;
     }
 
@@ -568,15 +587,15 @@ fn connEnqueueFrameLocked(c: *Conn, opcode: u8, payload: []const u8) void {
                 const sent: usize = @intCast(rc);
                 if (debug_enabled) _ = network_bytes_sent.fetchAdd(sent, .monotonic);
                 if (sent < hlen) {
-                    _ = appendOwnedOutput(c, hdr[sent..hlen], payload);
+                    accepted = appendOwnedOutput(c, hdr[sent..hlen], payload);
                 } else if (sent < hlen + payload.len) {
-                    _ = appendOwnedOutput(c, payload[sent - hlen ..], "");
-                }
+                    accepted = appendOwnedOutput(c, payload[sent - hlen ..], "");
+                } else accepted = true;
                 return;
             },
             .INTR => continue,
             .AGAIN => {
-                _ = appendOwnedOutput(c, hdr[0..hlen], payload);
+                accepted = appendOwnedOutput(c, hdr[0..hlen], payload);
                 return;
             },
             else => {
@@ -618,8 +637,7 @@ fn connEnqueueSharedFrame(c: *Conn, frame: *model.SharedFrame) SharedFrameAccoun
     defer c.output_mutex.unlock(g_io);
     if (c.closing or c.poisoned) return .{};
     if (!outputEmpty(c)) {
-        _ = appendSharedOutput(c, frame, 0);
-        return .{ .frames_sent = 1 };
+        return .{ .frames_sent = @intFromBool(appendSharedOutput(c, frame, 0)) };
     }
 
     const hlen: usize = frame.header_len;
@@ -632,13 +650,12 @@ fn connEnqueueSharedFrame(c: *Conn, frame: *model.SharedFrame) SharedFrameAccoun
         switch (linux.errno(rc)) {
             .SUCCESS => {
                 const sent: usize = @intCast(rc);
-                if (sent < frame.len()) _ = appendSharedOutput(c, frame, sent);
-                return .{ .bytes_sent = sent, .frames_sent = 1 };
+                const accepted = sent == frame.len() or appendSharedOutput(c, frame, sent);
+                return .{ .bytes_sent = sent, .frames_sent = @intFromBool(accepted) };
             },
             .INTR => continue,
             .AGAIN => {
-                _ = appendSharedOutput(c, frame, 0);
-                return .{ .frames_sent = 1 };
+                return .{ .frames_sent = @intFromBool(appendSharedOutput(c, frame, 0)) };
             },
             else => {
                 c.poisoned = true;
@@ -1376,9 +1393,10 @@ fn handleKeyPress(c: *Conn, d: Direction) void {
 
     l.mutex.lockUncancelable(g_io);
     defer l.mutex.unlock(g_io);
-    c.membership_mutex.lockUncancelable(g_io);
+    // Every cross-thread membership write also holds this lobby mutex. Joins
+    // run only on this reactor thread, so no other writer can move the
+    // connection to a different lobby while this handler is running.
     const player = if (c.lobby == l) c.player else null;
-    c.membership_mutex.unlock(g_io);
     if (player) |p| _ = p.pushTurn(d);
 }
 
@@ -1808,17 +1826,34 @@ fn readRssBytes() u64 {
     return 0;
 }
 
-fn buildStats(aa: Allocator) ![]u8 {
+const StatsPayload = struct {
+    json: []u8,
+    lobby_stats: []stats_json.LobbyStats,
+    worker_loads: []stats_json.WorkerLoad,
+
+    fn deinit(payload: StatsPayload, allocator: Allocator) void {
+        allocator.free(payload.json);
+        allocator.free(payload.lobby_stats);
+        allocator.free(payload.worker_loads);
+    }
+};
+
+fn buildStats(aa: Allocator) !StatsPayload {
     const nsToUs = struct {
         fn convert(value: u64) f64 {
             return @as(f64, @floatFromInt(value)) / 1000.0;
         }
         fn average(total: u64, samples: u64) f64 {
-            return if (samples == 0) 0 else convert(total) / @as(f64, @floatFromInt(samples));
+            if (samples == 0) return 0;
+            return roundToThousandth(convert(total) / @as(f64, @floatFromInt(samples)));
+        }
+        fn roundToThousandth(value: f64) f64 {
+            return @round(value * 1000.0) / 1000.0;
         }
     };
 
     const worker_loads = try aa.alloc(stats_json.WorkerLoad, game_workers.items.len);
+    errdefer aa.free(worker_loads);
     for (game_workers.items, 0..) |worker, index| {
         worker.mutex.lockUncancelable(g_io);
         defer worker.mutex.unlock(g_io);
@@ -1829,6 +1864,7 @@ fn buildStats(aa: Allocator) ![]u8 {
     }
 
     const lobby_stats = try aa.alloc(stats_json.LobbyStats, lobbies.count());
+    errdefer aa.free(lobby_stats);
     var lobby_index: usize = 0;
     for (lobbies.values()) |l| {
         l.mutex.lockUncancelable(g_io);
@@ -1840,7 +1876,7 @@ fn buildStats(aa: Allocator) ![]u8 {
             .bonus = l.bonus.items.len,
             .golden = l.golden != null,
             .lastTickMs = l.stats.last_tick_ms,
-            .avgTickMs = l.stats.avg_tick_ms,
+            .avgTickMs = nsToUs.roundToThousandth(l.stats.avg_tick_ms),
             .balanceEwmaUs = nsToUs.convert(l.balance_ewma_ns),
             .maxTickMs = l.stats.max_tick_ms,
             .serializeUs = nsToUs.convert(l.stats.serialize_ns),
@@ -1854,7 +1890,7 @@ fn buildStats(aa: Allocator) ![]u8 {
         lobby_index += 1;
     }
 
-    return stats_json.encode(aa, .{
+    const encoded = try stats_json.encode(aa, .{
         .rss = readRssBytes(),
         .uptime = @as(f64, @floatFromInt(unixMillis() - start_ms)) / 1000.0,
         .totalPlayers = totalPlayersLocked(),
@@ -1868,25 +1904,30 @@ fn buildStats(aa: Allocator) ![]u8 {
         .workerTargetTickUs = nsToUs.convert(worker_balance.targetTickBudgetNs(TICK_NS)),
         .workerLoads = worker_loads,
         .networkBytesSent = network_bytes_sent.load(.monotonic),
-        .networkBytesReceived = network_bytes_received.load(.monotonic),
+        .networkBytesReceived = network_bytes_received,
         .websocketFramesSent = websocket_frames_sent.load(.monotonic),
-        .websocketFramesReceived = websocket_frames_received.load(.monotonic),
+        .websocketFramesReceived = websocket_frames_received,
         .inputEvents = input_events,
         .avgInputEventUs = nsToUs.average(input_event_ns_total, input_events),
         .lobbies = lobby_stats[0..lobby_index],
     });
+    return .{
+        .json = encoded,
+        .lobby_stats = lobby_stats,
+        .worker_loads = worker_loads,
+    };
 }
 
 fn sendStats(c: *Conn, aa: Allocator, keep_alive: bool, head_only: bool) void {
-    const js = buildStats(aa) catch {
+    const payload = buildStats(aa) catch {
         return sendServerError(c, aa);
     };
-    defer aa.free(js);
+    defer payload.deinit(aa);
     sendResponse(c, aa, .{
         .status = 200,
         .reason = "OK",
         .ctype = "application/json",
-        .body = js,
+        .body = payload.json,
         .keep_alive = keep_alive,
         .head_only = head_only,
     });
@@ -2071,7 +2112,7 @@ fn parseWsFrames(c: *Conn, aa: Allocator, data: []u8) !WsResult {
         const payload = data[pstart .. pstart + len];
         for (payload, 0..) |*ch, i| ch.* ^= key[i & 3];
         off += hdr_len + 4 + len;
-        if (debug_enabled) _ = websocket_frames_received.fetchAdd(1, .monotonic);
+        if (debug_enabled) websocket_frames_received +%= 1;
 
         switch (opcode) {
             0x1 => try websocket.validateTextPayload(payload), // text control packets are server-only
@@ -2258,7 +2299,7 @@ fn readAvailable(c: *Conn, aa: Allocator, peer_shutdown: bool) bool {
                     peer_eof = true;
                     break;
                 }
-                if (debug_enabled) _ = network_bytes_received.fetchAdd(count, .monotonic);
+                if (debug_enabled) network_bytes_received +%= count;
                 c.last_activity_ms = unixMillis();
                 c.input.appendSlice(galloc, scratch[0..count]) catch return false;
                 const max_input = if (c.mode == .http) MAX_HTTP_INPUT else MAX_WS_INPUT;
@@ -2632,6 +2673,44 @@ test "websocket close seals output after all earlier frames" {
     connection.output_offset = 0;
 }
 
+test "websocket sent counter excludes rejected queue publications" {
+    galloc = std.testing.allocator;
+    g_io = std.testing.io;
+    const previous_debug = debug_enabled;
+    const previous_frames = websocket_frames_sent.load(.monotonic);
+    defer {
+        debug_enabled = previous_debug;
+        websocket_frames_sent.store(previous_frames, .monotonic);
+    }
+    debug_enabled = true;
+    websocket_frames_sent.store(0, .monotonic);
+
+    var connection = Conn{ .fd = -1, .mode = .websocket };
+    defer {
+        for (connection.output.items[connection.output_head..]) |output| releasePending(output);
+        connection.output.deinit(galloc);
+    }
+    const prior = try galloc.dupe(u8, "prior");
+    try connection.output.append(galloc, .{ .owned = prior });
+    connection.output_bytes = prior.len;
+
+    connEnqueueFrame(&connection, 0x1, "accepted");
+    try std.testing.expectEqual(@as(u64, 1), websocket_frames_sent.load(.monotonic));
+
+    connection.output_bytes = MAX_QUEUE_BYTES;
+    connEnqueueFrame(&connection, 0x1, "rejected");
+    try std.testing.expect(connection.poisoned);
+    try std.testing.expectEqual(@as(u64, 1), websocket_frames_sent.load(.monotonic));
+
+    var shared: model.SharedFrame = .{};
+    shared.payload.items = @constCast("snapshot");
+    shared.header_len = @intCast(wsHeader(&shared.header, 0x2, shared.payload.items.len));
+    connection.poisoned = false;
+    const accounting = connEnqueueSharedFrame(&connection, &shared);
+    try std.testing.expectEqual(@as(usize, 0), accounting.frames_sent);
+    try std.testing.expect(connection.poisoned);
+}
+
 test "color conversion clamps floating point edge values" {
     try std.testing.expectEqual(@as(u8, 0), colorByte(-0.000_001));
     try std.testing.expectEqual(@as(u8, 127), colorByte(0.5));
@@ -2654,6 +2733,29 @@ test "binary client packets reject malformed and partial input" {
     try std.testing.expectEqual(Direction.left, websocket.clientPacket(&.{ 2, 2 }).?.direction);
     try std.testing.expectEqual(false, websocket.clientPacket(&.{ 3, 0 }).?.visibility);
     try std.testing.expectEqual(true, websocket.clientPacket(&.{ 3, 1 }).?.visibility);
+}
+
+test "keypress queues a turn for the current lobby membership" {
+    g_io = std.testing.io;
+    var connection = Conn{ .fd = -1 };
+    var lobby = Lobby{ .id = @constCast("test"), .food = .{ .x = 0, .y = 0 } };
+    var player = Player{
+        .id = "sid",
+        .name = @constCast("name"),
+        .color_hex = @constCast("#abcdef"),
+        .conn = &connection,
+    };
+    connection.lobby = &lobby;
+    connection.player = &player;
+
+    handleKeyPress(&connection, .right);
+    try std.testing.expectEqual(@as(usize, 1), player.queue_len);
+    try std.testing.expectEqual(Direction.right, player.queue[0]);
+
+    connection.lobby = null;
+    connection.player = null;
+    handleKeyPress(&connection, .up);
+    try std.testing.expectEqual(@as(usize, 1), player.queue_len);
 }
 
 test "only a websocket pong satisfies the heartbeat" {
@@ -2706,7 +2808,7 @@ test "compact roster and tick preserve world information" {
     defer wire.deinit(galloc);
     const result = try binary_snapshot.build(&wire, &lobby, 0, galloc);
     try std.testing.expectEqual(binary_snapshot.Kind.keyframe, result.kind);
-    try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', binary_snapshot.VERSION, 0 }, result.bytes[0..4]);
+    try std.testing.expectEqualSlices(u8, &.{ 'S', 'N', binary_snapshot.VERSION, 1, 0, 1 }, result.bytes[0..6]);
 }
 
 test "movement reports a wall crossing before snapshot publication" {
@@ -2774,4 +2876,74 @@ test "shared keyframe coalescing preserves partial frames and controls" {
     try std.testing.expectEqual(@as(usize, 2), snapshot_pool.items.len);
     releaseSharedFrame(reused);
     try std.testing.expectEqual(@as(usize, 3), snapshot_pool.items.len);
+}
+
+test "keyframe coalescing is stable and releases every stale shared reference once" {
+    galloc = std.testing.allocator;
+    defer drainSnapshotPool();
+    var connection = Conn{ .fd = -1 };
+    defer connection.output.deinit(galloc);
+
+    // Retain a realistic consumed prefix to ensure coalescing touches only the
+    // live suffix and preserves output_head/output_offset semantics.
+    for (0..70) |_| try connection.output.append(galloc, .{ .borrowed = "consumed" });
+    connection.output_head = 70;
+
+    const partial = acquireSharedFrame().?;
+    partial.keyframe = false;
+    try partial.payload.appendSlice(galloc, "partial-delta");
+    partial.header_len = @intCast(wsHeader(&partial.header, 0x2, partial.payload.items.len));
+    retainSharedFrame(partial);
+    try connection.output.append(galloc, .{ .shared = partial });
+    connection.output_offset = 3;
+
+    const stale = acquireSharedFrame().?;
+    stale.keyframe = false;
+    try stale.payload.appendSlice(galloc, "stale-delta");
+    stale.header_len = @intCast(wsHeader(&stale.header, 0x2, stale.payload.items.len));
+
+    const control_a = try galloc.dupe(u8, "control-a");
+    const control_c = try galloc.dupe(u8, "control-c");
+    const controls = [_]model.PendingOutput{
+        .{ .owned = control_a },
+        .{ .borrowed = "control-b" },
+        .{ .owned = control_c },
+        .{ .borrowed = "control-d" },
+    };
+    var control_bytes: usize = 0;
+    for (controls) |control| control_bytes += control.len();
+
+    for (controls) |control| {
+        for (0..32) |_| {
+            retainSharedFrame(stale);
+            try connection.output.append(galloc, .{ .shared = stale });
+        }
+        try connection.output.append(galloc, control);
+    }
+
+    const stale_count: usize = 4 * 32;
+    connection.output_bytes = partial.len() - connection.output_offset + stale_count * stale.len() + control_bytes;
+    try std.testing.expectEqual(@as(usize, stale_count + 1), stale.refs.load(.monotonic));
+
+    coalesceForKeyframe(&connection);
+
+    try std.testing.expectEqual(@as(usize, 70), connection.output_head);
+    try std.testing.expectEqual(@as(usize, 3), connection.output_offset);
+    try std.testing.expectEqual(@as(usize, 75), connection.output.items.len);
+    try std.testing.expect(connection.output.items[70].shared == partial);
+    try std.testing.expectEqualStrings("control-a", connection.output.items[71].owned);
+    try std.testing.expectEqualStrings("control-b", connection.output.items[72].borrowed);
+    try std.testing.expectEqualStrings("control-c", connection.output.items[73].owned);
+    try std.testing.expectEqualStrings("control-d", connection.output.items[74].borrowed);
+    try std.testing.expectEqual(partial.len() - connection.output_offset + control_bytes, connection.output_bytes);
+    try std.testing.expectEqual(@as(usize, 1), stale.refs.load(.monotonic));
+
+    for (connection.output.items[connection.output_head..]) |output| releasePending(output);
+    connection.output.clearRetainingCapacity();
+    connection.output_head = 0;
+    connection.output_offset = 0;
+    connection.output_bytes = 0;
+    releaseSharedFrame(partial);
+    releaseSharedFrame(stale);
+    try std.testing.expectEqual(@as(usize, 2), snapshot_pool.items.len);
 }

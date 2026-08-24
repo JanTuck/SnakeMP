@@ -90,13 +90,14 @@ function addOne(job) {
       const view = payload instanceof ArrayBuffer
         ? new DataView(payload)
         : ArrayBuffer.isView(payload) ? new DataView(payload.buffer, payload.byteOffset, payload.byteLength) : null;
-      if (!view || view.byteLength < 12 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 3) return invalid();
-      const kind = view.getUint8(3);
-      const sequence = view.getUint16(4, true);
-      const baseSequence = view.getUint16(6, true);
-      if (kind > 1 || (kind === 0 ? baseSequence !== sequence : (state.sequence === null || baseSequence !== state.sequence || sequence !== ((baseSequence + 1) & 0xffff)))) return invalid();
-      let offset = 9;
-      const players = view.getUint8(8);
+      if (!view || view.byteLength < 7 || view.getUint8(0) !== 0x53 || view.getUint8(1) !== 0x4e || view.getUint8(2) !== 4) return invalid();
+      const sequence = view.getUint16(3, true);
+      const header = view.getUint8(5);
+      if ((header & 0x60) !== 0) return invalid();
+      const kind = header >>> 7;
+      const players = header & 0x1f;
+      if (players > 16 || (kind === 1 && (state.sequence === null || sequence !== ((state.sequence + 1) & 0xffff)))) return invalid();
+      let offset = 6;
       for (let i = 0; i < players; i++) {
         if (kind === 0) {
           if (offset + 6 > view.byteLength) return invalid();
@@ -118,11 +119,13 @@ function addOne(job) {
         if (offset > view.byteLength) return invalid();
       }
       if (offset >= view.byteLength) return invalid();
-      const bonus = view.getUint8(offset++); offset += bonus * 2;
-      if (offset >= view.byteLength) return invalid();
-      const drops = view.getUint8(offset++); offset += drops * 4;
-      if (offset >= view.byteLength) return invalid();
-      const golden = view.getUint8(offset++); offset += golden * 4;
+      const world = view.getUint8(offset++);
+      if ((world & 0x80) !== 0) return invalid();
+      const bonus = world & 0x0f;
+      const drops = (world >>> 4) & 3;
+      const golden = (world & 0x40) !== 0;
+      if (bonus > 12 || drops > 2) return invalid();
+      offset += bonus * 2 + drops * 4 + (golden ? 4 : 0);
       if (offset !== view.byteLength) return invalid();
       state.sequence = sequence;
       recordTick();
