@@ -33,7 +33,8 @@
 <script src="/js/userInput.js" type="module"></script>
 <script src="/js/rendering.js" type="module"></script>
 <script>
-    const socket = io();
+    // All servers (node, rust, zig, go, bun) speak the websocket transport.
+    const socket = io({ transports: ['websocket'] });
     // This page always belongs to the lobby in its URL: /game/<id>.
     const LOBBY_ID = decodeURIComponent(location.pathname.split('/').filter(Boolean)[1] || '') || '12345';
     //Set last used username if present
