@@ -17,7 +17,7 @@
 //! two-cell move. The client reconstructs both heads from its previous state,
 //! avoiding boost ticks falling back to full-body keyframes.
 //! World counts share one byte: bonus count in bits 0..3, drop count in bits
-//! 4..5, golden presence in bit 6, and bit 7 selects the Arcade v2 extension.
+//! 4..5, golden presence in bit 6, and bit 7 selects the Arcade extension.
 //! The extension starts with a byte containing a 6-bit remains count, feast in
 //! bit 6, and bounty presence in bit 7. Each remain is x/y/ttl:u16, followed by
 //! optional feast ttl:u16 and bounty roster slot:u8.
@@ -227,7 +227,7 @@ fn appendWorld(buffer: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator
     const bonus_count = @min(lobby.bonus.items.len, WORLD_BONUS_MASK);
     const drop_count = @min(lobby.drops.items.len, WORLD_DROP_MASK);
     const golden_bit: u8 = if (lobby.golden != null) WORLD_GOLDEN_BIT else 0;
-    const has_arcade_extension = lobby.mode == .arcade_v2;
+    const has_arcade_extension = lobby.mode == .arcade;
     const world = @as(u8, @intCast(bonus_count)) |
         (@as(u8, @intCast(drop_count)) << WORLD_DROP_SHIFT) | golden_bit |
         (if (has_arcade_extension) WORLD_ARCADE_BIT else 0);
@@ -348,7 +348,7 @@ test "v5 builder retains and deltas a complete 32-player roster" {
     var initialized: usize = 0;
     defer for (storage[0..initialized]) |*player| player.snake.deinit(allocator);
 
-    var lobby = model.Lobby{ .id = @constCast("large"), .food = .{ .x = 0, .y = 0 } };
+    var lobby = model.Lobby{ .id = @constCast("large"), .mode = .classical, .food = .{ .x = 0, .y = 0 } };
     defer lobby.players.deinit(allocator);
     for (&storage, 0..) |*player, index| {
         player.* = .{
@@ -389,7 +389,7 @@ test "wall wrapping falls back to an absolute keyframe" {
         .x = (config.GRID_COLS - 1) * model.CELL,
         .y = 10 * model.CELL,
     });
-    var lobby = model.Lobby{ .id = @constCast("wrap"), .food = .{ .x = 0, .y = 0 } };
+    var lobby = model.Lobby{ .id = @constCast("wrap"), .mode = .classical, .food = .{ .x = 0, .y = 0 } };
     defer lobby.players.deinit(allocator);
     try lobby.players.append(allocator, &player);
 
@@ -415,7 +415,7 @@ test "v5 keyframes and direction deltas have stable golden bytes" {
     };
     defer player.snake.deinit(allocator);
     try player.snake.append(allocator, .{ .x = 2 * model.CELL, .y = 3 * model.CELL });
-    var lobby = model.Lobby{ .id = @constCast("test"), .food = .{ .x = 0, .y = 0 } };
+    var lobby = model.Lobby{ .id = @constCast("test"), .mode = .classical, .food = .{ .x = 0, .y = 0 } };
     defer lobby.players.deinit(allocator);
     try lobby.players.append(allocator, &player);
     var wire: std.ArrayListUnmanaged(u8) = .empty;
@@ -465,7 +465,7 @@ test "v5 boost deltas encode straight double steps and tail shrink without keyfr
         .{ .x = 2 * model.CELL, .y = 3 * model.CELL },
         .{ .x = model.CELL, .y = 3 * model.CELL },
     });
-    var lobby = model.Lobby{ .id = @constCast("boost"), .food = .{ .x = 0, .y = 0 } };
+    var lobby = model.Lobby{ .id = @constCast("boost"), .mode = .classical, .food = .{ .x = 0, .y = 0 } };
     defer lobby.players.deinit(allocator);
     try lobby.players.append(allocator, &player);
     var wire: std.ArrayListUnmanaged(u8) = .empty;
@@ -506,7 +506,7 @@ test "v5 board-edge coordinates have stable golden bytes" {
         .x = config.GRID_W - model.CELL,
         .y = config.GRID_H - model.CELL,
     });
-    var lobby = model.Lobby{ .id = @constCast("edge"), .food = .{ .x = 0, .y = 0 } };
+    var lobby = model.Lobby{ .id = @constCast("edge"), .mode = .classical, .food = .{ .x = 0, .y = 0 } };
     defer lobby.players.deinit(allocator);
     try lobby.players.append(allocator, &player);
     var wire: std.ArrayListUnmanaged(u8) = .empty;
@@ -522,7 +522,7 @@ test "v5 board-edge coordinates have stable golden bytes" {
 
 test "v5 packs world counts and golden presence into one stable byte" {
     const allocator = std.testing.allocator;
-    var lobby = model.Lobby{ .id = @constCast("test"), .food = .{ .x = 0, .y = 0 } };
+    var lobby = model.Lobby{ .id = @constCast("test"), .mode = .classical, .food = .{ .x = 0, .y = 0 } };
     defer lobby.bonus.deinit(allocator);
     defer lobby.drops.deinit(allocator);
     try lobby.bonus.append(allocator, .{ .pos = .{ .x = 4 * model.CELL, .y = 5 * model.CELL } });
@@ -554,9 +554,9 @@ test "v5 Arcade extension has bounded remains feast and bounty bytes" {
     defer player.snake.deinit(allocator);
     try player.snake.append(allocator, .{ .x = 2 * model.CELL, .y = 3 * model.CELL });
     var lobby = model.Lobby{
-        .id = @constCast("arcade-v2"),
+        .id = @constCast("arcade"),
         .food = .{ .x = 0, .y = 0 },
-        .mode = .arcade_v2,
+        .mode = .arcade,
         .feast_until = 250,
         .bounty_slot = 0,
     };
@@ -589,7 +589,7 @@ test "independent keyframe preserves delta history and sequence wraps" {
     };
     defer player.snake.deinit(allocator);
     try player.snake.append(allocator, .{ .x = model.CELL, .y = model.CELL });
-    var lobby = model.Lobby{ .id = @constCast("test"), .food = .{ .x = 0, .y = 0 } };
+    var lobby = model.Lobby{ .id = @constCast("test"), .mode = .classical, .food = .{ .x = 0, .y = 0 } };
     defer lobby.players.deinit(allocator);
     try lobby.players.append(allocator, &player);
     var wire: std.ArrayListUnmanaged(u8) = .empty;

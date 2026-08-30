@@ -26,11 +26,10 @@ update is a bounds-checked binary snapshot. JSON is reserved for infrequent
 control events such as initialization, roster changes, errors, the activity
 feed, and chat.
 
-Lobby creators choose one immutable ruleset. **Classical** is apples-only,
-**Arcade v1** preserves the established golden-apple and supply-drop game, and
-**Arcade v2** adds length-funded boost, collectible remains, feasts, leader
-bounties, kill streaks, danger cues, and a short wreckage focus. These are
-separate modes: Arcade v2 does not silently change Classical or Arcade v1.
+Lobby creators choose one immutable ruleset. **Classical** is apples-only;
+**Arcade** keeps the golden-apple and supply-drop game and adds length-funded
+boost, collectible remains, feasts, leader bounties, kill streaks, danger
+cues, and a short wreckage focus.
 
 Chat uses each player's roster color. Unfocused play shows a Minecraft-like
 bottom-left stream that fades away without an opaque chat panel; focusing the

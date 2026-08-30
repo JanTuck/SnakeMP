@@ -23,7 +23,7 @@ const OPPOSITE = new Map([
 
 let observedDirection = null;
 const queuedDirections = [];
-let gameMode = "arcade_v1";
+let gameMode = "arcade";
 let boostHeld = false;
 let gameplayEnabled = false;
 
@@ -44,8 +44,8 @@ export function releaseBoost() {
 }
 
 export function setGameMode(mode) {
-    gameMode = mode === "arcade_v2" ? "arcade_v2" : mode === "classical" ? "classical" : "arcade_v1";
-    if (gameMode !== "arcade_v2") releaseBoost();
+    gameMode = mode === "arcade" ? "arcade" : mode === "classical" ? "classical" : "arcade";
+    if (gameMode !== "arcade") releaseBoost();
 }
 
 export function setGameplayEnabled(enabled) {
@@ -111,7 +111,7 @@ function handleDirection(event) {
 }
 
 function handleBoostDown(event) {
-    if (event.code !== "Space" || !gameplayEnabled || gameMode !== "arcade_v2" || isEditingTarget(event.target)) return;
+    if (event.code !== "Space" || !gameplayEnabled || gameMode !== "arcade" || isEditingTarget(event.target)) return;
     event.preventDefault();
     if (event.repeat || boostHeld) return;
     emitBoost(true);

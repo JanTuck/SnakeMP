@@ -45,7 +45,7 @@ pub const DROP_POINTS: i64 = 2;
 pub const DROP_GROWTH: i64 = 2;
 pub const DROP_APPLES: usize = 4;
 
-// Arcade v2 is intentionally bounded independently of snake length and lobby
+// Arcade is intentionally bounded independently of snake length and lobby
 // lifetime so a crowded lobby cannot turn corpse mass into retained state.
 pub const REMAINS_TTL_MS: i64 = 15_000;
 pub const FEAST_REMAINS_TTL_MS: i64 = 25_000;

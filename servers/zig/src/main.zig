@@ -1139,7 +1139,7 @@ fn removeConnPlayer(c: *Conn, aa: Allocator) void {
         return;
     }
     feedDeath(l, p, null, 0, aa);
-    if (l.mode.isArcadeV2()) spawnCorpseRemainsLocked(l, p, unixMillis());
+    if (l.mode.isArcade()) spawnCorpseRemainsLocked(l, p, unixMillis());
     detachPlayer(l, p);
     destroyPlayer(p);
 }
@@ -1475,10 +1475,9 @@ fn lobbyAcceptsPassword(l: *const Lobby, supplied: []const u8) bool {
 fn parseGameMode(raw: ?[]const u8, legacy_classical: bool) ?model.GameMode {
     if (raw) |value| {
         if (std.mem.eql(u8, value, "classical")) return .classical;
-        if (std.mem.eql(u8, value, "arcade-v1") or std.mem.eql(u8, value, "arcade_v1")) return .arcade_v1;
-        if (std.mem.eql(u8, value, "arcade-v2") or std.mem.eql(u8, value, "arcade_v2")) return .arcade_v2;
+        if (std.mem.eql(u8, value, "arcade")) return .arcade;
     }
-    return if (raw == null) (if (legacy_classical) .classical else .arcade_v1) else null;
+    return if (raw == null) (if (legacy_classical) .classical else .arcade) else null;
 }
 
 fn parsePublicTarget(raw: ?[]const u8) ?u8 {
@@ -1918,7 +1917,7 @@ fn handleBoost(c: *Conn, held: bool) void {
     const l = lobby orelse return;
     l.mutex.lockUncancelable(g_io);
     defer l.mutex.unlock(g_io);
-    if (!l.mode.isArcadeV2() or spectatorIndex(l, c) != null) return;
+    if (!l.mode.isArcade() or spectatorIndex(l, c) != null) return;
     const player = if (c.lobby == l) c.player else null;
     if (player) |p| {
         p.boosting = held;
@@ -2087,7 +2086,7 @@ fn appendRemnantLocked(l: *Lobby, cell: CellPos, now: i64) void {
 }
 
 fn spawnCorpseRemainsLocked(l: *Lobby, p: *const Player, now: i64) void {
-    if (!l.mode.isArcadeV2() or p.snake.items.len <= 1 or l.remains.items.len >= model.MAX_REMAINS) return;
+    if (!l.mode.isArcade() or p.snake.items.len <= 1 or l.remains.items.len >= model.MAX_REMAINS) return;
     const body_len = p.snake.items.len - 1;
     const adaptive = body_len / CORPSE_REMAINS_MAX;
     const stride = @max(@as(usize, 3), adaptive);
@@ -2100,7 +2099,7 @@ fn spawnCorpseRemainsLocked(l: *Lobby, p: *const Player, now: i64) void {
     }
 }
 
-fn expireArcadeV2Locked(l: *Lobby, now: i64) void {
+fn expireArcadeLocked(l: *Lobby, now: i64) void {
     var index: usize = 0;
     while (index < l.remains.items.len) {
         if (l.remains.items[index].expires_at <= now) {
@@ -2283,7 +2282,7 @@ fn eliminateResolvedLocked(l: *Lobby, players: []const *Player, deaths: *const [
     return true;
 }
 
-fn resolveCurrentArcadeV2DeathsLocked(l: *Lobby, bounty: ?*Player, now: i64, aa: Allocator) bool {
+fn resolveCurrentArcadeDeathsLocked(l: *Lobby, bounty: ?*Player, now: i64, aa: Allocator) bool {
     if (l.players.items.len == 0) return false;
     var storage: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
     const count = l.players.items.len;
@@ -2293,7 +2292,7 @@ fn resolveCurrentArcadeV2DeathsLocked(l: *Lobby, bounty: ?*Player, now: i64, aa:
     return eliminateResolvedLocked(l, players, &deaths, bounty, now, aa);
 }
 
-fn arcadeV2BoostEligibleLocked(l: *Lobby, p: *Player, now: i64) bool {
+fn arcadeBoostEligibleLocked(l: *Lobby, p: *Player, now: i64) bool {
     if (!p.boosting) {
         p.boost_substep = false;
         return false;
@@ -2314,21 +2313,21 @@ fn arcadeV2BoostEligibleLocked(l: *Lobby, p: *Player, now: i64) bool {
     return !p.boost_substep;
 }
 
-fn simulateArcadeV2Locked(l: *Lobby, now: i64, aa: Allocator) void {
+fn simulateArcadeLocked(l: *Lobby, now: i64, aa: Allocator) void {
     const bounty = currentBounty(l);
-    _ = resolveCurrentArcadeV2DeathsLocked(l, bounty, now, aa);
+    _ = resolveCurrentArcadeDeathsLocked(l, bounty, now, aa);
 
     for (l.players.items) |player| collectAtHeadLocked(l, player, aa);
     for (l.players.items) |player| {
         player.applyMove(galloc);
         if (l.wrap_walls) wrapPlayerHead(player);
     }
-    _ = resolveCurrentArcadeV2DeathsLocked(l, bounty, now, aa);
+    _ = resolveCurrentArcadeDeathsLocked(l, bounty, now, aa);
 
     var extra: [binary_snapshot.MAX_PLAYERS]*Player = undefined;
     var extra_len: usize = 0;
     for (l.players.items) |player| {
-        if (arcadeV2BoostEligibleLocked(l, player, now)) {
+        if (arcadeBoostEligibleLocked(l, player, now)) {
             extra[extra_len] = player;
             extra_len += 1;
         }
@@ -2340,7 +2339,7 @@ fn simulateArcadeV2Locked(l: *Lobby, now: i64, aa: Allocator) void {
         player.applyMove(galloc);
         if (l.wrap_walls) wrapPlayerHead(player);
     }
-    _ = resolveCurrentArcadeV2DeathsLocked(l, bounty, now, aa);
+    _ = resolveCurrentArcadeDeathsLocked(l, bounty, now, aa);
     updateBountySlot(l);
 }
 
@@ -2351,7 +2350,7 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
 
     // Classical lobbies contain only main food, so their hot path skips all
     // special-pickup expiry and scheduling work as well as their game rules.
-    if (l.mode.hasArcadeObjectives()) {
+    if (l.mode.isArcade()) {
         // 1. expire pickups past their TTL
         var di: usize = 0;
         while (di < l.drops.items.len) {
@@ -2375,12 +2374,12 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
         }
     }
 
-    if (l.mode.isArcadeV2()) {
-        expireArcadeV2Locked(l, now);
+    if (l.mode.isArcade()) {
+        expireArcadeLocked(l, now);
         scheduleFeastLocked(l, now, aa);
-        simulateArcadeV2Locked(l, now, aa);
+        simulateArcadeLocked(l, now, aa);
     } else {
-        // Classical and Arcade v1 retain their established single-step order:
+        // Classical retains its established single-step order:
         // collision at tick start, pickup at the current head, then movement.
         // The only lifecycle change is retaining the eliminated connection as
         // a spectator so Game Over can keep receiving snapshots and chat.
@@ -2409,7 +2408,7 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
                 respawnFood(l);
                 broadcastUpdateFood(l, aa);
             }
-            if (l.mode.hasArcadeObjectives()) {
+            if (l.mode.isArcade()) {
                 var bi = l.bonus.items.len;
                 while (bi > 0) {
                     bi -= 1;
@@ -3474,7 +3473,7 @@ pub fn main(init: std.process.Init) !void {
     {
         const def_id = try galloc.dupe(u8, DEFAULT_LOBBY_ID);
         errdefer galloc.free(def_id);
-        _ = try createLobbyLocked(def_id, "", .arcade_v1, 16, false, 16);
+        _ = try createLobbyLocked(def_id, "", .arcade, 16, false, 16);
     }
 
     const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
@@ -3725,7 +3724,7 @@ test "all mode objectives avoid arena edges and the responsive HUD footprint" {
     for ([_]bool{ false, true }) |classical| {
         var lobby = Lobby{
             .id = @constCast("objective-test"),
-            .mode = if (classical) .classical else .arcade_v1,
+            .mode = if (classical) .classical else .arcade,
             .food = .{ .x = (COLS / 2) * CELL, .y = (ROWS / 2) * CELL },
         };
         lobby.rng = std.Random.DefaultPrng.init(if (classical) 0xc1a551c else 0xa4cade);
@@ -4024,7 +4023,7 @@ test "wrap walls transport heads across every arena edge" {
     try std.testing.expectEqual(@as(i32, 0), player.snake.items[0].y);
 }
 
-test "Arcade v2 wraps before authoritative death classification" {
+test "Arcade wraps before authoritative death classification" {
     galloc = std.testing.allocator;
     var connection = Conn{ .fd = -1 };
     var player = Player{
@@ -4038,14 +4037,14 @@ test "Arcade v2 wraps before authoritative death classification" {
     try player.snake.append(galloc, .{ .x = GRID_W - CELL, .y = 10 * CELL });
     var lobby = Lobby{
         .id = @constCast("wrap-v2"),
-        .mode = .arcade_v2,
+        .mode = .arcade,
         .wrap_walls = true,
         .food = .{ .x = 20 * CELL, .y = 20 * CELL },
     };
     defer lobby.players.deinit(galloc);
     try lobby.players.append(galloc, &player);
 
-    simulateArcadeV2Locked(&lobby, 1000, std.testing.allocator);
+    simulateArcadeLocked(&lobby, 1000, std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), lobby.players.items.len);
     try std.testing.expectEqual(@as(i32, 0), player.snake.items[0].x);
     try std.testing.expectEqual(@as(i32, 10 * CELL), player.snake.items[0].y);
@@ -4143,12 +4142,13 @@ test "head-to-head and mutual body collisions kill every attacker simultaneously
     try std.testing.expect(deaths[0] and deaths[1]);
 }
 
-test "mode parsing preserves legacy fallback and rejects explicit unknown values" {
-    try std.testing.expectEqual(model.GameMode.arcade_v1, parseGameMode(null, false).?);
+test "mode parsing defaults to arcade and rejects legacy and unknown values" {
+    try std.testing.expectEqual(model.GameMode.arcade, parseGameMode(null, false).?);
     try std.testing.expectEqual(model.GameMode.classical, parseGameMode(null, true).?);
     try std.testing.expectEqual(model.GameMode.classical, parseGameMode("classical", false).?);
-    try std.testing.expectEqual(model.GameMode.arcade_v1, parseGameMode("arcade-v1", true).?);
-    try std.testing.expectEqual(model.GameMode.arcade_v2, parseGameMode("arcade_v2", false).?);
+    try std.testing.expectEqual(model.GameMode.arcade, parseGameMode("arcade", false).?);
+    try std.testing.expect(parseGameMode("arcade-v1", false) == null);
+    try std.testing.expect(parseGameMode("arcade_v2", false) == null);
     try std.testing.expect(parseGameMode("future-mode", false) == null);
 }
 
@@ -4193,7 +4193,7 @@ test "public landing status JSON is compact exact and bounded" {
     try std.testing.expect(std.mem.endsWith(u8, maximum, "}"));
 }
 
-test "Arcade v2 collision credit requires one non-head body owner" {
+test "Arcade collision credit requires one non-head body owner" {
     var connection = Conn{ .fd = -1 };
     var owner_cells = [_]CellPos{
         .{ .x = 10 * CELL, .y = 10 * CELL },
@@ -4259,7 +4259,7 @@ test "corpse remains are adaptively sampled capped and HUD safe" {
     });
     var lobby = Lobby{
         .id = @constCast("v2"),
-        .mode = .arcade_v2,
+        .mode = .arcade,
         .food = .{ .x = 120 * CELL, .y = 60 * CELL },
     };
     defer lobby.remains.deinit(galloc);
@@ -4288,7 +4288,7 @@ test "three remains convert once and boost is one extra step every other held ti
     });
     var lobby = Lobby{
         .id = @constCast("v2"),
-        .mode = .arcade_v2,
+        .mode = .arcade,
         .food = .{ .x = 100 * CELL, .y = 50 * CELL },
     };
     defer lobby.remains.deinit(galloc);
@@ -4304,7 +4304,7 @@ test "three remains convert once and boost is one extra step every other held ti
     // Spend the pending growth first at the fifteenth held tick.
     var extra_steps: usize = 0;
     for (0..BOOST_COST_TICKS) |_| {
-        if (arcadeV2BoostEligibleLocked(&lobby, &player, 1000)) extra_steps += 1;
+        if (arcadeBoostEligibleLocked(&lobby, &player, 1000)) extra_steps += 1;
     }
     try std.testing.expectEqual(@as(usize, BOOST_COST_TICKS / 2), extra_steps);
     try std.testing.expectEqual(@as(i64, 0), player.pending_growth);
@@ -4312,7 +4312,7 @@ test "three remains convert once and boost is one extra step every other held ti
     try std.testing.expectEqual(@as(usize, 0), lobby.remains.items.len);
 
     // The next complete cost window sheds exactly one real tail cell.
-    for (0..BOOST_COST_TICKS) |_| _ = arcadeV2BoostEligibleLocked(&lobby, &player, 2000);
+    for (0..BOOST_COST_TICKS) |_| _ = arcadeBoostEligibleLocked(&lobby, &player, 2000);
     try std.testing.expectEqual(@as(usize, BOOST_MIN_CELLS), player.snake.items.len);
     try std.testing.expectEqual(@as(usize, 1), lobby.remains.items.len);
 }

@@ -106,12 +106,12 @@ const path = require('node:path');
   assert.equal(press('KeyS', true), true, 'repeated arrows remain prevented from scrolling');
   assert.equal(emitted.length, beforeRepeat, 'OS key-repeat does not enqueue input');
 
-  input.setGameMode('arcade_v1');
-  const beforeV1Space = emitted.length;
-  assert.equal(press('Space'), false, 'Arcade v1 keeps Space untouched');
-  assert.equal(emitted.length, beforeV1Space);
+  input.setGameMode('classical');
+  const beforeClassicalSpace = emitted.length;
+  assert.equal(press('Space'), false, 'Classical keeps Space untouched');
+  assert.equal(emitted.length, beforeClassicalSpace);
 
-  input.setGameMode('arcade_v2');
+  input.setGameMode('arcade');
   assert.equal(press('Space', false, { tagName: 'input' }), false, 'Space remains usable in form fields');
   const beforeChatButton = emitted.length;
   assert.equal(press('Space', false, { tagName: 'button' }), false,
@@ -119,7 +119,7 @@ const path = require('node:path');
   assert.equal(press('ArrowUp', false, { tagName: 'button' }), false,
     'focused game controls do not steer the snake');
   assert.equal(emitted.length, beforeChatButton, 'game control keys never leak into movement or boost');
-  assert.equal(press('Space'), true, 'Arcade v2 captures held boost');
+  assert.equal(press('Space'), true, 'Arcade captures held boost');
   assert.deepEqual(emitted.at(-1), ['boost', true]);
   press('Space', true);
   assert.deepEqual(emitted.slice(-1), [['boost', true]], 'repeat cannot duplicate boost-on');

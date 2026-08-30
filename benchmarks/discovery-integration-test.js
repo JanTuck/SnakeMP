@@ -151,14 +151,14 @@ function connectPlayer(base, lobby, username, password = '') {
     assert.strictEqual(indexAsset.headers['cache-control'], 'no-store', 'direct HTML assets must not be cached');
 
     for (const publicTarget of ['1', '17', 'many', '-1']) {
-      const invalid = await request(base, 'POST', '/generateid', `mode=arcade-v2&publicTarget=${encodeURIComponent(publicTarget)}`);
+      const invalid = await request(base, 'POST', '/generateid', `mode=arcade&publicTarget=${encodeURIComponent(publicTarget)}`);
       assert.strictEqual(invalid.status, 400, `invalid publicTarget=${publicTarget} must be rejected`);
     }
     for (const capacity of ['2', '24', '64', 'many']) {
-      const invalid = await request(base, 'POST', '/generateid', `mode=arcade-v2&publicTarget=0&capacity=${encodeURIComponent(capacity)}`);
+      const invalid = await request(base, 'POST', '/generateid', `mode=arcade&publicTarget=0&capacity=${encodeURIComponent(capacity)}`);
       assert.strictEqual(invalid.status, 400, `invalid capacity=${capacity} must be rejected`);
     }
-    const largeProtected = await request(base, 'POST', '/generateid', 'mode=arcade-v2&publicTarget=17&capacity=32&password=secret');
+    const largeProtected = await request(base, 'POST', '/generateid', 'mode=arcade&publicTarget=17&capacity=32&password=secret');
     assert.strictEqual(largeProtected.status, 303, '32-player lobbies must accept targets above the 16-player default');
 
     // HTTP redirects never reserve phantom seats. A burst with no WebSocket
@@ -171,9 +171,9 @@ function connectPlayer(base, lobby, username, password = '') {
     players.push(await connectPlayer(base, '12345', 'DefaultOne'));
     players.push(await connectPlayer(base, '12345', 'DefaultTwo'));
 
-    const unlisted = generatedLobby(await request(base, 'POST', '/generateid', 'mode=arcade-v2&publicTarget=0'));
-    const protectedLobby = generatedLobby(await request(base, 'POST', '/generateid', 'mode=arcade-v2&password=secret'));
-    const listed = generatedLobby(await request(base, 'POST', '/generateid', 'mode=arcade-v2'));
+    const unlisted = generatedLobby(await request(base, 'POST', '/generateid', 'mode=arcade&publicTarget=0'));
+    const protectedLobby = generatedLobby(await request(base, 'POST', '/generateid', 'mode=arcade&password=secret'));
+    const listed = generatedLobby(await request(base, 'POST', '/generateid', 'mode=arcade'));
     assert.notStrictEqual(listed, unlisted);
     assert.notStrictEqual(listed, protectedLobby);
 

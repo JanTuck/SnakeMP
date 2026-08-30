@@ -139,7 +139,7 @@ let inlineInitCalls = 0;
 let lateRenderingInitCalls = 0;
 let lateRenderingInitData = null;
 transport.on('init', () => { inlineInitCalls += 1; });
-second.receive('["init",{"mode":"arcade_v2","scale":16}]');
+second.receive('["init",{"mode":"arcade","scale":16}]');
 assert.equal(inlineInitCalls, 1);
 transport.on('init', (data) => {
   lateRenderingInitCalls += 1;
@@ -148,7 +148,7 @@ transport.on('init', (data) => {
 assert.equal(lateRenderingInitCalls, 1, 'a late rendering listener receives the retained init exactly once');
 assert.deepEqual(
   JSON.parse(JSON.stringify(lateRenderingInitData)),
-  { mode: 'arcade_v2', scale: 16 },
+  { mode: 'arcade', scale: 16 },
   'the retained init preserves the authoritative mode and board setup'
 );
 

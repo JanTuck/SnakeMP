@@ -57,7 +57,7 @@ export const Motion = Object.freeze({
 });
 
 let els = null;
-let gameMode = 'arcade_v1';
+let gameMode = 'arcade';
 const lastMe = { id: null, name: '', score: 0, length: 0 };
 let scoreVisible = false;
 let boardVisible = false;
@@ -69,8 +69,7 @@ function setText(element, value) {
 
 function modeLabel() {
     if (gameMode === 'classical') return 'Classical';
-    if (gameMode === 'arcade_v2') return 'Arcade v2';
-    return 'Arcade v1';
+    return 'Arcade';
 }
 
 function feedContent(item) {
@@ -80,7 +79,7 @@ function feedContent(item) {
         case 'kill':
             return { asset: '/img/snek.png', className: 'is-kill', text: `${item.killer} cut off ${item.who}${item.streak >= 2 ? ` — ${item.streak} streak` : ''}` };
         case 'death':
-            if (gameMode === 'arcade_v2' && typeof item.killerId === 'string' && typeof item.killer === 'string') {
+            if (gameMode === 'arcade' && typeof item.killerId === 'string' && typeof item.killer === 'string') {
                 const streak = item.streak >= 2 ? ` · ${item.streak} streak` : '';
                 const bounty = item.bounty > 0 ? ` · +${item.bounty} bounty` : '';
                 return { asset: '/img/snek.png', className: 'is-kill', text: `${item.killer} cut off ${item.who}${streak}${bounty}` };
@@ -195,11 +194,11 @@ export const Hud = {
     setMode(mode) {
         gameMode = mode === true || mode === 'classical'
             ? 'classical'
-            : mode === 'arcade_v2' ? 'arcade_v2' : 'arcade_v1';
+            : mode === 'arcade' ? 'arcade' : 'arcade';
         if (els === null) return;
         delete els.mode.dataset.feast;
         setText(els.mode, modeLabel());
-        if (gameMode !== 'arcade_v2') {
+        if (gameMode !== 'arcade') {
             for (let index = 0; index < MAX_LEADERS; index++) {
                 els.rows[index].row.classList.toggle('hud-bounty', false);
                 rowState[index].isBounty = false;
@@ -222,7 +221,7 @@ export const Hud = {
     update(players, meId, arcadeState = null) {
         if (els === null) return;
 
-        const feastTtl = gameMode === 'arcade_v2' && arcadeState !== null
+        const feastTtl = gameMode === 'arcade' && arcadeState !== null
             ? Math.max(0, Number(arcadeState.feastTtl) || 0) : 0;
         if (feastTtl > 0) {
             els.mode.dataset.feast = 'true';
@@ -231,7 +230,7 @@ export const Hud = {
             delete els.mode.dataset.feast;
             setText(els.mode, modeLabel());
         }
-        const bountyId = gameMode === 'arcade_v2' && arcadeState !== null ? arcadeState.bountyId : null;
+        const bountyId = gameMode === 'arcade' && arcadeState !== null ? arcadeState.bountyId : null;
 
         const me = findMe(players, meId);
         const nextScoreVisible = me !== null;
@@ -290,7 +289,7 @@ export const Hud = {
 
     feed(item) {
         if (els === null) return;
-        if (gameMode !== 'arcade_v2' && (item.type === 'kill' || item.type === 'bounty' || item.type === 'feast' || item.type === 'feast-start')) return;
+        if (gameMode !== 'arcade' && (item.type === 'kill' || item.type === 'bounty' || item.type === 'feast' || item.type === 'feast-start')) return;
         const content = feedContent(item);
         const entry = document.createElement('div');
         const icon = document.createElement('img');

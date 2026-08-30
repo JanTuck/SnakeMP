@@ -27,7 +27,7 @@ let food = null;
 let isSetup = false;
 let gameOver = false;
 let spectating = false;
-let gameMode = 'arcade_v1';
+let gameMode = 'arcade';
 let errorTimeout = null;
 let gameOverMenu = null;
 let deathReplay = null;
@@ -140,7 +140,7 @@ function ensureNameplate(id, displayName) {
         plate.measured = false;
     }
     plate.element.classList.toggle('is-local', isLocal);
-    plate.element.classList.toggle('is-bounty', id === world.bountyId && gameMode === 'arcade_v2');
+    plate.element.classList.toggle('is-bounty', id === world.bountyId && gameMode === 'arcade');
 }
 
 function removeNameplate(id) {
@@ -151,7 +151,7 @@ function removeNameplate(id) {
 }
 
 function setBountyId(id) {
-    const next = gameMode === 'arcade_v2' && typeof id === 'string' ? id : null;
+    const next = gameMode === 'arcade' && typeof id === 'string' ? id : null;
     if (world.bountyId === next) return;
     if (world.bountyId !== null) nameplates.get(world.bountyId)?.element.classList.toggle('is-bounty', false);
     world.bountyId = next;
@@ -306,15 +306,15 @@ socket.on("b", (payload) => {
             world.golden.y = frame.goldenY * 16;
             world.golden.ttl = frame.goldenTtl;
         }
-        resizeObjects(world.remains, gameMode === 'arcade_v2' ? frame.remainsCount : 0);
+        resizeObjects(world.remains, gameMode === 'arcade' ? frame.remainsCount : 0);
         for (let index = 0; index < world.remains.length; index++) {
             const remain = world.remains[index];
             remain.x = frame.remains[index].x * 16;
             remain.y = frame.remains[index].y * 16;
             remain.ttl = frame.remains[index].ttl;
         }
-        world.feastTtl = gameMode === 'arcade_v2' ? frame.feastTtl : 0;
-        setBountyId(gameMode === 'arcade_v2' && frame.hasBounty ? roster[frame.bountySlot]?.[0] : null);
+        world.feastTtl = gameMode === 'arcade' ? frame.feastTtl : 0;
+        setBountyId(gameMode === 'arcade' && frame.hasBounty ? roster[frame.bountySlot]?.[0] : null);
         world.players = compactPlayers;
         lastSnapshotSequence = frame.sequence;
         remoteInterpolation.snapshot(performance.now(), frame.sequence);
@@ -338,9 +338,9 @@ socket.on("b", (payload) => {
 
 socket.on('init', (initData) => {
     document.getElementById('game_popup').style.display = 'none';
-    gameMode = initData.mode === 'arcade_v2'
-        ? 'arcade_v2'
-        : initData.mode === 'classical' || initData.classical === true ? 'classical' : 'arcade_v1';
+    gameMode = initData.mode === 'arcade'
+        ? 'arcade'
+        : initData.mode === 'classical' || initData.classical === true ? 'classical' : 'arcade';
     Hud.setMode(gameMode);
     setGameMode(gameMode);
 
@@ -382,11 +382,11 @@ socket.on('feed', (item) => {
     else if (item.type === 'join') Sfx.join();
     else if (item.type === 'drop-incoming') Sfx.countIn();
     else if ((item.type === 'death' || item.type === 'kill') && item.who !== undefined) {
-        // Arcade v2 attribution is identity-based: display names are not unique.
+        // Arcade attribution is identity-based: display names are not unique.
         const victimId = item.victimId ?? item.whoId ?? item.id;
         const victim = typeof victimId === 'string'
             ? compactById.get(victimId)
-            : gameMode === 'arcade_v2' ? undefined : (world.players || []).find((p) => p.displayName === item.who);
+            : gameMode === 'arcade' ? undefined : (world.players || []).find((p) => p.displayName === item.who);
         if (victim !== undefined) {
             Particles.burst(victim.snake[0].x + 8, victim.snake[0].y + 8, victim.color, 24, 4);
             requestFrame(true);
@@ -414,14 +414,14 @@ socket.on('death', (death) => {
     Particles.burst(focusX, focusY, me !== undefined ? me.color : '#e74c3c', 40, 5);
     gameOverMenu?.destroy?.();
 
-    if (gameMode === 'arcade_v2') {
+    if (gameMode === 'arcade') {
         gameOver = false;
         spectating = true;
         deathReplay = { x: focusX, y: focusY, startedAt: now, until: now + replayMs, duration: replayMs, finished: false };
         gameOverMenu = new GameOverMenu(ctx, { compact: true });
         gameOverMenu.setReplay(replayMs);
     } else {
-        gameOver = true; // Established Classical / Arcade v1 terminal presentation.
+        gameOver = true; // Established Classical terminal presentation.
         spectating = false;
         deathReplay = null;
         nameplateLayer.hidden = true;
@@ -438,9 +438,9 @@ socket.on('disconnect', () => {
 
 // ---- Render loop: interpolated movement at display refresh rate ----
 function drawWorld(now) {
-    // Arcade v2 remains stay deliberately quieter than apples: neutral matte
+    // Arcade remains stay deliberately quieter than apples: neutral matte
     // pellets communicate edible mass without turning a death into confetti.
-    if (gameMode === 'arcade_v2') {
+    if (gameMode === 'arcade') {
         for (const remain of world.remains) {
             const alpha = remain.ttl < 2000 ? Math.max(0.25, remain.ttl / 2000) : 1;
             ctx.globalAlpha = alpha;
@@ -490,7 +490,7 @@ function drawWorld(now) {
 }
 
 function refreshDanger(now) {
-    if (gameMode !== 'arcade_v2' || spectating || now - lastDangerCheck < DANGER_CHECK_MS) return;
+    if (gameMode !== 'arcade' || spectating || now - lastDangerCheck < DANGER_CHECK_MS) return;
     lastDangerCheck = now;
     dangerId = null;
     const local = snakeList.get(socket.id);
@@ -517,7 +517,7 @@ function refreshDanger(now) {
 }
 
 function drawDanger(t, now) {
-    if (gameMode !== 'arcade_v2' || spectating) return;
+    if (gameMode !== 'arcade' || spectating) return;
     refreshDanger(now);
     if (dangerId === null) return;
     const local = snakeList.get(socket.id);

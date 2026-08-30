@@ -59,13 +59,12 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
   compared with the standard library's timing-safe primitive.
 - **Classical** contains only the main apple. It has no drops, bonus apples,
   golden apples, boost, remains, feasts, bounty, streak, or danger system.
-- **Arcade v1** preserves the established game: main/bonus/golden apples and
-  supply drops, with no Arcade v2 mechanics.
-- **Arcade v2** inherits the Arcade v1 objectives and adds length-funded boost,
-  collectible remains, feast periods, leader bounties, credited kill streaks,
-  proximity danger cues, and a remains-aware wreckage focus.
-- The three names are first-class rulesets, not a version negotiation. Adding
-  Arcade v2 never changes Classical or Arcade v1 behavior.
+- **Arcade** keeps the classic main/bonus/golden apples and supply drops and
+  adds length-funded boost, collectible remains, feast periods, leader
+  bounties, credited kill streaks, proximity danger cues, and a remains-aware
+  wreckage focus.
+- The two modes are first-class rulesets: playing one never changes the other's
+  behavior.
 - Lobby `12345` always exists and is never deleted.
 - At most 4096 lobbies exist by default, including `12345`
   (`SNEK_MAX_LOBBIES`). At capacity, `POST /generateid` returns HTTP 503 without
@@ -93,7 +92,7 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
   chat spectators do not make a lobby look full. Password-protected lobbies
   are always stored as unlisted. Legacy clients may still submit `publicTarget`
   0 or 2..32 explicitly, bounded by the selected capacity. The
-  permanent `12345` lobby is an open Arcade v1 lobby advertised to 16 players.
+  permanent `12345` lobby is an open Arcade lobby advertised to 16 players.
 - Full-server rejection is `game_error: "Server is full, try again later"`.
 - Full-lobby rejection is `game_error: "This game is full"`.
 
@@ -124,8 +123,8 @@ On success the server:
 A socket may join again after its player dies. In every mode, death removes the
 authoritative snake, retains only its bounded identity, and moves the same
 connection into a bounded spectator list so Game Over chat stays interactive.
-Arcade v2 additionally presents a 3.5-second wreckage focus; Classical and
-Arcade v1 retain their established terminal presentation. The spectator stays
+Arcade additionally presents a 3.5-second wreckage focus; Classical keeps its
+established terminal presentation. The spectator stays
 in lobby chat until retry, disconnect, or bounded spectator eviction, but its
 binary world snapshots stop at the 3.5-second spectating cutoff. Closing a
 socket atomically detaches and frees its current player or spectator membership
@@ -188,7 +187,7 @@ Input, visibility, and boost frames must be exactly two bytes. Directions are
 absolute;
 the server rejects repeated/reversing turns and owns the two-turn queue. The
 visibility hint changes snapshot delivery cadence, never authoritative
-simulation. Boost is a held state, is effective only in Arcade v2, and is reset
+simulation. Boost is a held state, is effective only in Arcade, and is reset
 when player ownership ends. Unknown packet types/directions and WebSocket text
 messages from a client have no game effect.
 
@@ -207,7 +206,7 @@ Each event is one JSON array whose first element is the event name:
 
 ```json
 ["id", "base64url-connection-id"]
-["init", {"scale": 16, "food": {"x": 0, "y": 0}, "mode": "arcade_v2", "classical": false}]
+["init", {"scale": 16, "food": {"x": 0, "y": 0}, "mode": "arcade", "classical": false}]
 ["r", [["id", "displayName", "#rrggbb"]]]
 ["updateFood", {"x": 0, "y": 0}]
 ["death", {"score": 12, "focus": {"x": 0, "y": 0}, "spectateMs": 3500}]
@@ -262,7 +261,7 @@ world:u8
   // bits 0..3: bonus count (0..12)
   // bits 4..5: drop count (0..2)
   // bit 6: golden present
-  // bit 7: Arcade v2 extension follows
+  // bit 7: Arcade extension follows
 
 repeat bonus_count times: x_cell:u8, y_cell:u8
 
@@ -270,7 +269,7 @@ repeat drop_count times: x_cell:u8, y_cell:u8, ttl_ms:u16
 
 if golden present: x_cell:u8, y_cell:u8, ttl_ms:u16
 
-if Arcade v2 extension follows:
+if Arcade extension follows:
   arcade:u8
     // bits 0..5: remains count (0..63)
     // bit 6: feast active
@@ -288,8 +287,8 @@ when its sequence is the wrapping next `u16` after the client's last accepted
 sequence; the former explicit base field was exactly redundant with this check.
 Moving delta rows reconstruct the new head as one adjacent cell in the encoded
 direction; the existing body shifts behind it.
-Classical and Arcade v1 snapshots leave world bit 7 clear and end after the
-v4-compatible world body. Arcade v2 sets it and includes the entire bounded
+Classical snapshots leave world bit 7 clear and end after the
+v4-compatible world body. Arcade sets it and includes the entire bounded
 extension in keyframes and deltas. The remains count is six bits and therefore
 cannot exceed 63; an active bounty slot must be less than this frame's player
 count. TTLs are clamped to `0..65535`.
@@ -304,7 +303,7 @@ section counts, remaining length
 before every read, gameplay bounds (16 players, 9,216 cells, 12 bonus apples,
 two drops, 63 remains), golden/feast/bounty presence and references, and exact
 end-of-frame alignment. A frame without the extension explicitly clears prior
-Arcade v2 extension state. Malformed,
+Arcade extension state. Malformed,
 truncated, or out-of-sequence snapshots are ignored without mutating game
 state.
 
@@ -321,7 +320,7 @@ For each lobby, under its ownership lock:
 4. resolve accepted turns and all players' collision intentions from the same
    pre-movement state, credit body collisions to the body owner, then commit
    deaths without insertion-order advantage;
-5. resolve food/remains pickups, growth, ordinary movement, and Arcade v2 boost
+5. resolve food/remains pickups, growth, ordinary movement, and Arcade boost
    substeps;
 6. update the unique qualifying bounty leader and streak state;
 7. send a roster if membership changed;
@@ -333,14 +332,14 @@ three points and one growth. A crate gives two points, two growth, and spawns up
 to four bonus apples, capped at 12. Drops live 25 seconds and golden apples 12.
 A free cell contains no snake, food, bonus apple, drop, or golden apple.
 
-Arcade v2 remains are lobby-owned bounded values, never references into a dead
+Arcade remains are lobby-owned bounded values, never references into a dead
 snake. On death, the head is excluded and the body is sampled with
 `stride = max(3, ceil((length - 1) / 20))`, capped at 20 new remains and 63
 live remains per lobby. Normal remains live 15 seconds; remains created during
 a feast live 25 seconds. Collecting three remains grants one point and one
 pending segment of growth.
 
-Holding boost in Arcade v2 performs one additional fully authoritative movement
+Holding boost in Arcade performs one additional fully authoritative movement
 substep every second held tick (1.5x movement overall); the substep uses the
 same wall, self, player, and pickup rules rather than jumping across cells.
 Every 15 active boost ticks pays one unit: pending growth is consumed first,
@@ -395,7 +394,7 @@ kill resets the streak to one.
   and the final binary WebSocket join rechecks the lobby and the global retained
   identity cap.
 - `POST /generateid`: URL-encoded optional `password` and required `mode` value
-  `classical`, `arcade-v1`, or `arcade-v2`; create the immutable-mode lobby and
+  `classical` or `arcade`; create the immutable-mode lobby and
   return `303 /game/<id>`. Without a `publicTarget`, passwordless lobbies are
   listed through their selected capacity and passworded lobbies are unlisted.
   The legacy `publicTarget` field remains accepted as 0 or 2..32. The legacy

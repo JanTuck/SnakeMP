@@ -17,19 +17,17 @@ pub const CHAT_REFILL_MS: i64 = 750;
 pub const LOBBY_CHAT_TOKEN_CAPACITY: u8 = 12;
 pub const LOBBY_CHAT_REFILL_MS: i64 = 250;
 
-/// Lobby rules are fixed when the lobby is created. Arcade v1 deliberately
-/// remains a first-class mode so Arcade v2 can evolve without silently
-/// changing the established game.
+/// Lobby rules are fixed when the lobby is created. Classical is apples-only;
+/// Arcade adds golden apples, supply drops, boost, remains, feasts, and
+/// bounties. The mode never changes for the lifetime of a lobby.
 pub const GameMode = enum(u8) {
     classical = 0,
-    arcade_v1 = 1,
-    arcade_v2 = 2,
+    arcade = 1,
 
     pub fn wireName(mode: GameMode) []const u8 {
         return switch (mode) {
             .classical => "classical",
-            .arcade_v1 => "arcade_v1",
-            .arcade_v2 => "arcade_v2",
+            .arcade => "arcade",
         };
     }
 
@@ -37,14 +35,8 @@ pub const GameMode = enum(u8) {
         return mode == .classical;
     }
 
-    /// Both Arcade generations retain the original drops, bonus apples, and
-    /// golden apples. Only Arcade v2 enables remains and its related systems.
-    pub fn hasArcadeObjectives(mode: GameMode) bool {
-        return mode != .classical;
-    }
-
-    pub fn isArcadeV2(mode: GameMode) bool {
-        return mode == .arcade_v2;
+    pub fn isArcade(mode: GameMode) bool {
+        return mode == .arcade;
     }
 };
 
@@ -166,14 +158,13 @@ test "growth allocation failure leaves movement state unchanged" {
     try std.testing.expectEqualSlices(CellPos, &.{.{ .x = CELL, .y = CELL }}, player.snake.items);
 }
 
-test "game modes keep established objectives isolated from arcade v2" {
+test "game modes expose distinct classical and arcade behavior" {
     try std.testing.expect(GameMode.classical.isClassical());
-    try std.testing.expect(!GameMode.classical.hasArcadeObjectives());
-    try std.testing.expect(!GameMode.arcade_v1.isArcadeV2());
-    try std.testing.expect(GameMode.arcade_v1.hasArcadeObjectives());
-    try std.testing.expect(GameMode.arcade_v2.hasArcadeObjectives());
-    try std.testing.expect(GameMode.arcade_v2.isArcadeV2());
-    try std.testing.expectEqualStrings("arcade_v1", GameMode.arcade_v1.wireName());
+    try std.testing.expect(!GameMode.classical.isArcade());
+    try std.testing.expect(!GameMode.arcade.isClassical());
+    try std.testing.expect(GameMode.arcade.isArcade());
+    try std.testing.expectEqualStrings("classical", GameMode.classical.wireName());
+    try std.testing.expectEqualStrings("arcade", GameMode.arcade.wireName());
 }
 
 test "tail shedding preserves the configured minimum length" {
@@ -278,9 +269,9 @@ pub const Lobby = struct {
     /// lobby mutex alongside membership and broadcast fan-out.
     chat_tokens: u8 = LOBBY_CHAT_TOKEN_CAPACITY,
     chat_last_refill_ms: i64 = 0,
-    /// The creator fixes this for the lobby lifetime. Arcade v1 remains the
-    /// compatibility default; Classical and Arcade v2 are always explicit.
-    mode: GameMode = .arcade_v1,
+    /// The creator fixes this for the lobby lifetime. Classical must be
+    /// explicit; Arcade is the default mode for new lobbies.
+    mode: GameMode = .arcade,
     /// Optional arena rule chosen by the lobby creator. Crossing any edge
     /// re-enters on the opposite edge instead of counting as a wall death.
     wrap_walls: bool = false,

@@ -806,7 +806,7 @@ button:focus-visible { outline: 2px solid var(--focus); outline-offset: 3px; }
 
 .game-over-action[hidden] { display: none; }
 
-/* Arcade v2 keeps the live, full-board view after death. The replay starts as
+/* Arcade keeps the live, full-board view after death. The replay starts as
    a small status chip, then resolves into a compact retry control. */
 .game-over-overlay.is-spectating {
     place-items: end center;

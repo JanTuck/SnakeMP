@@ -120,7 +120,7 @@ function frame(bytes, prefix = 0) {
   const reservedHeader = frame([0x53, 0x4e, 5, 2, 0, 0xc1, 0, 0]);
   assert.equal(decodeSnapshot(reservedHeader, 1, 1, current), null, 'header padding bits must be zero');
   const emptyArcadeExtension = frame([0x53, 0x4e, 5, 2, 0, 0x81, 0, 0x80, 0]);
-  assert.ok(decodeSnapshot(emptyArcadeExtension, 1, 1, current), 'world bit 7 selects the bounded Arcade v2 extension');
+  assert.ok(decodeSnapshot(emptyArcadeExtension, 1, 1, current), 'world bit 7 selects the bounded Arcade extension');
 
   const packedPadding = frame([
     0x53, 0x4e, 5, 9, 0, 1,
@@ -165,7 +165,7 @@ function frame(bytes, prefix = 0) {
     0x96, 0, 0,
   ]);
   const decodedArcade = decodeSnapshot(arcadeFrame, 1, null, []);
-  assert.ok(decodedArcade, 'Arcade v2 keyframe extension must decode');
+  assert.ok(decodedArcade, 'Arcade keyframe extension must decode');
   assert.equal(decodedArcade.remainsCount, 2);
   assert.deepEqual(decodedArcade.remains[0], { x: 4, y: 5, ttl: 100 });
   assert.deepEqual(decodedArcade.remains[1], { x: 6, y: 7, ttl: 65535 });
@@ -176,7 +176,7 @@ function frame(bytes, prefix = 0) {
 
   for (let cut = arcadeFrame.byteLength - 1; cut >= arcadeFrame.byteLength - 4; cut--) {
     assert.equal(decodeSnapshot(arcadeFrame.subarray(0, cut), 1, null, []), null,
-      'truncated optional Arcade v2 fields must reject the complete frame');
+      'truncated optional Arcade fields must reject the complete frame');
   }
   const badRemainCell = Uint8Array.from(arcadeFrame);
   badRemainCell[16] = 128;
@@ -186,7 +186,7 @@ function frame(bytes, prefix = 0) {
   assert.equal(decodeSnapshot(badBountySlot, 1, null, []), null, 'bounty slot must name a player in this frame');
   const trailingArcade = new Uint8Array(arcadeFrame.length + 1);
   trailingArcade.set(arcadeFrame);
-  assert.equal(decodeSnapshot(trailingArcade, 1, null, []), null, 'trailing Arcade v2 bytes must reject the frame');
+  assert.equal(decodeSnapshot(trailingArcade, 1, null, []), null, 'trailing Arcade bytes must reject the frame');
 
   const maximumRemains = [0x53, 0x4e, 5, 11, 0, 0, 0x80, 0x3f];
   for (let index = 0; index < 63; index++) maximumRemains.push(index % 128, index % 72, index, 0);
@@ -199,7 +199,7 @@ function frame(bytes, prefix = 0) {
 
   const plainAfterArcade = decodeSnapshot(frame([0x53, 0x4e, 5, 13, 0, 0, 0]), 0, null, []);
   assert.ok(plainAfterArcade);
-  assert.equal(plainAfterArcade.remainsCount, 0, 'legacy-mode snapshots clear prior Arcade v2 extension state');
+  assert.equal(plainAfterArcade.remainsCount, 0, 'legacy-mode snapshots clear prior Arcade extension state');
   assert.equal(plainAfterArcade.feastActive, false);
   assert.equal(plainAfterArcade.hasBounty, false);
 

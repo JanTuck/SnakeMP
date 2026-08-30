@@ -176,10 +176,10 @@ const vm = require('node:vm');
   socket.emitEvent('init', { food: { x: 10, y: 20 }, mode: 'classical' });
   assert.deepEqual(modes, ['classical'], 'classical init state must reach the exact HUD mode label');
   assert.equal(queuedFrames.length, 1, 'initial game setup must start rendering');
-  socket.emitEvent('init', { food: { x: 10, y: 20 }, mode: 'arcade_v1' });
-  socket.emitEvent('init', { food: { x: 10, y: 20 }, mode: 'arcade_v2' });
-  assert.deepEqual(modes, ['classical', 'arcade_v1', 'arcade_v2']);
-  assert.deepEqual(inputModes, ['classical', 'arcade_v1', 'arcade_v2']);
+  socket.emitEvent('init', { food: { x: 10, y: 20 }, mode: 'classical' });
+  socket.emitEvent('init', { food: { x: 10, y: 20 }, mode: 'arcade' });
+  assert.deepEqual(modes, ['classical', 'classical', 'arcade']);
+  assert.deepEqual(inputModes, ['classical', 'classical', 'arcade']);
   assert.equal(gameplayStates.at(-1), true);
   assert.equal(queuedFrames.length, 1, 'repeated setup must not queue duplicate frames');
 
@@ -198,7 +198,7 @@ const vm = require('node:vm');
 
   queuedFrames.shift()(100);
   assert.equal(queuedFrames.length, 1, 'active play must continuously schedule frames');
-  assert.ok(fillRects >= 2, 'Arcade v2 renders one matte remain as a base and highlight');
+  assert.ok(fillRects >= 2, 'Arcade renders one matte remain as a base and highlight');
   assert.ok(strokes >= 1, 'nearest approaching head receives one restrained danger chevron');
   assert.deepEqual(lineTos.at(-2), [158, 108], 'danger feedback stays anchored to the newest visible local head');
   assert.deepEqual(snakeDraws.slice(-2), [
@@ -214,8 +214,8 @@ const vm = require('node:vm');
   assert.equal(directions.at(-1), 'ArrowRight', 'crossing the right seam preserves rightward steering');
 
   socket.emitEvent('death', { score: 7, focus: { x: 140, y: 120 } });
-  assert.equal(menus.at(-1).compact, true, 'Arcade v2 uses the compact spectator retry state');
-  assert.equal(elements.nameplates.hidden, false, 'Arcade v2 preserves remote nameplates and the full live board');
+  assert.equal(menus.at(-1).compact, true, 'Arcade uses the compact spectator retry state');
+  assert.equal(elements.nameplates.hidden, false, 'Arcade preserves remote nameplates and the full live board');
   assert.equal(gameplayStates.at(-1), false, 'death disables gameplay input without disabling chat');
   socket.emitEvent('b', 'valid-frame');
   assert.equal(decodeCalls, 3, 'spectators continue applying authoritative snapshots');
@@ -228,7 +228,7 @@ const vm = require('node:vm');
   ], 'local and remote bodies share smooth presentation time while local steering feedback remains immediate');
   assert.equal(rectReads, 2, 'a real viewport resize refreshes the cached canvas geometry once');
   assert.equal(nameplateMetricReads, 8, 'a viewport resize remeasures each responsive nameplate once');
-  assert.equal(queuedFrames.length, 1, 'Arcade v2 spectating continues after the particle burst');
+  assert.equal(queuedFrames.length, 1, 'Arcade spectating continues after the particle burst');
 
   particlesActive = false;
   queuedFrames.shift()(4000);
@@ -238,9 +238,9 @@ const vm = require('node:vm');
   assert.equal(menus.at(-1).finished, true, 'the 3.5 second wreckage replay resolves into retry state');
   assert.equal(queuedFrames.length, 1, 'the full board stays live after replay');
 
-  socket.emitEvent('init', { food: { x: 30, y: 40 }, mode: 'arcade_v1' });
+  socket.emitEvent('init', { food: { x: 30, y: 40 }, mode: 'classical' });
   socket.emitEvent('death', 8);
-  assert.equal(menus.at(-1).compact, false, 'Arcade v1 retains its established terminal presentation');
+  assert.equal(menus.at(-1).compact, false, 'Classical retains its established terminal presentation');
   assert.equal(elements.nameplates.hidden, true);
   assert.equal(queuedFrames.length, 1);
   particlesActive = false;
@@ -251,7 +251,7 @@ const vm = require('node:vm');
   socket.emitEvent('init', { food: { x: 30, y: 40 }, mode: 'classical' });
   assert.equal(queuedFrames.length, 1, 'rejoining after game over must restart active rendering');
 
-  console.log('render loop tests: PASS (v2 remains/bounty/danger/spectating; v1 terminal isolation)');
+  console.log('render loop tests: PASS (arcade remains/bounty/danger/spectating; classical terminal presentation)');
 })().catch((error) => {
   console.error(error.stack || error);
   process.exitCode = 1;

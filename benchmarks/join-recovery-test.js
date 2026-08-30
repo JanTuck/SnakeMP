@@ -150,9 +150,9 @@ assert.equal(button.disabled, true, 'the automatic reconnect visibly resumes joi
 assert.equal(elements.join_status.textContent, 'Reconnecting…');
 assert.equal(second.sent.filter((packet) => packet[0] === 1).length, 1, 'the identity is replayed once on the fresh socket');
 
-second.receive('["init",{"mode":"arcade_v2"}]');
+second.receive('["init",{"mode":"arcade"}]');
 assert.equal(button.disabled, false, 'init acknowledges and clears the pending state');
 assert.equal(elements.join_status.textContent, '');
 assert.equal(form.attributes.get('aria-busy'), 'false');
 
-console.log('join recovery integration test: PASS (stalled join unlocks, reconnects, and receives Arcade v2 init)');
+console.log('join recovery integration test: PASS (stalled join unlocks, reconnects, and receives Arcade init)');

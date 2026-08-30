@@ -109,16 +109,16 @@ const path = require('node:path');
   Hud.init();
   assert.equal(elements.get('hud_mode').textContent, 'Classical', 'mode received before HUD initialization must be retained');
   assert.match(elements.get('hud_board')['aria-label'], /special pickups are disabled/);
-  Hud.setMode('arcade_v1');
-  assert.equal(elements.get('hud_mode').textContent, 'Arcade v1');
-  assert.match(elements.get('hud_board')['aria-label'], /Arcade v1/);
-  Hud.setMode('arcade_v2');
-  assert.equal(elements.get('hud_mode').textContent, 'Arcade v2');
+  Hud.setMode('arcade');
+  assert.equal(elements.get('hud_mode').textContent, 'Arcade');
+  assert.match(elements.get('hud_board')['aria-label'], /Arcade/);
+  Hud.setMode('arcade');
+  assert.equal(elements.get('hud_mode').textContent, 'Arcade');
   Hud.update([
     { id: 'leader', displayName: 'Leader', score: 8, snake: [{ x: 0, y: 0 }] },
     { id: 'me', displayName: 'Me', score: 3, snake: [{ x: 16, y: 0 }] },
   ], 'me', { feastTtl: 2200, bountyId: 'leader' });
-  assert.equal(elements.get('hud_mode').textContent, 'Feast · 3s', 'feast temporarily replaces only the Arcade v2 mode label');
+  assert.equal(elements.get('hud_mode').textContent, 'Feast · 3s', 'feast temporarily replaces only the Arcade mode label');
   assert.equal(elements.get('hud_rows').children[0].classList.contains('hud-bounty'), true);
   assert.match(elements.get('hud_rows').children[0]['aria-label'], /bounty/);
   Hud.update([
@@ -127,14 +127,14 @@ const path = require('node:path');
   assert.equal(elements.get('hud_rows').children[0].children[0].textContent, 'Leader');
   assert.equal(elements.get('hud_rows').children[1].hidden, true,
     'a death roster shrink hides the vacated rank instead of retaining a duplicate survivor');
-  Hud.setMode('arcade_v1');
-  assert.equal(elements.get('hud_rows').children[0].classList.contains('hud-bounty'), false, 'Arcade v1 clears v2 bounty treatment');
+  Hud.setMode('classical');
+  assert.equal(elements.get('hud_rows').children[0].classList.contains('hud-bounty'), false, 'Classical clears Arcade bounty treatment');
 
   const originalTimeout = global.setTimeout;
   const originalClearTimeout = global.clearTimeout;
   global.setTimeout = () => 1;
   global.clearTimeout = () => {};
-  Hud.setMode('arcade_v2');
+  Hud.setMode('arcade');
   Hud.feed({ type: 'kill', killerId: 'killer-id', killer: 'Hunter', victimId: 'victim-id', who: 'Runner', streak: 3 });
   assert.equal(elements.get('hud_feed').children[0].children[1].textContent, 'Hunter cut off Runner — 3 streak');
   assert.equal(elements.get('hud_feed').children[0].className, 'hud-feed-item is-kill');

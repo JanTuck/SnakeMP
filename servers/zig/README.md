@@ -103,9 +103,8 @@ ownership rules.
   to every member.
 - Roster identity is an infrequent JSON control event; 15 Hz snapshots contain
   only scores, lengths, cell coordinates, bounded objective/remains state, and
-  TTLs. Classical and Arcade v1 omit the Arcade v2 extension entirely.
-- Lobby mode is immutable: Classical is apples-only, Arcade v1 preserves the
-  established golden-apple/supply-drop rules, and Arcade v2 adds boost,
+  TTLs. Classical omits the Arcade extension entirely.
+- Lobby mode is immutable: Classical is apples-only, and Arcade adds boost,
   remains, feasts, bounties, streaks, danger cues, and a wreckage focus.
 - Chat messages are single-line validated UTF-8 with fixed byte/scalar bounds
   and a per-connection token bucket. In every mode, a dead player may chat
