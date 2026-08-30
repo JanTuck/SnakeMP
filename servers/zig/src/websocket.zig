@@ -26,6 +26,10 @@ pub const ClientPacket = union(enum) {
     direction: model.Direction,
     visibility: bool,
     boost: bool,
+    /// Absolute steering angle as a little-endian u16 quantum, 0..65535 ->
+    /// [0, 2*pi). Absolute (not delta) so coalesced/late packets can never
+    /// point the wrong way (design §2.5).
+    steer: u16,
     chat: []const u8,
 };
 
@@ -164,6 +168,9 @@ pub fn clientPacket(payload: []const u8) ?ClientPacket {
         // no redundant length byte. Validation keeps the returned slice
         // borrowed from the unmasked input buffer.
         5 => if (chatMessage(payload[1..])) |message| .{ .chat = message } else null,
+        // Steer is exactly three bytes: type plus a little-endian absolute
+        // angle. Truncated or trailing bytes are rejected like every packet.
+        6 => if (payload.len == 3) .{ .steer = std.mem.readInt(u16, payload[1..3], .little) } else null,
         else => null,
     };
 }
@@ -241,6 +248,15 @@ test "boost packets are exact held state" {
     try std.testing.expect(clientPacket(&.{ 4, 0, 0 }) == null);
     try std.testing.expect(clientPacket(&.{ 4, 2 }) == null);
     try std.testing.expect(clientPacket(&.{ 4, 255 }) == null);
+}
+
+test "steer packets are exactly three bytes with a little-endian absolute angle" {
+    try std.testing.expectEqual(@as(u16, 0), clientPacket(&.{ 6, 0, 0 }).?.steer);
+    try std.testing.expectEqual(@as(u16, 0x1234), clientPacket(&.{ 6, 0x34, 0x12 }).?.steer);
+    try std.testing.expectEqual(@as(u16, 0xFFFF), clientPacket(&.{ 6, 0xFF, 0xFF }).?.steer);
+    try std.testing.expect(clientPacket(&.{6}) == null);
+    try std.testing.expect(clientPacket(&.{ 6, 0 }) == null);
+    try std.testing.expect(clientPacket(&.{ 6, 0, 0, 0 }) == null);
 }
 
 test "chat packets trim spaces and retain borrowed Unicode payloads" {

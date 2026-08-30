@@ -22,6 +22,7 @@ const stats_json = @import("stats.zig");
 const text = @import("text.zig");
 const websocket = @import("websocket.zig");
 const worker_balance = @import("worker_balance.zig");
+const snek = @import("snek.zig");
 
 const Allocator = std.mem.Allocator;
 const Buf = json.Buf;
@@ -80,6 +81,10 @@ const BOOST_COST_TICKS = config.BOOST_COST_TICKS;
 const BOOST_MIN_CELLS = config.BOOST_MIN_CELLS;
 const SPECTATE_FOCUS_MS = config.SPECTATE_FOCUS_MS;
 const BOUNTY_MIN_SCORE = config.BOUNTY_MIN_SCORE;
+const TICK_NS_IO = config.TICK_NS_IO;
+const DEFAULT_SNEK_IO_MAX_PLAYERS_PER_LOBBY = config.DEFAULT_SNEK_IO_MAX_PLAYERS_PER_LOBBY;
+const DEFAULT_SNEK_IO_FOOD_TARGET = config.DEFAULT_SNEK_IO_FOOD_TARGET;
+const DEFAULT_SNEK_IO_MAX_FOOD = config.DEFAULT_SNEK_IO_MAX_FOOD;
 const PING_INTERVAL_MS = config.PING_INTERVAL_MS;
 const PING_TIMEOUT_MS = config.PING_TIMEOUT_MS;
 const ERR_INVALID_USERNAME = config.ERR_INVALID_USERNAME;
@@ -109,6 +114,17 @@ var rng_prng: std.Random.DefaultPrng = undefined;
 var lobbies: std.StringArrayHashMapUnmanaged(*Lobby) = .empty;
 var max_players_global: usize = DEFAULT_MAX_PLAYERS_GLOBAL;
 var max_players_per_lobby: usize = DEFAULT_MAX_PLAYERS_PER_LOBBY;
+/// Snek IO mode capacity (design §2.4): overrides max_players_per_lobby for
+/// snek_io lobbies so a continuous arena can host its full protocol-sized
+/// roster. The process-wide SNEK_MAX_PLAYERS cap still gates retained
+/// identities globally.
+var snek_io_max_players: usize = DEFAULT_SNEK_IO_MAX_PLAYERS_PER_LOBBY;
+/// Snek IO ambient food population and hard cap (design §2.10); the sim
+/// clamps both to its fixed arrays at init.
+var snek_io_food_target: usize = DEFAULT_SNEK_IO_FOOD_TARGET;
+var snek_io_max_food: usize = DEFAULT_SNEK_IO_MAX_FOOD;
+/// Snek IO tick period (30 Hz default); the worker cadence slice consumes it.
+var snek_tick_ns: u64 = TICK_NS_IO;
 var max_lobbies: usize = DEFAULT_MAX_LOBBIES;
 var lobbies_per_worker: usize = DEFAULT_LOBBIES_PER_WORKER;
 var lobby_idle_delete_ms: i64 = DEFAULT_LOBBY_IDLE_DELETE_MS;
@@ -1425,6 +1441,9 @@ fn deactivateEmptyLobbies() void {
 fn destroyLobby(l: *Lobby) void {
     unassignGameWorker(l);
     while (l.spectators.items.len > 0) evictSpectatorLocked(l, l.spectators.items.len - 1);
+    // The Snek IO sim is one process-allocator allocation, released alongside
+    // the lobby's other galloc-owned arrays before the struct itself.
+    if (l.snek) |sim| snek.Snek.deinit(galloc, sim);
     l.drops.deinit(galloc);
     l.bonus.deinit(galloc);
     l.remains.deinit(galloc);
@@ -1476,6 +1495,7 @@ fn parseGameMode(raw: ?[]const u8, legacy_classical: bool) ?model.GameMode {
     if (raw) |value| {
         if (std.mem.eql(u8, value, "classical")) return .classical;
         if (std.mem.eql(u8, value, "arcade")) return .arcade;
+        if (std.mem.eql(u8, value, "snek_io")) return .snek_io; // the only spelling
     }
     return if (raw == null) (if (legacy_classical) .classical else .arcade) else null;
 }
@@ -1487,10 +1507,14 @@ fn parsePublicTarget(raw: ?[]const u8) ?u8 {
     return null;
 }
 
-fn parseLobbyCapacity(raw: ?[]const u8) ?u8 {
+fn parseLobbyCapacity(raw: ?[]const u8, mode: model.GameMode) ?u8 {
     const value = raw orelse return 16;
     if (value.len == 0 or std.mem.eql(u8, value, "16")) return 16;
     if (std.mem.eql(u8, value, "32")) return 32;
+    // Snek IO lobbies additionally accept their full mode capacity, clamped by
+    // the mode cap (default 100; design §2.4). Unknown values still reject.
+    if (mode == .snek_io and std.mem.eql(u8, value, "100"))
+        return @intCast(@min(@as(usize, 100), snek_io_max_players));
     return null;
 }
 
@@ -1507,21 +1531,38 @@ fn createLobbyLocked(id: []u8, password: []const u8, mode: model.GameMode, publi
     const seed = rng_prng.random().int(u64);
     var password_salt: [16]u8 = undefined;
     rng_prng.random().bytes(&password_salt);
-    const lobby_capacity: u8 = @intCast(@min(@as(usize, requested_capacity), max_players_per_lobby));
+    // Snek IO rooms use their own mode capacity (default 100) instead of the
+    // grid per-lobby cap and are always toroidal (design §1.5, §2.4).
+    const mode_capacity: usize = if (mode == .snek_io) snek_io_max_players else max_players_per_lobby;
+    const lobby_capacity: u8 = @intCast(@min(@as(usize, requested_capacity), mode_capacity));
     l.* = .{
         .id = id,
         .password_salt = password_salt,
         .password_hash = if (password.len == 0) @splat(0) else hashPassword(&password_salt, password),
         .password_protected = password.len != 0,
-        .public_target = if (password.len == 0) @min(public_target, lobby_capacity) else 0,
+        // Snek IO advertises its full capacity when public, so Quick Join
+        // lists the room until it is full (design §2.4).
+        .public_target = if (password.len == 0 and mode == .snek_io)
+            lobby_capacity
+        else if (password.len == 0)
+            @min(public_target, lobby_capacity)
+        else
+            0,
         .max_players = lobby_capacity,
         .mode = mode,
-        .wrap_walls = wrap_walls,
+        .wrap_walls = wrap_walls or mode == .snek_io,
         .food = undefined,
     };
     l.rng = std.Random.DefaultPrng.init(seed);
     errdefer l.remains.deinit(galloc);
     errdefer l.spectators.deinit(galloc);
+    if (mode == .snek_io) {
+        // Preallocate the whole fixed-size Snek IO sim exactly once, seeded
+        // from the lobby rng so ambient food placement is reproducible.
+        var sim_rng = l.rng.random();
+        l.snek = try snek.Snek.init(galloc, snek_io_food_target, snek_io_max_food, &sim_rng);
+        errdefer snek.Snek.deinit(galloc, l.snek.?);
+    }
     // These are hard protocol/lifecycle caps. Reserving once keeps death,
     // boost shedding, and spectator retention allocation-free in game ticks.
     try l.remains.ensureTotalCapacityPrecise(galloc, model.MAX_REMAINS);
@@ -1910,6 +1951,20 @@ fn handleVisibility(c: *Conn, visible: bool) void {
     }
 }
 
+/// Packet-4 boost gate. Design §2.2 documents this as the ONLY packet-gate
+/// widening for Snek IO: arcade and snek_io accept held boost; classical has
+/// no boost rule; spectators never boost in any mode. The caller holds the
+/// lobby mutex.
+fn lobbyAcceptsBoost(l: *const Lobby, c: *const Conn) bool {
+    return !l.mode.isClassical() and spectatorIndex(l, c) == null;
+}
+
+/// Packet-6 steer gate: steering is a snek_io-only input, stored only for
+/// active players (spectators do not steer). The caller holds the lobby mutex.
+fn lobbyAcceptsSteer(l: *const Lobby, c: *const Conn) bool {
+    return l.mode == .snek_io and spectatorIndex(l, c) == null;
+}
+
 fn handleBoost(c: *Conn, held: bool) void {
     c.membership_mutex.lockUncancelable(g_io);
     const lobby = c.lobby;
@@ -1917,12 +1972,28 @@ fn handleBoost(c: *Conn, held: bool) void {
     const l = lobby orelse return;
     l.mutex.lockUncancelable(g_io);
     defer l.mutex.unlock(g_io);
-    if (!l.mode.isArcade() or spectatorIndex(l, c) != null) return;
+    if (!lobbyAcceptsBoost(l, c)) return;
     const player = if (c.lobby == l) c.player else null;
     if (player) |p| {
         p.boosting = held;
         if (!held) p.boost_substep = false;
     }
+}
+
+/// Store the latest absolute steer angle (packet 6) in the single latest-wins
+/// slot on the connection; the Snek IO tick slice applies it to the sim
+/// snake's target_angle at its own cadence (design §2.5). Rate capping
+/// (<= 60/s) is unnecessary with one slot: every packet that arrives replaces
+/// the previous value and is never queued.
+fn handleSteer(c: *Conn, angle: u16) void {
+    c.membership_mutex.lockUncancelable(g_io);
+    const lobby = c.lobby;
+    c.membership_mutex.unlock(g_io);
+    const l = lobby orelse return;
+    l.mutex.lockUncancelable(g_io);
+    defer l.mutex.unlock(g_io);
+    if (!lobbyAcceptsSteer(l, c) or c.lobby != l) return;
+    c.steer_angle = angle;
 }
 
 fn refillChatBucket(tokens: *u8, last_refill_ms: *i64, now: i64, capacity: u8, refill_ms: i64) void {
@@ -2345,6 +2416,18 @@ fn simulateArcadeLocked(l: *Lobby, now: i64, aa: Allocator) void {
 
 // ------------------------------------------------------------------ tick
 
+/// Slice-B seam for Snek IO: the real tick pipeline — apply steer
+/// (Conn.steer_angle -> snek.Snake.target_angle), movement/sampling/growth/
+/// boost burn, one @memset hash rebuild, kill resolution, death bursts, food
+/// pickups, and the SI snapshot broadcast (design §2.1) — is a later slice.
+/// Until it lands, each snek_io tick is a safe no-op: the Snek sim stays
+/// frozen, nothing is scheduled, and no grid game logic ever touches sim
+/// state. Membership, roster, snapshot, and stats accounting below still run,
+/// so the lobby remains fully consistent between slices.
+fn snekTickStub(l: *Lobby) void {
+    _ = l;
+}
+
 fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
     const t0 = monoNanos();
 
@@ -2378,6 +2461,14 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
         expireArcadeLocked(l, now);
         scheduleFeastLocked(l, now, aa);
         simulateArcadeLocked(l, now, aa);
+    } else if (l.mode == .snek_io) {
+        // Snek IO never runs the grid game paths: its snakes live in
+        // Lobby.snek (snek.zig), not Player.snake cells, and every arcade
+        // objective site in this function is gated by l.mode.isArcade() —
+        // the scheduling block above and the pickup loop below — so nothing
+        // arcs for snek_io. The sim pipeline itself is the slice-B seam;
+        // until it lands, tick as a safe no-op (see snekTickStub).
+        snekTickStub(l);
     } else {
         // Classical retains its established single-step order:
         // collision at tick start, pickup at the current head, then movement.
@@ -2869,12 +2960,12 @@ fn routeAndRespond(c: *Conn, aa: Allocator, method: []const u8, target: []const 
                 });
             };
             const capacity_value = if (body.len > 0) extractFormField(aa, body, "capacity") else null;
-            const capacity = parseLobbyCapacity(capacity_value) orelse {
+            const capacity = parseLobbyCapacity(capacity_value, mode) orelse {
                 return sendResponse(c, aa, .{
                     .status = 400,
                     .reason = "Bad Request",
                     .ctype = "text/plain; charset=utf-8",
-                    .body = "Lobby capacity must be 16 or 32",
+                    .body = "Lobby capacity must be 16 or 32 (100 for snek_io)",
                     .keep_alive = keep_alive,
                 });
             };
@@ -3012,6 +3103,7 @@ fn handleRawBinary(c: *Conn, aa: Allocator, payload: []const u8) void {
         .direction => |direction| handleKeyPress(c, direction),
         .visibility => |visible| handleVisibility(c, visible),
         .boost => |held| handleBoost(c, held),
+        .steer => |angle| handleSteer(c, angle),
         .chat => |message| handleChat(c, message, aa),
     }
 }
@@ -3464,6 +3556,17 @@ pub fn main(init: std.process.Init) !void {
     lobbies_per_worker = envUsize(init.minimal.environ, "SNEK_LOBBIES_PER_WORKER", DEFAULT_LOBBIES_PER_WORKER, 10_000);
     lobby_idle_delete_ms = @intCast(envUsize(init.minimal.environ, "SNEK_LOBBY_IDLE_MS", @intCast(DEFAULT_LOBBY_IDLE_DELETE_MS), 24 * 60 * 60 * 1000));
 
+    // Snek IO knobs (design §2.10), clamped to protocol bounds: the mode
+    // capacity fits the SI frame's 7-bit player count (<= 127), food bounds
+    // stay far under the u16 wire quantum (<= 65535) and are kept target <=
+    // max, and the tick period must stay nonzero. Snek.init re-clamps food
+    // bounds to its fixed arrays as defense in depth.
+    snek_io_max_players = envUsize(init.minimal.environ, "SNEK_IO_MAX_PLAYERS_PER_LOBBY", DEFAULT_SNEK_IO_MAX_PLAYERS_PER_LOBBY, 127);
+    snek_io_food_target = envUsize(init.minimal.environ, "SNEK_IO_FOOD_TARGET", DEFAULT_SNEK_IO_FOOD_TARGET, 65_535);
+    snek_io_max_food = envUsize(init.minimal.environ, "SNEK_IO_MAX_FOOD", DEFAULT_SNEK_IO_MAX_FOOD, 65_535);
+    snek_io_food_target = @min(snek_io_food_target, snek_io_max_food);
+    snek_tick_ns = @intCast(envUsize(init.minimal.environ, "SNEK_TICK_NS", TICK_NS_IO, std.math.maxInt(u64)));
+
     start_ms = unixMillis();
     const seed: u64 = @bitCast(monoNanos());
     rng_prng = std.Random.DefaultPrng.init(seed ^ @as(u64, @intCast(std.os.linux.getpid())));
@@ -3881,6 +3984,51 @@ test "classical lobby ticks never schedule special pickups" {
     try std.testing.expectEqual(@as(i64, 1), lobby.next_golden_at);
 }
 
+test "snek_io lobby ticks are a safe no-op until the sim pipeline slice lands" {
+    galloc = std.testing.allocator;
+    g_io = std.testing.io;
+    defer drainSnapshotPool();
+
+    // A real sim with a live snake: if any grid path ran, the sim or the
+    // snake would be mutated and arcade objectives would spawn.
+    var sim_rng_prng = std.Random.DefaultPrng.init(0x5EED);
+    var sim_rng = sim_rng_prng.random();
+    const sim = try snek.Snek.init(galloc, 64, snek.MAX_FOOD, &sim_rng);
+    defer snek.Snek.deinit(sim, galloc);
+    const snake = sim.spawnSnake(0, &sim_rng);
+    const food_count_before = sim.food.count;
+
+    var lobby = Lobby{
+        .id = @constCast("snek-io"),
+        .mode = .snek_io,
+        .snek = sim,
+        .food = .{ .x = 0, .y = 0 },
+        // Arcade objective timers armed: a leak into the arcade path would
+        // spawn pickups immediately.
+        .next_drop_at = 1,
+        .next_golden_at = 1,
+    };
+    lobby.rng = std.Random.DefaultPrng.init(42);
+    defer lobby.drops.deinit(galloc);
+    defer lobby.bonus.deinit(galloc);
+    defer lobby.roster_wire.deinit(galloc);
+    defer lobby.players.deinit(galloc);
+    defer lobby.spectators.deinit(galloc);
+    defer lobby.remains.deinit(galloc);
+
+    for (0..8) |index| tickLobby(&lobby, 100_000 + @as(i64, @intCast(index)), std.testing.allocator);
+
+    // No arcade objective scheduling ran for snek_io...
+    try std.testing.expectEqual(@as(usize, 0), lobby.drops.items.len);
+    try std.testing.expectEqual(@as(usize, 0), lobby.bonus.items.len);
+    try std.testing.expectEqual(@as(?model.Golden, null), lobby.golden);
+    // ...and the Snek sim is untouched: same ambient food, snake alive,
+    // spatial hash never rebuilt.
+    try std.testing.expectEqual(food_count_before, sim.food.count);
+    try std.testing.expect(snake.alive);
+    try std.testing.expectEqual(@as(usize, 0), sim.hash.node_top);
+}
+
 test "keypress queues a turn for the current lobby membership" {
     g_io = std.testing.io;
     var connection = Conn{ .fd = -1 };
@@ -4142,11 +4290,16 @@ test "head-to-head and mutual body collisions kill every attacker simultaneously
     try std.testing.expect(deaths[0] and deaths[1]);
 }
 
-test "mode parsing defaults to arcade and rejects legacy and unknown values" {
+test "mode parsing defaults to arcade accepts snek_io and rejects legacy spellings" {
     try std.testing.expectEqual(model.GameMode.arcade, parseGameMode(null, false).?);
     try std.testing.expectEqual(model.GameMode.classical, parseGameMode(null, true).?);
     try std.testing.expectEqual(model.GameMode.classical, parseGameMode("classical", false).?);
     try std.testing.expectEqual(model.GameMode.arcade, parseGameMode("arcade", false).?);
+    // "snek_io" is the only accepted spelling (design §2.2).
+    try std.testing.expectEqual(model.GameMode.snek_io, parseGameMode("snek_io", false).?);
+    try std.testing.expect(parseGameMode("snek", false) == null);
+    try std.testing.expect(parseGameMode("snekio", false) == null);
+    try std.testing.expect(parseGameMode("snek-io", false) == null);
     try std.testing.expect(parseGameMode("arcade-v1", false) == null);
     try std.testing.expect(parseGameMode("arcade_v2", false) == null);
     try std.testing.expect(parseGameMode("future-mode", false) == null);
@@ -4173,12 +4326,54 @@ test "public Quick Join target is private by default and strictly bounded" {
 test "lobby capacity defaults to 16 and accepts only supported sizes" {
     try std.testing.expectEqual(binary_snapshot.MAX_PLAYERS, DEFAULT_MAX_PLAYERS_GLOBAL);
     try std.testing.expectEqual(binary_snapshot.MAX_PLAYERS, DEFAULT_MAX_PLAYERS_PER_LOBBY);
-    try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity(null));
-    try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity(""));
-    try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity("16"));
-    try std.testing.expectEqual(@as(?u8, 32), parseLobbyCapacity("32"));
-    try std.testing.expect(parseLobbyCapacity("2") == null);
-    try std.testing.expect(parseLobbyCapacity("64") == null);
+    try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity(null, .classical));
+    try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity("", .arcade));
+    try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity("16", .classical));
+    try std.testing.expectEqual(@as(?u8, 32), parseLobbyCapacity("32", .arcade));
+    try std.testing.expect(parseLobbyCapacity("2", .arcade) == null);
+    try std.testing.expect(parseLobbyCapacity("64", .classical) == null);
+    // Snek IO lobbies additionally accept their full mode capacity (default
+    // 100, clamped by the mode cap); grid modes keep rejecting it, and snek_io
+    // still rejects unknown values (design §2.4).
+    try std.testing.expectEqual(@as(?u8, 100), parseLobbyCapacity("100", .snek_io));
+    try std.testing.expect(parseLobbyCapacity("100", .arcade) == null);
+    try std.testing.expect(parseLobbyCapacity("100", .classical) == null);
+    try std.testing.expect(parseLobbyCapacity("64", .snek_io) == null);
+    try std.testing.expect(parseLobbyCapacity("2", .snek_io) == null);
+    try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity(null, .snek_io));
+}
+
+test "packet gates follow the mode matrix" {
+    galloc = std.testing.allocator;
+    var connection = Conn{ .fd = -1 };
+    var lobby = Lobby{ .id = @constCast("gate-matrix"), .food = .{ .x = 0, .y = 0 } };
+    defer lobby.spectators.deinit(galloc);
+
+    // Boost (packet 4): only classical rejects; arcade and snek_io accept.
+    try std.testing.expect(lobbyAcceptsBoost(&lobby, &connection)); // arcade default
+    lobby.mode = .snek_io;
+    try std.testing.expect(lobbyAcceptsBoost(&lobby, &connection));
+    lobby.mode = .classical;
+    try std.testing.expect(!lobbyAcceptsBoost(&lobby, &connection));
+
+    // Steer (packet 6): snek_io only; classical and arcade reject.
+    try std.testing.expect(!lobbyAcceptsSteer(&lobby, &connection));
+    lobby.mode = .arcade;
+    try std.testing.expect(!lobbyAcceptsSteer(&lobby, &connection));
+    lobby.mode = .snek_io;
+    try std.testing.expect(lobbyAcceptsSteer(&lobby, &connection));
+
+    // The spectator exclusion is unchanged: retained members never boost or
+    // steer in any mode.
+    try lobby.spectators.append(galloc, &connection);
+    lobby.mode = .arcade;
+    try std.testing.expect(!lobbyAcceptsBoost(&lobby, &connection));
+    lobby.mode = .snek_io;
+    try std.testing.expect(!lobbyAcceptsBoost(&lobby, &connection));
+    try std.testing.expect(!lobbyAcceptsSteer(&lobby, &connection));
+    lobby.mode = .classical;
+    try std.testing.expect(!lobbyAcceptsBoost(&lobby, &connection));
+    try std.testing.expect(!lobbyAcceptsSteer(&lobby, &connection));
 }
 
 test "public landing status JSON is compact exact and bounded" {

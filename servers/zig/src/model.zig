@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const posix = std.posix;
+const snek = @import("snek.zig");
 
 pub const CELL: i32 = 16;
 pub const SID_LEN = 22;
@@ -19,15 +20,19 @@ pub const LOBBY_CHAT_REFILL_MS: i64 = 250;
 
 /// Lobby rules are fixed when the lobby is created. Classical is apples-only;
 /// Arcade adds golden apples, supply drops, boost, remains, feasts, and
-/// bounties. The mode never changes for the lifetime of a lobby.
+/// bounties; Snek IO is the continuous battle arena simulated in snek.zig.
+/// The mode never changes for the lifetime of a lobby.
 pub const GameMode = enum(u8) {
     classical = 0,
     arcade = 1,
+    snek_io = 2,
 
+    /// The only wire spelling for each mode; "snek_io" has no aliases.
     pub fn wireName(mode: GameMode) []const u8 {
         return switch (mode) {
             .classical => "classical",
             .arcade => "arcade",
+            .snek_io => "snek_io",
         };
     }
 
@@ -38,6 +43,8 @@ pub const GameMode = enum(u8) {
     pub fn isArcade(mode: GameMode) bool {
         return mode == .arcade;
     }
+    // Snek IO is neither classical nor arcade; isClassical/isArcade above stay
+    // strict and call sites that want continuous-mode behavior compare == .snek_io.
 };
 
 pub const Direction = enum { up, down, left, right };
@@ -158,13 +165,20 @@ test "growth allocation failure leaves movement state unchanged" {
     try std.testing.expectEqualSlices(CellPos, &.{.{ .x = CELL, .y = CELL }}, player.snake.items);
 }
 
-test "game modes expose distinct classical and arcade behavior" {
+test "game modes expose distinct classical arcade and snek_io behavior" {
+    // classical / arcade remain strictly themselves; snek_io is neither.
     try std.testing.expect(GameMode.classical.isClassical());
     try std.testing.expect(!GameMode.classical.isArcade());
     try std.testing.expect(!GameMode.arcade.isClassical());
     try std.testing.expect(GameMode.arcade.isArcade());
+    try std.testing.expect(!GameMode.snek_io.isClassical());
+    try std.testing.expect(!GameMode.snek_io.isArcade());
+    try std.testing.expect(GameMode.arcade != GameMode.snek_io);
+    try std.testing.expect(GameMode.classical != GameMode.snek_io);
     try std.testing.expectEqualStrings("classical", GameMode.classical.wireName());
     try std.testing.expectEqualStrings("arcade", GameMode.arcade.wireName());
+    try std.testing.expectEqualStrings("snek_io", GameMode.snek_io.wireName());
+    try std.testing.expect(@intFromEnum(GameMode.snek_io) == 2);
 }
 
 test "tail shedding preserves the configured minimum length" {
@@ -272,6 +286,10 @@ pub const Lobby = struct {
     /// The creator fixes this for the lobby lifetime. Classical must be
     /// explicit; Arcade is the default mode for new lobbies.
     mode: GameMode = .arcade,
+    /// Snek IO simulation state, allocated only for snek_io lobbies in
+    /// main.createLobbyLocked and freed by main.destroyLobby. Null for
+    /// classical/arcade lobbies, which pay zero cost for the snek module.
+    snek: ?*snek.Snek = null,
     /// Optional arena rule chosen by the lobby creator. Crossing any edge
     /// re-enters on the opposite edge instead of counting as a wall death.
     wrap_walls: bool = false,
@@ -344,6 +362,10 @@ pub const Conn = struct {
     /// Visibility affects snapshot delivery only. The lobby worker continues
     /// to simulate this player's snake at the normal authoritative tick rate.
     snapshot_hidden: std.atomic.Value(bool) = .init(false),
+    /// Latest absolute Snek IO steer angle (packet 6) in u16 quantum,
+    /// 0..65535 -> [0, 2*pi) when the tick slice applies it. Single
+    /// latest-wins slot: bursts coalesce and are never queued (design §2.5).
+    steer_angle: ?u16 = null,
     snapshot_needs_keyframe: std.atomic.Value(bool) = .init(false),
     next_background_snapshot_ms: std.atomic.Value(i64) = .init(0),
     player: ?*Player = null,

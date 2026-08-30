@@ -9,6 +9,9 @@ pub const GRID_W: i32 = 2048;
 pub const GRID_H: i32 = 1152;
 pub const MAX_CELLS: usize = @intCast(GRID_COLS * GRID_ROWS);
 pub const TICK_NS: u64 = 66_666_667;
+/// Snek IO ticks at 30 Hz (design §1.1, §2.3). Accepted as the default for
+/// the SNEK_TICK_NS env override; grid lobbies keep TICK_NS.
+pub const TICK_NS_IO: u64 = 33_333_333;
 /// Hidden browser tabs still receive an authoritative keyframe often enough
 /// to stay warm without paying the foreground 15 Hz fan-out cost.
 pub const BACKGROUND_SNAPSHOT_MS: i64 = 1_000;
@@ -20,6 +23,14 @@ pub const DEFAULT_MAX_PLAYERS_PER_LOBBY: usize = 32;
 /// Includes the permanent default lobby. Empty generated lobbies are cheap,
 /// but still retain ids, maps, and debug-metric rows until their idle TTL.
 pub const DEFAULT_MAX_LOBBIES: usize = 4096;
+/// Snek IO operational defaults (design §2.10). SNEK_IO_MAX_PLAYERS_PER_LOBBY
+/// overrides the mode capacity in createLobbyLocked; the food knobs bound the
+/// ambient population of a snek_io sim; SNEK_TICK_NS sets its tick period.
+/// The process-wide SNEK_MAX_PLAYERS cap independently gates retained
+/// identities, so a full 100-player lobby needs SNEK_MAX_PLAYERS >= 100.
+pub const DEFAULT_SNEK_IO_MAX_PLAYERS_PER_LOBBY: usize = 100;
+pub const DEFAULT_SNEK_IO_FOOD_TARGET: usize = 5000;
+pub const DEFAULT_SNEK_IO_MAX_FOOD: usize = 8000;
 pub const LOBBIES_PER_WORKER: usize = 128;
 pub const GAME_WORKER_STACK: usize = 128 * 1024;
 /// Keep newly created rooms available while their creator is still sharing the
