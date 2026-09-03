@@ -30,10 +30,25 @@ function collectModuleGraph(entry) {
 }
 
 const graph = collectModuleGraph(path.join(clientRoot, 'js/rendering.js'));
-assert.strictEqual(graph.size, 10, 'rendering module graph changed; update the production asset expectation deliberately');
+assert.strictEqual(graph.size, 12, 'rendering module graph changed; update the production asset expectation deliberately');
 for (const filename of graph) {
   const route = '/' + path.relative(clientRoot, filename).split(path.sep).join('/');
   assert(manifest.includes(`.path = "${route}"`), `browser dependency is not embedded: ${route}`);
+}
+for (const route of [
+  '/img/landing-arena.png',
+  '/img/mode-classical.png', '/img/mode-arcade.png', '/img/mode-io.png',
+  '/img/classic-green-head.png', '/img/classic-green-body.png', '/img/classic-green-tail.png',
+  '/img/io-360-head.png', '/img/io-360-body.png', '/img/io-360-tail.png', '/img/io-360-boost-ring.png',
+  '/img/io/apple.png', '/img/io/strawberry.png', '/img/io/cheese.png', '/img/io/donut.png',
+  '/img/io/golden-apple.png', '/img/io/lightning-berry.png', '/img/io/rainbow-candy.png', '/img/io/feast-platter.png',
+  '/img/io/crate.png', '/img/io/spike-mine.png',
+  '/fonts/montserrat-black.otf', '/fonts/OFL-Montserrat.txt',
+]) {
+  assert(manifest.includes(`.path = "${route}"`), `generated mode artwork is not embedded: ${route}`);
+}
+for (const route of ['/img/io/rocks.png', '/img/io/thorn-hedge.png']) {
+  assert(!manifest.includes(`.path = "${route}"`), `removed IO obstacle artwork must not ship: ${route}`);
 }
 
 const startupScripts = new Set([
@@ -58,6 +73,8 @@ for (const [relative, route] of removed) {
 }
 
 const rendering = fs.readFileSync(path.join(clientRoot, 'js/rendering.js'), 'utf8');
+const sprites = fs.readFileSync(path.join(clientRoot, 'js/sprites.js'), 'utf8');
+const snake = fs.readFileSync(path.join(clientRoot, 'js/snake.js'), 'utf8');
 const gameOverMenu = fs.readFileSync(path.join(clientRoot, 'js/menu/gameOverMenu.js'), 'utf8');
 assert(!/\b(?:Food|ResourceHandler)\b/.test(rendering), 'rendering still depends on obsolete wrapper classes');
 assert.strictEqual(
@@ -68,6 +85,13 @@ assert.strictEqual(
 assert(!/swords\.png/.test(fs.readFileSync(path.join(clientRoot, 'img/CREDITS.md'), 'utf8')), 'removed image remains in credits');
 assert(!/gsap/i.test(fs.readFileSync(path.join(clientRoot, 'game.html'), 'utf8')), 'game page still loads GSAP');
 assert(!/window\.gsap/.test(rendering), 'rendering still depends on GSAP');
+assert(/snakeStyleIndex\(meta\[2\], meta\[0\]\)/.test(rendering),
+  'IO appearance must come from stable roster identity, never roster position');
+assert(!/getIo\?\.\('io(?:Body|Tail|Head)', playerIndex\)/.test(rendering),
+  'IO sprite variants must not change when bots reorder the roster');
+assert(/new Array\(IO_STYLE_COLORS\.length\)/.test(sprites) && /IO_STYLE_COLORS\.length === 6|IO_STYLE_COLORS = \[/.test(sprites),
+  'IO skin cache must remain bounded to the small appearance palette');
+assert(/export function snakeStyleIndex/.test(snake), 'grid and IO renderers must share the stable style resolver');
 assert(!/window\.gsap/.test(fs.readFileSync(path.join(clientRoot, 'js/hud.js'), 'utf8')), 'HUD still depends on GSAP');
 assert(/overlay\.setAttribute\("role", "region"\)/.test(gameOverMenu),
   'game over must remain a non-modal region so Chat and Retry are keyboard peers');
@@ -93,6 +117,8 @@ assert(/\.game-chat:not\(\.is-open\) \.chat-open[\s\S]*display: block;/.test(cha
   'the Chat control must remain visible and clickable during active play');
 assert(/\.hud-rows li\[hidden\]\s*\{\s*display:\s*none\s*!important;\s*\}/.test(gameCss),
   'HUD row display rules must not override hidden rows after a player dies');
+assert(/canvas\.io-arena\s*\{[^}]*touch-action:\s*none;/.test(gameCss),
+  'IO drag steering must opt out of browser pan/zoom gesture cancellation');
 assert(!/\.innerHTML\b|insertAdjacentHTML|document\.write/.test(chat), 'chat must only render untrusted text through DOM text nodes');
 assert(/\.textContent = name;/.test(chat) && /\.textContent = text;/.test(chat), 'chat names and messages must use textContent');
 
