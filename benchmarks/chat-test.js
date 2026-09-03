@@ -131,8 +131,8 @@ socket.fire('r', [
   ['p2', 'Bea', '#78dce8'],
   ['p1', 'Ada', '#78dce8'],
 ]);
-socket.fire('chat', { id: 'p1', who: 'spoofed', color: '#000000', text: '<b>hello</b>' });
-socket.fire('chat', { id: 'p2', who: 'spoofed', color: '#000000', text: 'hi' });
+socket.fire('chat', { id: 'p1', who: 'spoofed', color: '#090d0b', text: '<b>hello</b>' });
+socket.fire('chat', { id: 'p2', who: 'spoofed', color: '#090d0b', text: 'hi' });
 assert.equal(history.children[0].children[0].textContent, 'Ada', 'active roster name defeats payload spoofing');
 assert.equal(history.children[0].children[2].textContent, '<b>hello</b>', 'message is literal text, not markup');
 assert.notEqual(
@@ -141,8 +141,16 @@ assert.notEqual(
   'duplicate supplied colors get distinct deterministic active-roster fallbacks',
 );
 
+const ioRoster = Array.from({ length: 55 }, (_, index) => [
+  `io-${index}`, `Player ${index}`, index === 54 ? '#ffd866' : '#78dce8',
+]);
+socket.fire('r', ioRoster);
+socket.fire('chat', { id: 'io-54', who: 'spoofed', color: '#090d0b', text: 'full room hello' });
+assert.equal(history.children.at(-1).children[0].textContent, 'Player 54',
+  'a fluctuating 55-player IO roster retains authoritative chat identity mapping');
+
 for (let index = 0; index < 100; index++) {
-  socket.fire('chat', { id: 'p1', text: `message ${index}` });
+  socket.fire('chat', { id: 'io-1', text: `message ${index}` });
 }
 assert.equal(history.children.length, 100, 'session history evicts beyond its 100-message bound');
 assert.equal(activeTimers.size, 200, 'evicted messages release both visibility timers');
@@ -157,9 +165,9 @@ assert.equal(document.activeElement, input);
 assert.equal(keyEvent.defaultPrevented, true);
 assert.equal(animationFrames.length, 1, 'opening chat schedules one scroll to the latest history');
 animationFrames.shift()();
-socket.fire('chat', { id: 'p1', text: 'burst one' });
-socket.fire('chat', { id: 'p1', text: 'burst two' });
-socket.fire('chat', { id: 'p1', text: 'burst three' });
+socket.fire('chat', { id: 'io-1', text: 'burst one' });
+socket.fire('chat', { id: 'io-1', text: 'burst two' });
+socket.fire('chat', { id: 'io-1', text: 'burst three' });
 assert.equal(animationFrames.length, 1, 'a message burst coalesces history scrolling into one animation frame');
 animationFrames.shift()();
 
@@ -181,6 +189,10 @@ assert.equal(root.classList.contains('is-open'), false);
 
 socket.fire('death');
 assert.equal(root.classList.contains('is-game-over'), true);
+assert.match(document.elements.chat_status.textContent, /wait/i);
+socket.fire('init', {});
+assert.equal(root.classList.contains('is-game-over'), false, 'rejoin clears the dead-chat presentation');
+assert.equal(document.elements.chat_status.textContent, '', 'rejoin clears stale waiting instructions');
 const retry = element(document, 'button');
 const tShortcut = {
   key: 't', code: 'KeyT', target: retry, defaultPrevented: false,
