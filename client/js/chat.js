@@ -4,6 +4,7 @@
     'use strict';
 
     const MAX_HISTORY = 100;
+    const MAX_PLAYERS = 100;
     const MAX_SCALARS = 96;
     const MAX_BYTES = 160;
     const FADE_AFTER_MS = 8500;
@@ -61,7 +62,7 @@
     }
 
     function reconcileRoster(nextRoster) {
-        if (!Array.isArray(nextRoster) || nextRoster.length > 32) return;
+        if (!Array.isArray(nextRoster) || nextRoster.length > MAX_PLAYERS) return;
         const candidates = [];
         const ids = new Set();
         for (const meta of nextRoster) {
@@ -164,6 +165,7 @@
         enabled = true;
         root.hidden = false;
         root.classList.remove('is-game-over');
+        status.textContent = '';
     });
     socket.on('death', () => {
         root.classList.add('is-game-over');
