@@ -22,7 +22,14 @@ pub fn header(out: *[10]u8, opcode: u8, len: usize) usize {
 }
 
 pub const ClientPacket = union(enum) {
-    join: struct { lobby_id: []const u8, username: []const u8, password: []const u8 },
+    join: struct {
+        lobby_id: []const u8,
+        username: []const u8,
+        password: []const u8,
+        /// New clients append one bounded appearance byte. Null preserves the
+        /// random-color behavior of the original join packet.
+        style: ?u8,
+    },
     direction: model.Direction,
     visibility: bool,
     boost: bool,
@@ -132,14 +139,20 @@ pub fn clientPacket(payload: []const u8) ?ClientPacket {
             const lobby_len: usize = payload[1];
             const username_len: usize = payload[2];
             const password_len: usize = payload[3];
+            const base_len = 4 + lobby_len + username_len + password_len;
             if (lobby_len == 0 or username_len == 0 or password_len > config.MAX_LOBBY_PASSWORD_BYTES or
-                4 + lobby_len + username_len + password_len != payload.len) break :blk null;
+                (payload.len != base_len and payload.len != base_len + 1)) break :blk null;
+            const style = if (payload.len == base_len + 1) payload[base_len] else null;
+            if (style) |value| {
+                if (value >= model.PLAYER_STYLE_COUNT) break :blk null;
+            }
             const username_at = 4 + lobby_len;
             const password_at = username_at + username_len;
             break :blk .{ .join = .{
                 .lobby_id = payload[4..username_at],
                 .username = payload[username_at..password_at],
-                .password = payload[password_at..],
+                .password = payload[password_at .. password_at + password_len],
+                .style = style,
             } };
         },
         2 => if (payload.len == 2) .{ .direction = switch (payload[1]) {
@@ -212,7 +225,7 @@ test "client lengths, headers, text, and close payloads are canonical" {
     try std.testing.expectError(error.InvalidUtf8, validateClosePayload("\x03\xe8\xc0\x80"));
 }
 
-test "maximum join packet includes bounded password and rejects trailing bytes" {
+test "maximum join packet supports one bounded style byte and rejects other trailing bytes" {
     var maximum_join: [578]u8 = undefined;
     maximum_join[0] = 1;
     maximum_join[1] = 255;
@@ -225,11 +238,21 @@ test "maximum join packet includes bounded password and rejects trailing bytes" 
     try std.testing.expectEqual(@as(usize, 255), parsed.lobby_id.len);
     try std.testing.expectEqual(@as(usize, 255), parsed.username.len);
     try std.testing.expectEqual(@as(usize, config.MAX_LOBBY_PASSWORD_BYTES), parsed.password.len);
+    try std.testing.expectEqual(@as(?u8, null), parsed.style);
 
     var trailing: [579]u8 = undefined;
     @memcpy(trailing[0..578], &maximum_join);
-    trailing[578] = 0;
+    trailing[578] = model.PLAYER_STYLE_COUNT - 1;
+    try std.testing.expectEqual(model.PLAYER_STYLE_COUNT - 1, clientPacket(&trailing).?.join.style.?);
+
+    trailing[578] = model.PLAYER_STYLE_COUNT;
     try std.testing.expect(clientPacket(&trailing) == null);
+
+    var two_trailing: [580]u8 = undefined;
+    @memcpy(two_trailing[0..579], &trailing);
+    two_trailing[578] = 0;
+    two_trailing[579] = 0;
+    try std.testing.expect(clientPacket(&two_trailing) == null);
 
     var oversized_password = maximum_join;
     oversized_password[3] = config.MAX_LOBBY_PASSWORD_BYTES + 1;
