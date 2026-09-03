@@ -19,7 +19,11 @@ function frame(bytes, prefix = 0) {
   const moduleUrl = 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
   const { decodeSnapshot } = await import(moduleUrl);
   const snakeSource = fs.readFileSync(path.join(__dirname, '..', 'client', 'js', 'snake.js'), 'utf8');
-  const { default: Snake } = await import('data:text/javascript;base64,' + Buffer.from(snakeSource).toString('base64'));
+  const { default: Snake, SNAKE_STYLE_COLORS, snakeStyleIndex } = await import('data:text/javascript;base64,' + Buffer.from(snakeSource).toString('base64'));
+  assert.deepEqual(SNAKE_STYLE_COLORS.map((color, index) => snakeStyleIndex(color, 'same-player')), [0, 1, 2, 3, 4, 5],
+    'every server-authoritative roster color resolves to its selected snake look');
+  assert.equal(snakeStyleIndex('#123456', 'stable-id'), snakeStyleIndex('#123456', 'stable-id'),
+    'legacy colors use stable identity fallback rather than roster position');
   const massWorkerSource = fs.readFileSync(path.join(__dirname, 'mass-worker.js'), 'utf8');
   assert.match(massWorkerSource, /\(header & 0x40\) !== 0/,
     'mass decoder must reserve only bit 6 of the v5 header');

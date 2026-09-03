@@ -141,6 +141,7 @@ let lateRenderingInitData = null;
 transport.on('init', () => { inlineInitCalls += 1; });
 second.receive('["init",{"mode":"arcade","scale":16}]');
 assert.equal(inlineInitCalls, 1);
+second.receive('["r",[["late-local","Late Local","#83bf35"]]]');
 transport.on('init', (data) => {
   lateRenderingInitCalls += 1;
   lateRenderingInitData = data;
@@ -151,6 +152,16 @@ assert.deepEqual(
   { mode: 'arcade', scale: 16 },
   'the retained init preserves the authoritative mode and board setup'
 );
+let lateRoster = null;
+transport.on('r', (roster) => { lateRoster = roster; });
+assert.deepEqual(JSON.parse(JSON.stringify(lateRoster)), [['late-local', 'Late Local', '#83bf35']],
+  'a late rendering listener receives the retained positional roster needed to decode future snapshots');
+
+transport.emit('clientReady', 'Alice', 'room');
+let staleRosterReplays = 0;
+transport.on('r', () => { staleRosterReplays += 1; });
+assert.equal(staleRosterReplays, 0,
+  'starting a new join clears the preceding life roster before late listeners can consume it');
 
 // UTF-8 protocol limits are byte limits, not JavaScript code-unit limits.
 const beforeOversize = second.sent.length;
@@ -180,12 +191,47 @@ transport.emit('clientReady', 'Alice', 'room', '🔐'.repeat(17));
 transport.emit('clientReady', 'Alice', 'room', 'x'.repeat(65));
 assert.equal(second.sent.length, beforePasswordBounds + 2, 'oversize passwords are rejected before send');
 
+// New joiners may append exactly one bounded appearance byte. The original
+// packet remains unchanged when the picker is absent or an old client joins.
+const beforeStyle = second.sent.length;
+transport.emit('clientReady', 'Alice', 'room', '', 5);
+assert.deepEqual(Array.from(second.sent[beforeStyle]), [
+  1, 4, 5, 0, ...Buffer.from('room'), ...Buffer.from('Alice'), 5,
+]);
+transport.emit('clientReady', 'Alice', 'room', '', 6);
+assert.deepEqual(Array.from(second.sent[beforeStyle + 1]), [
+  1, 4, 5, 0, ...Buffer.from('room'), ...Buffer.from('Alice'),
+], 'out-of-range styles degrade to the backwards-compatible packet');
+
 // Boost state is a fixed two-byte held/released packet and is never queued.
 const beforeBoost = second.sent.length;
 assert.equal(transport.emit('boost', true), true);
 assert.equal(transport.emit('boost', false), true);
 assert.deepEqual(Array.from(second.sent[beforeBoost]), [4, 1]);
 assert.deepEqual(Array.from(second.sent[beforeBoost + 1]), [4, 0]);
+
+// IO steering preserves the complete little-endian u16 circle, including
+// both sides of the 0/65535 seam. The single mutable packet is intentional:
+// WebSocket.send snapshots its bytes synchronously without allocating here.
+const steerPacketIndex = second.sent.length;
+for (const [angle, expected] of [
+  [0, [6, 0, 0]],
+  [8192, [6, 0, 32]],
+  [16384, [6, 0, 64]],
+  [32768, [6, 0, 128]],
+  [49151, [6, 255, 191]],
+  [65535, [6, 255, 255]],
+]) {
+  assert.equal(transport.emit('steer', angle), true);
+  assert.deepEqual(Array.from(second.sent.at(-1)), expected, `steer angle ${angle} must retain its exact u16 quantum`);
+}
+assert.equal(second.sent.slice(steerPacketIndex).every(packet => packet === second.sent[steerPacketIndex]), true,
+  'steady IO steering must reuse one bounded packet buffer');
+assert.equal(transport.emit('steer', Number.NaN), false, 'non-finite steering is rejected');
+assert.equal(transport.emit('steer', -1), true);
+assert.deepEqual(Array.from(second.sent.at(-1)), [6, 0, 0], 'steering underflow clamps to the circle start');
+assert.equal(transport.emit('steer', 70000), true);
+assert.deepEqual(Array.from(second.sent.at(-1)), [6, 255, 255], 'steering overflow clamps to the circle end');
 
 // Chat is a raw type-5 UTF-8 payload. The transport trims it, enforces both
 // scalar and byte ceilings, and reports whether it actually reached a live WS.
