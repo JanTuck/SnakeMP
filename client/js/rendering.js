@@ -1,11 +1,13 @@
-import Snake, { RemoteInterpolationClock } from "./snake.js?v=__SNEK_ASSET_REV__";
+import Snake, { RemoteInterpolationClock, snakeStyleIndex } from "./snake.js?v=__SNEK_ASSET_REV__";
 import GameOverMenu from "./menu/gameOverMenu.js?v=__SNEK_ASSET_REV__";
 import { Sprites } from "./sprites.js?v=__SNEK_ASSET_REV__";
 import { Sfx } from "./audio.js?v=__SNEK_ASSET_REV__";
 import { Particles } from "./particles.js?v=__SNEK_ASSET_REV__";
 import { Hud, Motion } from "./hud.js?v=__SNEK_ASSET_REV__";
 import { decodeSnapshot } from "./snapshot.js?v=__SNEK_ASSET_REV__";
-import { getPredictedDirection, releaseBoost, resetDirection, setGameMode, setGameplayEnabled, syncDirection } from "./userInput.js?v=__SNEK_ASSET_REV__";
+import { decodeIoSnapshot } from "./ioSnapshot.js?v=__SNEK_ASSET_REV__";
+import { IO_OBSTACLES, IO_OBSTACLE_ART, IO_OBSTACLE_HITBOX_SCALE, IO_PICKUP_SPRITES, ioFoodGrowth, ioInterpolateAngle, ioSnakeRadius } from "./ioWorld.js?v=__SNEK_ASSET_REV__";
+import { getPredictedDirection, getPredictedSteerAngle, releaseBoost, resetDirection, setGameMode, setGameplayEnabled, syncDirection } from "./userInput.js?v=__SNEK_ASSET_REV__";
 
 // Module scripts run after the DOM is parsed, so the canvas/socket exist
 // already. Wiring handlers here instead of inside window.onload avoids a
@@ -14,12 +16,16 @@ import { getPredictedDirection, releaseBoost, resetDirection, setGameMode, setGa
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext('2d');
 const nameplateLayer = document.getElementById("nameplates");
+const CLASSIC_CANVAS_WIDTH = canvas.width;
+const CLASSIC_CANVAS_HEIGHT = canvas.height;
 
 const TICK_MS = 1000 / 15; // must match the server game loop
 const DROP_TTL_MS = 25000;
 const DEATH_REPLAY_MS = 3500;
 const DANGER_CHECK_MS = 100;
 const DANGER_RADIUS = 32 * 16;
+const IO_ARENA = 8192;
+const IO_PELLET_COLORS = ['#63e6a3', '#ff5c8a', '#f2cb45', '#47c6e8', '#a879ff', '#ff784f'];
 
 const snakeList = new Map();
 const nameplates = new Map();
@@ -35,6 +41,8 @@ let deathReplay = null;
 // World pickups (supply drops, bonus apples, golden apple).
 let world = { bonus: [], drops: [], golden: null, remains: [], feastTtl: 0, bountyId: null };
 let roster = [];
+let pendingIoRoster = null;
+let localRosterIndex = -1;
 let compactPlayers = [];
 const compactById = new Map();
 let lastSnapshotSequence = null;
@@ -48,6 +56,8 @@ const prevScores = new Map();
 const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)') || { matches: false };
 let lastDangerCheck = -Infinity;
 let dangerId = null;
+let ioFrame = null;
+let ioObstacleMask = null;
 
 function requestFrame(resuming = false) {
     if (!renderReady || framePending) return;
@@ -61,6 +71,22 @@ function invalidateScreenLayout() {
     for (const plate of nameplates.values()) plate.measured = false;
 }
 
+function syncCanvasResolution() {
+    const rect = canvas.getBoundingClientRect();
+    const width = gameMode === 'snek_io' ? Math.max(1, Math.round(rect.width)) : CLASSIC_CANVAS_WIDTH;
+    const height = gameMode === 'snek_io' ? Math.max(1, Math.round(rect.height)) : CLASSIC_CANVAS_HEIGHT;
+    if (canvas.width === width && canvas.height === height) return;
+    canvas.width = width;
+    canvas.height = height;
+    invalidateScreenLayout();
+}
+
+function handleViewportResize() {
+    invalidateScreenLayout();
+    syncCanvasResolution();
+    requestFrame(true);
+}
+
 function screenRect() {
     if (cachedCanvasRect === null) cachedCanvasRect = canvas.getBoundingClientRect();
     return cachedCanvasRect;
@@ -69,9 +95,9 @@ function screenRect() {
 // The arena is fixed to the viewport, so its screen geometry only changes on
 // resize. Keeping it out of the 60/120 Hz render path avoids needless layout
 // reads, especially when a full 32-player roster also has DOM nameplates.
-window.addEventListener?.('resize', invalidateScreenLayout, { passive: true });
-window.visualViewport?.addEventListener?.('resize', invalidateScreenLayout, { passive: true });
-if (typeof ResizeObserver === 'function') new ResizeObserver(invalidateScreenLayout).observe(canvas);
+window.addEventListener?.('resize', handleViewportResize, { passive: true });
+window.visualViewport?.addEventListener?.('resize', handleViewportResize, { passive: true });
+if (typeof ResizeObserver === 'function') new ResizeObserver(handleViewportResize).observe(canvas);
 
 function showError(message) {
     let domError = document.getElementById('game_error');
@@ -82,6 +108,13 @@ function showError(message) {
         domError.style.display = 'none';
         errorTimeout = null;
     }, 1500);
+}
+
+function hideError() {
+    const domError = document.getElementById('game_error');
+    if (errorTimeout !== null) clearTimeout(errorTimeout);
+    errorTimeout = null;
+    if (domError !== null) domError.style.display = 'none';
 }
 
 // Translate a click into canvas coordinates, honouring CSS scaling.
@@ -194,15 +227,7 @@ function placeNameplates(rect) {
 
 // Immutable identity metadata arrives only on membership changes. Binary
 // snapshots are positional records aligned to this roster.
-socket.on("r", (nextRoster) => {
-    if (!Array.isArray(nextRoster) || nextRoster.length > 32) return;
-    const ids = new Set();
-    for (const meta of nextRoster) {
-        if (!Array.isArray(meta) || meta.length !== 3 ||
-            typeof meta[0] !== "string" || meta[0].length === 0 ||
-            typeof meta[1] !== "string" || typeof meta[2] !== "string" || ids.has(meta[0])) return;
-        ids.add(meta[0]);
-    }
+function applyRoster(nextRoster) {
     const live = new Set();
     const nextPlayers = new Array(nextRoster.length);
     for (let i = 0; i < nextRoster.length; i++) {
@@ -231,8 +256,29 @@ socket.on("r", (nextRoster) => {
     if (world.bountyId !== null && !live.has(world.bountyId)) setBountyId(null);
     roster = nextRoster;
     compactPlayers = nextPlayers;
+    localRosterIndex = roster.findIndex((meta) => meta[0] === socket.id);
     // The server follows every changed roster with an independent keyframe.
     lastSnapshotSequence = null;
+}
+
+socket.on("r", (nextRoster) => {
+    // A retained roster may reach this module before its retained init when a
+    // fast join beats module loading. Accept the protocol-wide bound here;
+    // each binary decoder still enforces its mode-specific player ceiling.
+    if (!Array.isArray(nextRoster) || nextRoster.length > 100) return;
+    const ids = new Set();
+    for (const meta of nextRoster) {
+        if (!Array.isArray(meta) || meta.length !== 3 ||
+            typeof meta[0] !== "string" || meta[0].length === 0 ||
+            typeof meta[1] !== "string" || typeof meta[2] !== "string" || ids.has(meta[0])) return;
+        ids.add(meta[0]);
+    }
+    // IO snapshots are positional. Keep rendering the previous complete
+    // roster/frame pair until the server's immediately-following snapshot can
+    // be committed atomically; otherwise bot scaling briefly paints names and
+    // colors on the wrong snakes.
+    if (gameMode === 'snek_io') pendingIoRoster = nextRoster;
+    else applyRoster(nextRoster);
 });
 
 function resizeObjects(array, length) {
@@ -244,6 +290,32 @@ function resizeObjects(array, length) {
 // before any visible game state is committed here.
 socket.on("b", (payload) => {
     if (!isSetup || gameOver) return;
+    if (gameMode === 'snek_io') {
+        const snapshotRoster = pendingIoRoster === null ? roster : pendingIoRoster;
+        const frame = decodeIoSnapshot(payload, snapshotRoster.length);
+        if (frame === null) return;
+        if (pendingIoRoster !== null) {
+            const nextRoster = pendingIoRoster;
+            pendingIoRoster = null;
+            applyRoster(nextRoster);
+            // Slot identities may have shifted, so the paired full snapshot is
+            // a complete state rather than an interpolation continuation.
+            remoteInterpolation.reset();
+        }
+        ioFrame = frame;
+        for (let index = 0; index < frame.playerCount; index++) {
+            const state = compactPlayers[index];
+            const update = frame.players[index];
+            state.score = update.score;
+            state.bodyLength = update.mass;
+            state.snake = update.body;
+        }
+        world.players = compactPlayers;
+        lastSnapshotSequence = frame.sequence;
+        remoteInterpolation.snapshot(performance.now(), frame.sequence);
+        try { Hud.update(compactPlayers, socket.id); } catch (_) {}
+        return;
+    }
     const frame = decodeSnapshot(payload, roster.length, lastSnapshotSequence, compactPlayers);
     if (frame === null) return;
     const scoreEffects = [];
@@ -337,14 +409,25 @@ socket.on("b", (payload) => {
 });
 
 socket.on('init', (initData) => {
+    hideError();
     document.getElementById('game_popup').style.display = 'none';
-    gameMode = initData.mode === 'arcade'
-        ? 'arcade'
-        : initData.mode === 'classical' || initData.classical === true ? 'classical' : 'arcade';
+    gameMode = initData.mode === 'snek_io' ? 'snek_io'
+        : initData.mode === 'arcade' ? 'arcade'
+        : 'classical';
     Hud.setMode(gameMode);
     setGameMode(gameMode);
 
-    food = { x: initData.food.x, y: initData.food.y };
+    if (gameMode === 'snek_io') food = null;
+    else food = { x: initData.food.x, y: initData.food.y };
+    ioFrame = null;
+    pendingIoRoster = null;
+    ioObstacleMask = null;
+    canvas.classList?.toggle('io-arena', gameMode === 'snek_io');
+    syncCanvasResolution();
+    const footnote = document.querySelector('.popup-footnote');
+    if (footnote !== null) footnote.textContent = gameMode === 'snek_io'
+        ? 'Point or touch to steer. Hold Space to boost.'
+        : 'Arrow keys or WASD to steer. Space activates your boost.';
     gameOver = false;
     spectating = false;
     deathReplay = null;
@@ -411,10 +494,12 @@ socket.on('death', (death) => {
     Sfx.death();
     shakeUntil = now + 450;
     // Burst where OUR snake actually died (last known head position).
-    Particles.burst(focusX, focusY, me !== undefined ? me.color : '#e74c3c', 40, 5);
+    Particles.burst(gameMode === 'snek_io' ? canvas.width / 2 : focusX,
+        gameMode === 'snek_io' ? canvas.height / 2 : focusY,
+        me !== undefined ? me.color : '#e74c3c', 40, 5);
     gameOverMenu?.destroy?.();
 
-    if (gameMode === 'arcade') {
+    if (gameMode === 'arcade' || gameMode === 'snek_io') {
         gameOver = false;
         spectating = true;
         deathReplay = { x: focusX, y: focusY, startedAt: now, until: now + replayMs, duration: replayMs, finished: false };
@@ -433,11 +518,24 @@ socket.on('death', (death) => {
 });
 
 socket.on('disconnect', () => {
+    // Freeze the last trustworthy picture and make every hot input inert until
+    // a fresh init acknowledgement arrives. In particular, a held boost or a
+    // queued IO steer must never leak into the replacement server session.
+    isSetup = false;
+    setGameplayEnabled(false);
+    resetDirection();
+    pendingIoRoster = null;
+    ioFrame = null;
+    ioObstacleMask = null;
+    applyRoster([]);
+    world.players = compactPlayers;
+    try { Hud.update([], ''); } catch (_) {}
     if (!gameOver) showError('Disconnected from server');
 });
 
 // ---- Render loop: interpolated movement at display refresh rate ----
 function drawWorld(now) {
+    if (gameMode === 'snek_io') return;
     // Arcade remains stay deliberately quieter than apples: neutral matte
     // pellets communicate edible mass without turning a death into confetti.
     if (gameMode === 'arcade') {
@@ -485,6 +583,241 @@ function drawWorld(now) {
             ctx.shadowBlur = 12;
             drawSprite('golden', world.golden.x - 1, world.golden.y - 1, 18);
             ctx.restore();
+        }
+    }
+}
+
+function ioDelta(value, origin) {
+    let delta = value - origin;
+    if (delta > IO_ARENA / 2) delta -= IO_ARENA;
+    else if (delta < -IO_ARENA / 2) delta += IO_ARENA;
+    return delta;
+}
+
+function ioPointX(player, index, t) {
+    const current = player.body[index];
+    const previous = player.previous[Math.min(index, player.previous.length - 1)] || current;
+    return (previous.x + ioDelta(current.x, previous.x) * t + IO_ARENA) % IO_ARENA;
+}
+
+function ioPointY(player, index, t) {
+    const current = player.body[index];
+    const previous = player.previous[Math.min(index, player.previous.length - 1)] || current;
+    return (previous.y + ioDelta(current.y, previous.y) * t + IO_ARENA) % IO_ARENA;
+}
+
+function ioIntersectsViewport(x, y, halfExtent) {
+    return x >= -halfExtent && x <= canvas.width + halfExtent &&
+        y >= -halfExtent && y <= canvas.height + halfExtent;
+}
+
+function drawIoObstacle(x, y, radius, kind) {
+    const art = IO_OBSTACLE_ART[kind];
+
+    // This quiet ground marker is the obstacle's lethal core. The remaining
+    // illustrated edge is a forgiving graze zone, so transparent sprite
+    // padding can never kill a player who appears clear of the obstacle.
+    const collisionRadius = radius * IO_OBSTACLE_HITBOX_SCALE;
+    ctx.fillStyle = kind === 2 ? '#7d2830' : '#6a482b';
+    ctx.globalAlpha = 0.16;
+    ctx.beginPath();
+    ctx.arc(x, y, collisionRadius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = kind === 2 ? '#ed4d50' : '#e89a38';
+    ctx.globalAlpha = 0.4;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+
+    if (art === null || art === undefined) return;
+    const sprite = Sprites.get(art.sprite);
+    if (sprite === undefined) return;
+    let [sourceX, sourceY, sourceWidth, sourceHeight] = art.crop;
+    const imageWidth = sprite.naturalWidth || sprite.width || 128;
+    const imageHeight = sprite.naturalHeight || sprite.height || 128;
+    if (sourceX + sourceWidth > imageWidth || sourceY + sourceHeight > imageHeight) {
+        sourceX = 0;
+        sourceY = 0;
+        sourceWidth = imageWidth;
+        sourceHeight = imageHeight;
+    }
+    const maxSize = radius * 2;
+    const scale = Math.min(maxSize / sourceWidth, maxSize / sourceHeight);
+    const width = sourceWidth * scale;
+    const height = sourceHeight * scale;
+    ctx.drawImage(sprite, sourceX, sourceY, sourceWidth, sourceHeight,
+        x - width / 2, y - height / 2, width, height);
+}
+
+function drawIoArena(t) {
+    if (ioFrame === null) return;
+    const localIndex = localRosterIndex;
+    const local = localIndex >= 0 ? ioFrame.players[localIndex] : ioFrame.players[0];
+    if (local === undefined || local.body.length === 0) return;
+    const replayCamera = localIndex < 0 && deathReplay !== null && !deathReplay.finished;
+    const cameraX = replayCamera ? deathReplay.x : ioPointX(local, 0, t);
+    const cameraY = replayCamera ? deathReplay.y : ioPointY(local, 0, t);
+    const halfW = canvas.width / 2;
+    const halfH = canvas.height / 2;
+
+    if (ioObstacleMask !== null) {
+        const removed = (ioObstacleMask & ~ioFrame.obstacleMask) >>> 0;
+        for (let obstacleIndex = 0; obstacleIndex < IO_OBSTACLES.length; obstacleIndex++) {
+            if ((removed & (1 << obstacleIndex)) === 0) continue;
+            const [worldX, worldY, radius, kind] = IO_OBSTACLES[obstacleIndex];
+            const x = halfW + ioDelta(worldX, cameraX);
+            const y = halfH + ioDelta(worldY, cameraY);
+            if (ioIntersectsViewport(x, y, radius)) {
+                const burstX = Math.max(0, Math.min(canvas.width, x));
+                const burstY = Math.max(0, Math.min(canvas.height, y));
+                Particles.burst(burstX, burstY, ['#e89a38', '#87919d', '#ed4d50', '#67b64b'][kind], 20, 5);
+            }
+        }
+    }
+    ioObstacleMask = ioFrame.obstacleMask;
+
+    ctx.fillStyle = '#121923';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.strokeStyle = 'rgba(158, 190, 179, 0.08)';
+    ctx.lineWidth = 1;
+    const grid = 96;
+    const offsetX = ((-cameraX + halfW) % grid + grid) % grid;
+    const offsetY = ((-cameraY + halfH) % grid + grid) % grid;
+    ctx.beginPath();
+    for (let x = offsetX; x < canvas.width; x += grid) { ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); }
+    for (let y = offsetY; y < canvas.height; y += grid) { ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); }
+    ctx.stroke();
+
+    for (let obstacleIndex = 0; obstacleIndex < IO_OBSTACLES.length; obstacleIndex++) {
+        if ((ioFrame.obstacleMask & (1 << obstacleIndex)) === 0) continue;
+        const [worldX, worldY, radius, kind] = IO_OBSTACLES[obstacleIndex];
+        const x = halfW + ioDelta(worldX, cameraX);
+        const y = halfH + ioDelta(worldY, cameraY);
+        if (!ioIntersectsViewport(x, y, radius)) continue;
+        drawIoObstacle(x, y, radius, kind);
+    }
+
+    for (let foodIndex = 0; foodIndex < ioFrame.foodCount; foodIndex++) {
+        const slot = ioFrame.foodSlots[foodIndex];
+        const mass = ioFrame.foodMass[slot];
+        const x = halfW + ioDelta(ioFrame.foodX[slot], cameraX);
+        const y = halfH + ioDelta(ioFrame.foodY[slot], cameraY);
+        const pickupName = IO_PICKUP_SPRITES[mass];
+        const size = pickupName !== null && pickupName !== undefined
+            ? 18 + ioFoodGrowth(mass) * 1.7
+            : mass === 1 ? 9 : 7;
+        const halfSize = size / 2;
+        if (!ioIntersectsViewport(x, y, halfSize)) continue;
+        const pickup = pickupName === null || pickupName === undefined ? undefined : Sprites.get(pickupName);
+        if (pickup !== undefined) {
+            ctx.globalAlpha = 0.98;
+            ctx.drawImage(pickup, x - size / 2, y - size / 2, size, size);
+        } else {
+            ctx.fillStyle = mass === 1 ? '#f2cb45' : IO_PELLET_COLORS[slot % IO_PELLET_COLORS.length];
+            ctx.globalAlpha = mass === 1 ? 0.92 : 0.78;
+            ctx.beginPath();
+            ctx.arc(x, y, mass === 1 ? 4.5 : 3.5, 0, Math.PI * 2);
+            ctx.fill();
+        }
+    }
+    ctx.globalAlpha = 1;
+
+    const rect = screenRect();
+    for (let playerIndex = 0; playerIndex < ioFrame.playerCount; playerIndex++) {
+        const player = ioFrame.players[playerIndex];
+        const meta = roster[playerIndex];
+        if (meta === undefined) continue;
+        const style = snakeStyleIndex(meta[2], meta[0]);
+        const bodySprite = Sprites.getIo?.('ioBody', style) || Sprites.get('ioBody');
+        const tailSprite = Sprites.getIo?.('ioTail', style) || Sprites.get('ioTail');
+        const headSprite = Sprites.getIo?.('ioHead', style) || Sprites.get('ioHead');
+        const boostSprite = Sprites.get('ioBoost');
+        const radius = ioSnakeRadius(player.mass);
+        const bodySize = radius * 2;
+        const tailSize = radius * 2.45;
+        const headSize = radius * 3.05;
+        ctx.save();
+        for (let index = player.body.length - 1; index >= 0; index--) {
+            const pointX = ioPointX(player, index, t);
+            const pointY = ioPointY(player, index, t);
+            const x = halfW + ioDelta(pointX, cameraX);
+            const y = halfH + ioDelta(pointY, cameraY);
+            if (index === 0) continue;
+            if (index === player.body.length - 1 && tailSprite !== undefined && player.body.length > 1) {
+                // The square tail sprite rotates, so its corner—not its
+                // unrotated half-width—is the conservative viewport extent.
+                const tailExtent = tailSize * Math.SQRT1_2;
+                if (!ioIntersectsViewport(x, y, tailExtent)) continue;
+                const nearX = ioPointX(player, index - 1, t);
+                const nearY = ioPointY(player, index - 1, t);
+                const angle = Math.atan2(ioDelta(pointY, nearY), ioDelta(pointX, nearX)) - Math.PI;
+                ctx.save();
+                ctx.translate(x, y);
+                ctx.rotate(angle);
+                ctx.drawImage(tailSprite, -tailSize / 2, -tailSize / 2, tailSize, tailSize);
+                ctx.restore();
+            } else if (bodySprite !== undefined) {
+                if (!ioIntersectsViewport(x, y, radius)) continue;
+                ctx.drawImage(bodySprite, x - radius, y - radius, bodySize, bodySize);
+            }
+        }
+
+        const headX = ioPointX(player, 0, t);
+        const headY = ioPointY(player, 0, t);
+        const hx = halfW + ioDelta(headX, cameraX);
+        const hy = halfH + ioDelta(headY, cameraY);
+        // Head art rotates as a square. Use its diagonal extent, then widen
+        // for the boost and shield effects when either reaches farther.
+        const headHalfSize = Math.max(headSize * Math.SQRT1_2,
+            player.boosting ? headSize * 0.75 : 0,
+            player.shielded ? headSize * 0.72 + 2 : 0,
+            radius * 1.35);
+        const headVisible = ioIntersectsViewport(hx, hy, headHalfSize);
+        if (headVisible) {
+            if (player.boosting && boostSprite !== undefined) {
+                const boostSize = headSize * 1.5;
+                ctx.drawImage(boostSprite, hx - boostSize / 2, hy - boostSize / 2, boostSize, boostSize);
+            }
+            if (player.shielded) {
+                ctx.strokeStyle = '#ff71ce';
+                ctx.lineWidth = 3;
+                ctx.globalAlpha = 0.85;
+                ctx.beginPath();
+                ctx.arc(hx, hy, headSize * 0.72, 0, Math.PI * 2);
+                ctx.stroke();
+                ctx.globalAlpha = 1;
+            }
+            if (headSprite !== undefined) {
+                const predictedAngle = playerIndex === localIndex ? getPredictedSteerAngle() : null;
+                const headAngle = predictedAngle === null
+                    ? ioInterpolateAngle(player.previousAngle, player.angle, t)
+                    : predictedAngle;
+                ctx.translate(hx, hy);
+                ctx.rotate(headAngle);
+                ctx.drawImage(headSprite, -headSize / 2, -headSize / 2, headSize, headSize);
+                ctx.rotate(-headAngle);
+                ctx.translate(-hx, -hy);
+            } else {
+                ctx.fillStyle = meta[2];
+                ctx.beginPath();
+                ctx.arc(hx, hy, radius * 1.35, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+        ctx.restore();
+        if (headVisible && meta[0] === socket.id && !player.boosting) {
+            ctx.strokeStyle = '#fffaf1';
+            ctx.lineWidth = 2.5;
+            ctx.beginPath();
+            ctx.arc(hx, hy, headSize / 2 + 2, 0, Math.PI * 2);
+            ctx.stroke();
+        }
+
+        const plate = nameplates.get(meta[0]);
+        if (plate !== undefined) {
+            plate.screenX = rect.left + hx * rect.width / canvas.width;
+            plate.screenY = rect.top + hy * rect.height / canvas.height;
+            plate.element.hidden = hx < 0 || hx > canvas.width || hy < 0 || hy > canvas.height;
         }
     }
 }
@@ -570,7 +903,9 @@ function drawDeathReplay(now) {
     ctx.strokeStyle = '#f5efe6';
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.arc(deathReplay.x, deathReplay.y, radius, 0, Math.PI * 2);
+    ctx.arc(gameMode === 'snek_io' ? canvas.width / 2 : deathReplay.x,
+        gameMode === 'snek_io' ? canvas.height / 2 : deathReplay.y,
+        radius, 0, Math.PI * 2);
     ctx.stroke();
     ctx.restore();
 }
@@ -607,7 +942,9 @@ function frame(now) {
     drawWorld(now);
     const canvasRect = screenRect();
     const localDirection = getPredictedDirection();
-    for (let snake of snakeList.values()) {
+    if (gameMode === 'snek_io') {
+        drawIoArena(t);
+    } else for (let snake of snakeList.values()) {
         const isLocal = snake.id === socket.id;
         // Use one display-refresh presentation clock for every snake. Local
         // steering intent still updates the eyes on the next animation frame,
