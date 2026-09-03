@@ -68,6 +68,11 @@ function landing(overrides = {}) {
     joinPassword: control(),
     createPassword: control(),
     capacity: control('16'),
+    capacity_io: control('100'),
+    walls: control('solid'),
+    capacity_help: control(),
+    walls_help: control(),
+    mode_io: { ...control(), checked: false },
   };
   const session = overrides.session || storage();
   const window = {
@@ -77,6 +82,7 @@ function landing(overrides = {}) {
   const document = {
     getElementById(id) { return elements[id]; },
     querySelector(selector) { return selector === '.join-form' ? joinForm : createForm; },
+    querySelectorAll() { return [elements.mode_io]; },
   };
   vm.runInNewContext(landingSource, {
     window, document, sessionStorage: session, URL, URLSearchParams, TextEncoder, JSON,
@@ -154,6 +160,9 @@ function game(overrides = {}) {
     join_form: form,
     join_status: control(),
   };
+  const styleInputs = overrides.styles
+    ? Array.from({ length: 6 }, (_, index) => ({ ...control(String(index)), checked: index === 0 }))
+    : [];
   const handlers = new Map();
   const emitted = [];
   const timers = [];
@@ -177,7 +186,10 @@ function game(overrides = {}) {
   vm.runInNewContext(gameSource, {
     window,
     location: { pathname: '/game/room%20seven' },
-    document: { getElementById(id) { return elements[id]; } },
+    document: {
+      getElementById(id) { return elements[id]; },
+      querySelectorAll(selector) { return selector === 'input[name="snake_style"]' ? styleInputs : []; },
+    },
     sessionStorage: session,
     localStorage: local,
     socket,
@@ -186,8 +198,9 @@ function game(overrides = {}) {
     clearTimeout(id) { if (timers[id - 1]) timers[id - 1].cleared = true; },
     TextEncoder,
     JSON,
+    Math: overrides.math || Math,
   }, { filename: 'client/game.html:inline' });
-  return { window, session, local, elements, form, button, socket, emitted, timers, get reconnects() { return reconnects; } };
+  return { window, session, local, elements, styleInputs, form, button, socket, emitted, timers, get reconnects() { return reconnects; } };
 }
 
 {
@@ -230,6 +243,27 @@ function game(overrides = {}) {
   assert.equal(page.button.disabled, false, 'a missing join acknowledgement cannot lock the form forever');
   assert.equal(page.reconnects, 1, 'a stalled join forces one clean transport reconnect');
   assert.match(page.elements.join_status.textContent, /connection stalled/i);
+}
+
+{
+  const local = storage({ 'snek:snake-style': '3' });
+  const page = game({ styles: true, local });
+  assert.equal(page.styleInputs[3].checked, true, 'saved appearance is restored in every lobby route');
+  page.elements.username.value = 'StyledPlayer';
+  page.form.fire('submit', submitEvent());
+  assert.deepEqual(page.emitted, [['clientReady', 'StyledPlayer', 'room seven', '', 3]],
+    'the selected appearance is included in the authoritative join');
+  page.socket.fire('connect');
+  assert.deepEqual(page.emitted.at(-1), ['clientReady', 'StyledPlayer', 'room seven', '', 3],
+    'reconnect preserves the same appearance index');
+}
+
+{
+  const deterministicMath = Object.create(Math);
+  deterministicMath.random = () => 0.8;
+  const page = game({ styles: true, math: deterministicMath });
+  assert.equal(page.styleInputs[4].checked, true,
+    'a first-time player receives a varied default instead of always seeing the green snake');
 }
 
 {

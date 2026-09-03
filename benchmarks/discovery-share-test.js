@@ -15,6 +15,10 @@ assert.match(indexHtml, /<form\b[^>]*method="post"[^>]*action="\/quickjoin"/, 'Q
 assert.doesNotMatch(indexHtml, /name="publicTarget"/, 'Quick Join eligibility must be automatic');
 assert.match(indexHtml, /Passwordless lobbies appear in Quick Join until full\./, 'automatic discovery must be explained');
 assert.match(indexHtml, /<select\b[^>]*name="capacity"[\s\S]*?<option value="16" selected>[\s\S]*?<option value="32">/, 'lobby creation must offer 16- and 32-player capacities');
+assert.match(indexHtml, /<option id="capacity_io" value="100" hidden>100 players<\/option>/, 'IO creation must expose its fixed 100-player arena capacity');
+for (const mode of ['classical', 'arcade', 'snek_io']) {
+  assert.match(indexHtml, new RegExp(`name="mode"[^>]*value="${mode}"`), `lobby creation must expose ${mode} as a first-class mode`);
+}
 assert.match(indexHtml, /<select\b[^>]*name="walls"[\s\S]*?<option value="solid" selected>[\s\S]*?<option value="wrap">/, 'lobby creation must offer solid and wraparound walls');
 assert.match(indexHtml, /'no-open-lobby':\s*'No open Quick Join lobby/, 'the empty Quick Join state must explain what failed');
 
