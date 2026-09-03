@@ -19,6 +19,8 @@ benchmarks/results/
 benchmarks/*.cpuprofile
 benchmarks/*.heapprofile
 benchmarks/*.jsonl
+.impeccable/hook.cache.json
+.impeccable/review/
 
 # Zig build artifacts
 zig-cache/
