@@ -23,6 +23,7 @@ const text = @import("text.zig");
 const websocket = @import("websocket.zig");
 const worker_balance = @import("worker_balance.zig");
 const snek = @import("snek.zig");
+const snek_snapshot = @import("snek_snapshot.zig");
 
 const Allocator = std.mem.Allocator;
 const Buf = json.Buf;
@@ -63,6 +64,7 @@ const DEFAULT_LOBBIES_PER_WORKER = config.LOBBIES_PER_WORKER;
 const GAME_WORKER_STACK = config.GAME_WORKER_STACK;
 const DEFAULT_LOBBY_IDLE_DELETE_MS = config.LOBBY_IDLE_DELETE_MS;
 const DEFAULT_LOBBY_ID = config.DEFAULT_LOBBY_ID;
+const DEFAULT_LOBBY_MODE: model.GameMode = .snek_io;
 const MAX_LOBBY_PASSWORD_BYTES = config.MAX_LOBBY_PASSWORD_BYTES;
 const BONUS_CAP = config.BONUS_CAP;
 const DROP_MAX = config.DROP_MAX;
@@ -152,7 +154,7 @@ var input_events: u64 = 0;
 var snapshot_pool_mutex: std.Io.Mutex = .init;
 var snapshot_pool: std.ArrayListUnmanaged(*model.SharedFrame) = .empty;
 const SNAPSHOT_POOL_LIMIT: usize = 64;
-const SNAPSHOT_POOL_MAX_CAPACITY: usize = 64 * 1024;
+const SNAPSHOT_POOL_MAX_CAPACITY: usize = 512 * 1024;
 
 const GameWorker = struct {
     mutex: std.Io.Mutex = .init,
@@ -417,35 +419,48 @@ fn pickSpawnCell(l: *Lobby) ?CellPos {
     return null;
 }
 
-// Thirty-two visually separated colors cover the complete live+spectator cap.
-// Selection probes from a random offset but never reuses an exact color while
-// its identity is still present in the lobby chat history membership.
-const PLAYER_COLORS = [_][]const u8{
-    "#ff6b6b", "#ff8787", "#f06595", "#f783ac", "#cc5de8", "#da77f2", "#845ef7", "#9775fa",
-    "#5c7cfa", "#748ffc", "#339af0", "#4dabf7", "#22b8cf", "#3bc9db", "#20c997", "#38d9a9",
-    "#51cf66", "#69db7c", "#94d82d", "#a9e34b", "#fcc419", "#ffd43b", "#ff922b", "#ffa94d",
-    "#ffb4a2", "#f7b2d9", "#e5a9ff", "#b8c0ff", "#a5d8ff", "#99e9f2", "#96f2d7", "#c0eb75",
+// The six join-dialog looks. The wire carries only an index; the roster color
+// remains the authority used to recover the same look after every reorder.
+const PLAYER_STYLE_COLORS = [_][]const u8{
+    "#51cf66", // Leaf
+    "#ff6b6b", // Berry
+    "#fcc419", // Sun
+    "#339af0", // River
+    "#845ef7", // Grape
+    "#f6e6c7", // Cow
 };
 
-fn playerColorInUse(l: *const Lobby, color: []const u8) bool {
-    for (l.players.items) |player| {
-        if (std.mem.eql(u8, player.color_hex, color)) return true;
-    }
-    for (l.spectators.items) |connection| {
-        if (connection.player) |player| {
-            if (std.mem.eql(u8, player.color_hex, color)) return true;
-        }
-    }
-    return false;
+comptime {
+    std.debug.assert(PLAYER_STYLE_COLORS.len == model.PLAYER_STYLE_COUNT);
 }
 
-fn choosePlayerColor(l: *Lobby) []const u8 {
-    const start = l.rng.random().uintLessThan(usize, PLAYER_COLORS.len);
-    for (0..PLAYER_COLORS.len) |offset| {
-        const color = PLAYER_COLORS[(start + offset) % PLAYER_COLORS.len];
-        if (!playerColorInUse(l, color)) return color;
-    }
-    return PLAYER_COLORS[start];
+fn playerStyleColor(style: ?u8) ?[]const u8 {
+    const index = style orelse return null;
+    if (index >= PLAYER_STYLE_COLORS.len) return null;
+    return PLAYER_STYLE_COLORS[index];
+}
+
+// Fictional, common first-name/handle combinations. The default IO lobby
+// selects a permutation of these process-lifetime strings, so bot identities
+// are human-readable and distinct without allocating or pretending to be a
+// particular real person.
+const IO_BOT_NAMES = [_][]const u8{
+    "Maya",   "Theo",  "Nora",  "Eli",   "Lina",   "Milo",   "Sofia", "Noah",
+    "Freja",  "Luca",  "Iris",  "Owen",  "Alma",   "Leo",    "Mina",  "Finn",
+    "Zoe",    "Hugo",  "Clara", "Arlo",  "Elsa",   "Otis",   "Mira",  "Jude",
+    "Liv",    "Axel",  "Nina",  "Remy",  "Ada",    "Kai",    "Tessa", "Benji",
+    "Emma",   "Lucas", "Aisha", "Mateo", "Grace",  "Sam",    "Chloe", "Elias",
+    "Amara",  "Felix", "Ruby",  "Jonas", "Leila",  "Oscar",  "Eva",   "Max",
+    "Hannah", "Emil",  "Sara",  "Anton", "Alice",  "David",  "Leah",  "Simon",
+    "Julie",  "Robin", "Ella",  "Adam",  "Olivia", "Daniel", "Maria", "Alex",
+};
+
+fn ioBotName(bot: *const model.IoBot) []const u8 {
+    return IO_BOT_NAMES[bot.name_index];
+}
+
+fn ioBotColor(bot: *const model.IoBot) []const u8 {
+    return PLAYER_STYLE_COLORS[bot.name_index % PLAYER_STYLE_COLORS.len];
 }
 
 // ------------------------------------------------------------------ collisions
@@ -925,6 +940,16 @@ fn totalPlayersLocked() usize {
     return total_players.load(.acquire);
 }
 
+fn totalBotsLocked() usize {
+    var count: usize = 0;
+    for (lobbies.values()) |lobby| {
+        lobby.mutex.lockUncancelable(g_io);
+        count += ioBotCount(lobby);
+        lobby.mutex.unlock(g_io);
+    }
+    return count;
+}
+
 fn totalLobbyMembersLocked() usize {
     return total_lobby_members.load(.acquire);
 }
@@ -948,7 +973,7 @@ fn spectatorReceivesSnapshot(c: *const Conn, now: i64) bool {
 }
 
 fn lobbyNeedsGameWorkerLocked(l: *const Lobby, now: i64) bool {
-    if (l.players.items.len != 0) return true;
+    if (l.players.items.len != 0 or ioBotCount(l) != 0) return true;
     for (l.spectators.items) |c| {
         if (spectatorReceivesSnapshot(c, now)) return true;
     }
@@ -1156,6 +1181,9 @@ fn removeConnPlayer(c: *Conn, aa: Allocator) void {
     }
     feedDeath(l, p, null, 0, aa);
     if (l.mode.isArcade()) spawnCorpseRemainsLocked(l, p, unixMillis());
+    if (l.mode == .snek_io) {
+        if (l.snek) |sim| if (p.io_slot) |slot| sim.despawnSnake(slot);
+    }
     detachPlayer(l, p);
     destroyPlayer(p);
 }
@@ -1172,7 +1200,7 @@ fn gameWorkerLoop(worker: *GameWorker) void {
         const tick_now = unixMillis();
         for (worker.lobbies.items) |lobby| {
             lobby.mutex.lockUncancelable(g_io);
-            if (lobby.players.items.len > 0 or lobby.spectators.items.len > 0)
+            if (lobby.players.items.len > 0 or lobby.spectators.items.len > 0 or ioBotCount(lobby) > 0)
                 tickLobby(lobby, tick_now, arena.allocator());
             lobby.mutex.unlock(g_io);
         }
@@ -1202,7 +1230,7 @@ fn createGameWorker(initial_lobby: ?*Lobby) !*GameWorker {
 fn workerEstimatedCostLocked(worker: *GameWorker) u64 {
     var total: u64 = 0;
     for (worker.lobbies.items) |lobby| {
-        total +|= worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.items.len);
+        total +|= worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.items.len + ioBotCount(lobby));
     }
     return total;
 }
@@ -1264,7 +1292,7 @@ fn retireLightestGameWorker(now_ms: i64, aa: Allocator) bool {
     const source = game_workers.items[source_index];
     while (source.lobbies.items.len > 0) {
         const lobby = source.lobbies.items[source.lobbies.items.len - 1];
-        const cost = worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.items.len);
+        const cost = worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.items.len + ioBotCount(lobby));
         var target_index: ?usize = null;
         for (game_workers.items, 0..) |target, index| {
             if (index == source_index or target.lobbies.items.len >= lobbies_per_worker) continue;
@@ -1320,7 +1348,7 @@ fn redistributeGameWorkers(now_ms: i64, aa: Allocator) void {
         var best_improvement: u64 = 0;
         for (source.lobbies.items, 0..) |lobby, index| {
             if (lobby.last_migrated_ms != 0 and now_ms - lobby.last_migrated_ms < worker_balance.migration_cooldown_ms) continue;
-            const cost = worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.items.len);
+            const cost = worker_balance.estimatedLobbyCostNs(lobby.balance_ewma_ns, lobby.players.items.len + ioBotCount(lobby));
             const improvement = worker_balance.moveImprovementNs(loads[heavy_index], loads[destination_index], cost);
             if (improvement > best_improvement) {
                 best_lobby_index = index;
@@ -1414,7 +1442,13 @@ fn deactivateEmptyLobbies() void {
             const lobby = worker.lobbies.items[lobby_index];
             lobby.mutex.lockUncancelable(g_io);
             const inactive = !lobbyNeedsGameWorkerLocked(lobby, now);
-            if (inactive) lobby.worker_assigned = false;
+            if (inactive) {
+                lobby.worker_assigned = false;
+                if (lobby.mode == .snek_io) {
+                    if (lobby.snek) |sim| sim.deinit(galloc);
+                    lobby.snek = null;
+                }
+            }
             lobby.mutex.unlock(g_io);
             if (inactive) {
                 _ = worker.lobbies.swapRemove(lobby_index);
@@ -1443,7 +1477,8 @@ fn destroyLobby(l: *Lobby) void {
     while (l.spectators.items.len > 0) evictSpectatorLocked(l, l.spectators.items.len - 1);
     // The Snek IO sim is one process-allocator allocation, released alongside
     // the lobby's other galloc-owned arrays before the struct itself.
-    if (l.snek) |sim| snek.Snek.deinit(galloc, sim);
+    if (l.snek) |sim| sim.deinit(galloc);
+    if (l.io_bots) |bots| galloc.destroy(bots);
     l.drops.deinit(galloc);
     l.bonus.deinit(galloc);
     l.remains.deinit(galloc);
@@ -1556,13 +1591,8 @@ fn createLobbyLocked(id: []u8, password: []const u8, mode: model.GameMode, publi
     l.rng = std.Random.DefaultPrng.init(seed);
     errdefer l.remains.deinit(galloc);
     errdefer l.spectators.deinit(galloc);
-    if (mode == .snek_io) {
-        // Preallocate the whole fixed-size Snek IO sim exactly once, seeded
-        // from the lobby rng so ambient food placement is reproducible.
-        var sim_rng = l.rng.random();
-        l.snek = try snek.Snek.init(galloc, snek_io_food_target, snek_io_max_food, &sim_rng);
-        errdefer snek.Snek.deinit(galloc, l.snek.?);
-    }
+    // IO simulation memory is intentionally lazy. An empty room retains only
+    // lobby metadata; its fixed simulation is allocated on the first join.
     // These are hard protocol/lifecycle caps. Reserving once keeps death,
     // boost shedding, and spectator retention allocation-free in game ticks.
     try l.remains.ensureTotalCapacityPrecise(galloc, model.MAX_REMAINS);
@@ -1575,6 +1605,7 @@ fn createLobbyLocked(id: []u8, password: []const u8, mode: model.GameMode, publi
 fn quickJoinEligibleLocked(l: *const Lobby) bool {
     if (l.password_protected or l.public_target < 2) return false;
     const target = @min(@as(usize, l.public_target), @as(usize, l.max_players));
+    // Bots make a public room look alive but never reserve the last human seat.
     return l.players.items.len < target;
 }
 
@@ -1587,7 +1618,7 @@ fn selectQuickJoinLobby() ?*Lobby {
     var best_players: usize = 0;
     for (lobbies.values()) |l| {
         l.mutex.lockUncancelable(g_io);
-        const players = l.players.items.len;
+        const players = l.players.items.len + ioBotCount(l);
         const eligible = quickJoinEligibleLocked(l);
         l.mutex.unlock(g_io);
         if (!eligible) continue;
@@ -1676,7 +1707,108 @@ fn broadcastGoldenFeed(l: *Lobby, p: *Player, aa: Allocator) void {
 
 /// Build all persistent player state before a lazy worker is acquired. The
 /// caller holds the lobby mutex so spawn selection and lobby RNG use are safe.
-fn createPlayerLocked(c: *Conn, target: *Lobby, username: []const u8, aa: Allocator) !*Player {
+fn availableIoSlotLocked(target: *const Lobby) ?u8 {
+    var used = [_]bool{false} ** snek.MAX_SNAKES;
+    for (target.players.items) |player| {
+        if (player.io_slot) |slot| used[slot] = true;
+    }
+    for (target.spectators.items) |connection| {
+        if (connection.player) |player| {
+            if (player.io_slot) |slot| used[slot] = true;
+        }
+    }
+    if (target.io_bots) |population| {
+        for (population.bots[0..population.count]) |bot| used[bot.io_slot] = true;
+    }
+    for (used, 0..) |taken, slot| if (!taken) return @intCast(slot);
+    return null;
+}
+
+fn ioBotCount(target: *const Lobby) usize {
+    return if (target.io_bots) |population| population.count else 0;
+}
+
+fn addIoBotLocked(target: *Lobby, rng: *std.Random) bool {
+    const population = target.io_bots orelse return false;
+    if (population.count >= model.IO_BOT_MAX) return false;
+    if (target.players.items.len + population.count >= target.max_players) return false;
+    const slot = availableIoSlotLocked(target) orelse return false;
+    const index: usize = population.count;
+    population.bots[index].io_slot = slot;
+    population.bots[index].decision_ticks = 0;
+    _ = (target.snek orelse return false).spawnSnake(slot, rng);
+    population.count += 1;
+    target.roster_dirty = true;
+    return true;
+}
+
+fn removeIoBotLocked(target: *Lobby) bool {
+    const population = target.io_bots orelse return false;
+    if (population.count == 0) return false;
+    population.count -= 1;
+    const bot = &population.bots[population.count];
+    if (target.snek) |sim| sim.despawnSnake(bot.io_slot);
+    target.roster_dirty = true;
+    return true;
+}
+
+/// Human seats always win. Removing at most one bot is sufficient because one
+/// WebSocket join publishes one player; failed joins are naturally refilled by
+/// the population's slow easing rather than causing synchronized churn.
+fn yieldIoBotSeatLocked(target: *Lobby) void {
+    if (target.mode != .snek_io) return;
+    // Retained death spectators keep their stable IO slot for Retry. Account
+    // for that slot reservation as well as the visible active count: otherwise
+    // a room with one retained spectator could look one seat below capacity
+    // while availableIoSlotLocked still had nowhere to place the human.
+    if (target.players.items.len + ioBotCount(target) >= target.max_players or
+        availableIoSlotLocked(target) == null)
+    {
+        _ = removeIoBotLocked(target);
+    }
+}
+
+/// A retained IO spectator already owns its simulation slot, but its active
+/// seat can be refilled by population easing before Retry arrives. Give that
+/// seat back to the human without applying the fresh-join free-slot check.
+fn yieldIoBotRetrySeatLocked(target: *Lobby) void {
+    if (target.mode != .snek_io) return;
+    if (target.players.items.len + ioBotCount(target) >= target.max_players) _ = removeIoBotLocked(target);
+}
+
+fn initDefaultIoBotsLocked(target: *Lobby, rng: *std.Random) !void {
+    std.debug.assert(target.mode == .snek_io and target.io_bots == null);
+    const population = try galloc.create(model.IoBotPopulation);
+    population.* = .{};
+    target.io_bots = population;
+    errdefer {
+        target.io_bots = null;
+        galloc.destroy(population);
+    }
+
+    // A power-of-two table plus an odd stride forms a permutation, guaranteeing
+    // all 55 visible names are distinct without a set or shuffle allocation.
+    const offset = rng.uintLessThan(usize, IO_BOT_NAMES.len);
+    const odd_stride = rng.uintLessThan(usize, IO_BOT_NAMES.len / 2) * 2 + 1;
+    for (&population.bots, 0..) |*bot, index| {
+        bot.name_index = @intCast((offset + index * odd_stride) % IO_BOT_NAMES.len);
+        bot.turn_bias = if (index & 1 == 0) 1 else -1;
+    }
+
+    const upper = @min(model.IO_BOT_MAX, @as(usize, target.max_players));
+    const lower = @min(model.IO_BOT_MIN, upper);
+    const initial = if (upper == lower) lower else rng.intRangeAtMost(usize, lower, upper);
+    population.target = @intCast(initial);
+    // The initial population is already at its target. Pick a fresh direction
+    // soon so the public count cannot look like a boot-time constant.
+    population.retarget_ticks = rng.intRangeAtMost(u16, 30 * 4, 30 * 12);
+    population.change_ticks = 0;
+    while (population.count < initial) {
+        if (!addIoBotLocked(target, rng)) return error.NoSafeSpawn;
+    }
+}
+
+fn createPlayerLocked(c: *Conn, target: *Lobby, username: []const u8, style: ?u8, retained: ?*Player, aa: Allocator) !*Player {
     const p = try galloc.create(Player);
     errdefer galloc.destroy(p);
     p.* = .{
@@ -1688,9 +1820,15 @@ fn createPlayerLocked(c: *Conn, target: *Lobby, username: []const u8, aa: Alloca
     p.name = try galloc.dupe(u8, username);
     errdefer galloc.free(p.name);
     _ = aa;
-    p.color_hex = try galloc.dupe(u8, choosePlayerColor(target));
+    const color = playerStyleColor(style) orelse
+        PLAYER_STYLE_COLORS[target.rng.random().uintLessThan(usize, PLAYER_STYLE_COLORS.len)];
+    p.color_hex = try galloc.dupe(u8, color);
     errdefer galloc.free(p.color_hex);
-    try p.snake.append(galloc, pickSpawnCell(target) orelse return error.NoSafeSpawn);
+    if (target.mode == .snek_io) {
+        p.io_slot = if (retained) |old| old.io_slot orelse return error.NoSafeSpawn else availableIoSlotLocked(target) orelse return error.NoSafeSpawn;
+    } else {
+        try p.snake.append(galloc, pickSpawnCell(target) orelse return error.NoSafeSpawn);
+    }
     return p;
 }
 
@@ -1760,13 +1898,21 @@ fn publishPreparedPlayerLocked(target: *Lobby, c: *Conn, player: *Player, retain
 /// join must be released outside that mutex to preserve worker -> lobby order.
 fn discardPreparedPlayerLocked(target: *Lobby, player: *Player, activated_worker: bool) void {
     destroyPlayer(player);
+    if (shouldReleaseLazyIoSim(target)) {
+        if (target.snek) |sim| sim.deinit(galloc);
+        target.snek = null;
+    }
     if (!activated_worker) return;
     target.mutex.unlock(g_io);
     unassignGameWorker(target);
     target.mutex.lockUncancelable(g_io);
 }
 
-fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_arg: ?[]const u8, password: []const u8) void {
+fn shouldReleaseLazyIoSim(target: *const Lobby) bool {
+    return target.mode == .snek_io and target.players.items.len == 0 and ioBotCount(target) == 0;
+}
+
+fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_arg: ?[]const u8, password: []const u8, style: ?u8) void {
     // Active players cannot use another join packet to teleport or duplicate
     // membership. A spectator is retained until the replacement is completely
     // prepared, so validation or resource failures never throw them out of chat.
@@ -1825,13 +1971,30 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
         sendGameError(c, ERR_SERVER_FULL, aa);
         return;
     }
-    if (target.players.items.len >= target.max_players) {
+    if (retrying)
+        yieldIoBotRetrySeatLocked(target)
+    else
+        yieldIoBotSeatLocked(target);
+    if (target.players.items.len + ioBotCount(target) >= target.max_players) {
         target.mutex.unlock(g_io);
         sendGameError(c, ERR_LOBBY_FULL, aa);
         return;
     }
 
-    const p = createPlayerLocked(c, target, chk.trimmed, aa) catch |err| {
+    if (target.mode == .snek_io and target.snek == null) {
+        var sim_rng = target.rng.random();
+        target.snek = snek.Snek.init(galloc, snek_io_food_target, snek_io_max_food, &sim_rng) catch {
+            target.mutex.unlock(g_io);
+            sendGameError(c, ERR_SERVER_FULL, aa);
+            return;
+        };
+    }
+
+    const p = createPlayerLocked(c, target, chk.trimmed, style, retained, aa) catch |err| {
+        if (shouldReleaseLazyIoSim(target)) {
+            if (target.snek) |sim| sim.deinit(galloc);
+            target.snek = null;
+        }
         target.mutex.unlock(g_io);
         sendGameError(c, if (err == error.NoSafeSpawn) ERR_LOBBY_FULL else ERR_SERVER_FULL, aa);
         return;
@@ -1845,6 +2008,12 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
         target.mutex.unlock(g_io);
         assignGameWorker(target) catch {
             destroyPlayer(p);
+            target.mutex.lockUncancelable(g_io);
+            if (shouldReleaseLazyIoSim(target)) {
+                if (target.snek) |sim| sim.deinit(galloc);
+                target.snek = null;
+            }
+            target.mutex.unlock(g_io);
             sendGameError(c, ERR_SERVER_FULL, aa);
             return;
         };
@@ -1894,6 +2063,19 @@ fn handleClientReady(c: *Conn, aa: Allocator, username_arg: ?[]const u8, lobby_a
     if (!published) {
         discardPreparedPlayerLocked(target, p, activated_worker);
         return;
+    }
+    if (target.mode == .snek_io) {
+        const sim = target.snek orelse {
+            // Lobby construction guarantees this; keep the join safe if a
+            // future migration ever violates that invariant.
+            detachPlayer(target, p);
+            destroyPlayer(p);
+            sendGameError(c, ERR_SERVER_FULL, aa);
+            return;
+        };
+        var io_rng = target.rng.random();
+        const io_snake = sim.spawnSnake(p.io_slot.?, &io_rng);
+        p.score = @intCast(io_snake.mass - snek.INITIAL_MASS);
     }
     target.roster_dirty = true;
     target.last_empty_at = 0;
@@ -2099,8 +2281,9 @@ fn openDropLocked(l: *Lobby, p: *Player, aa: Allocator) void {
 fn buildRoster(l: *Lobby) ![]const u8 {
     l.roster_wire.clearRetainingCapacity();
     try l.roster_wire.appendSlice(galloc, "[\"r\",[");
-    for (l.players.items, 0..) |player, index| {
-        if (index != 0) try l.roster_wire.append(galloc, ',');
+    var emitted: usize = 0;
+    for (l.players.items) |player| {
+        if (emitted != 0) try l.roster_wire.append(galloc, ',');
         try l.roster_wire.append(galloc, '[');
         try jsString(&l.roster_wire, galloc, player.id);
         try l.roster_wire.append(galloc, ',');
@@ -2108,6 +2291,22 @@ fn buildRoster(l: *Lobby) ![]const u8 {
         try l.roster_wire.append(galloc, ',');
         try jsString(&l.roster_wire, galloc, player.color_hex);
         try l.roster_wire.append(galloc, ']');
+        emitted += 1;
+    }
+    if (l.io_bots) |population| {
+        for (population.bots[0..population.count], 0..) |*bot, index| {
+            if (emitted != 0) try l.roster_wire.append(galloc, ',');
+            try l.roster_wire.append(galloc, '[');
+            var id_storage: [12]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_storage, "bot-{d}", .{index + 1});
+            try jsString(&l.roster_wire, galloc, id);
+            try l.roster_wire.append(galloc, ',');
+            try jsString(&l.roster_wire, galloc, ioBotName(bot));
+            try l.roster_wire.append(galloc, ',');
+            try jsString(&l.roster_wire, galloc, ioBotColor(bot));
+            try l.roster_wire.append(galloc, ']');
+            emitted += 1;
+        }
     }
     try l.roster_wire.appendSlice(galloc, "]]\n");
     return l.roster_wire.items[0 .. l.roster_wire.items.len - 1];
@@ -2416,16 +2615,198 @@ fn simulateArcadeLocked(l: *Lobby, now: i64, aa: Allocator) void {
 
 // ------------------------------------------------------------------ tick
 
-/// Slice-B seam for Snek IO: the real tick pipeline — apply steer
-/// (Conn.steer_angle -> snek.Snake.target_angle), movement/sampling/growth/
-/// boost burn, one @memset hash rebuild, kill resolution, death bursts, food
-/// pickups, and the SI snapshot broadcast (design §2.1) — is a later slice.
-/// Until it lands, each snek_io tick is a safe no-op: the Snek sim stays
-/// frozen, nothing is scheduled, and no grid game logic ever touches sim
-/// state. Membership, roster, snapshot, and stats accounting below still run,
-/// so the lobby remains fully consistent between slices.
-fn snekTickStub(l: *Lobby) void {
-    _ = l;
+fn ioPlayerForSlot(l: *Lobby, slot: u8) ?*Player {
+    for (l.players.items) |player| if (player.io_slot == slot) return player;
+    for (l.spectators.items) |connection| {
+        if (connection.player) |player| if (player.io_slot == slot) return player;
+    }
+    return null;
+}
+
+fn ioBotForSlot(l: *Lobby, slot: u8) ?*model.IoBot {
+    const population = l.io_bots orelse return null;
+    for (population.bots[0..population.count]) |*bot| if (bot.io_slot == slot) return bot;
+    return null;
+}
+
+fn ioBotFoodAngle(sim: *const snek.Snek, snake_state: *const snek.Snake, rng: *std.Random) ?f32 {
+    if (sim.food.count == 0) return null;
+    const start = rng.uintLessThan(usize, snek.MAX_FOOD);
+    var best_distance: f32 = std.math.inf(f32);
+    var best_angle: ?f32 = null;
+    // Sampling keeps decisions bounded even at the 8,000-food hard cap. Party
+    // items get an effective distance discount, making bots visibly contest
+    // valuable food without running a pathfinder or allocating a search set.
+    for (0..96) |sample_index| {
+        const slot = (start + sample_index * 83) % snek.MAX_FOOD;
+        const kind = sim.food.mass[slot];
+        if (kind == 0) continue;
+        var dx = @as(f32, @floatFromInt(sim.food.x[slot])) - snake_state.head_x;
+        var dy = @as(f32, @floatFromInt(sim.food.y[slot])) - snake_state.head_y;
+        if (dx > snek.ARENA / 2) dx -= snek.ARENA;
+        if (dx < -snek.ARENA / 2) dx += snek.ARENA;
+        if (dy > snek.ARENA / 2) dy -= snek.ARENA;
+        if (dy < -snek.ARENA / 2) dy += snek.ARENA;
+        const value = @as(f32, @floatFromInt(@max(@as(u16, 1), snek.Snek.foodGrowth(kind))));
+        const distance = (dx * dx + dy * dy) / value;
+        if (distance < best_distance) {
+            best_distance = distance;
+            best_angle = std.math.atan2(dy, dx);
+        }
+    }
+    return best_angle;
+}
+
+fn ioBotWrappedDelta(a: f32, b: f32) f32 {
+    var delta = b - a;
+    if (delta > snek.ARENA / 2) delta -= snek.ARENA;
+    if (delta < -snek.ARENA / 2) delta += snek.ARENA;
+    return delta;
+}
+
+/// Return a short-lived escape heading when a bot is already travelling into
+/// a live hazard that it cannot eat. This is deliberately a tiny forward
+/// corridor check, not pathfinding: it runs allocation-free every physics
+/// step so a bot cannot keep an old food decision for up to 1.4 seconds and
+/// blindly boost into a bomb or crate.
+fn ioBotHazardAvoidance(sim: *const snek.Snek, snake_state: *const snek.Snake, turn_bias: i8) ?f32 {
+    if (snake_state.shield_ticks > 0) return null;
+    const heading_x = @cos(snake_state.angle);
+    const heading_y = @sin(snake_state.angle);
+    const snake_radius = snek.Snek.snakeRadius(snake_state.mass);
+    var nearest_forward = std.math.inf(f32);
+    var escape_angle: ?f32 = null;
+
+    for (snek.OBSTACLES, 0..) |obstacle, obstacle_index| {
+        const bit = @as(u32, 1) << @intCast(obstacle_index);
+        if (sim.obstacle_alive_mask & bit == 0) continue;
+        if (snake_radius >= snek.Snek.obstacleEatRadius(obstacle.kind)) continue;
+
+        const dx = ioBotWrappedDelta(snake_state.head_x, obstacle.x);
+        const dy = ioBotWrappedDelta(snake_state.head_y, obstacle.y);
+        const forward = dx * heading_x + dy * heading_y;
+        if (forward <= 0 or forward >= 360 or forward >= nearest_forward) continue;
+        const lateral = dx * -heading_y + dy * heading_x;
+        const lethal_radius = snake_radius + obstacle.radius * snek.OBSTACLE_HITBOX_SCALE;
+        if (@abs(lateral) >= lethal_radius + 28) continue;
+
+        // Stay consistent on a head-on approach instead of alternating sides
+        // every tick. Otherwise turn away from the side the hazard occupies.
+        const side: f32 = if (@abs(lateral) < 1.0)
+            @floatFromInt(if (turn_bias == 0) @as(i8, 1) else turn_bias)
+        else if (lateral > 0)
+            -1
+        else
+            1;
+        escape_angle = snake_state.angle + side * 1.05;
+        nearest_forward = forward;
+    }
+    return escape_angle;
+}
+
+fn tickIoBotsLocked(l: *Lobby, rng: *std.Random) void {
+    const population = l.io_bots orelse return;
+    const sim = l.snek orelse return;
+
+    if (population.retarget_ticks > 0) {
+        population.retarget_ticks -= 1;
+    } else {
+        var next_target = rng.intRangeAtMost(usize, model.IO_BOT_MIN, model.IO_BOT_MAX);
+        if (next_target == population.count) {
+            next_target = if (next_target == model.IO_BOT_MAX) model.IO_BOT_MAX - 1 else next_target + 1;
+        }
+        population.target = @intCast(next_target);
+        population.retarget_ticks = rng.intRangeAtMost(u16, 30 * 45, 30 * 120);
+    }
+
+    if (population.change_ticks > 0) population.change_ticks -= 1;
+    const seats_after_humans = @as(usize, l.max_players) -| l.players.items.len;
+    const desired = @min(@as(usize, population.target), seats_after_humans);
+    if (population.change_ticks == 0 and population.count != desired) {
+        if (population.count < desired) {
+            _ = addIoBotLocked(l, rng);
+        } else {
+            _ = removeIoBotLocked(l);
+        }
+        // One change every 1-4 seconds feels organic and avoids snapshot/roster
+        // spikes when a new random target is far from the current population.
+        population.change_ticks = rng.intRangeAtMost(u16, 30, 120);
+    }
+    if (population.count == desired and population.target == desired and population.retarget_ticks > 30 * 12) {
+        // Briefly enjoy the destination, then move again. This keeps the lobby
+        // organic without making the online counter flicker every refresh.
+        population.retarget_ticks = rng.intRangeAtMost(u16, 30 * 4, 30 * 12);
+    }
+
+    for (population.bots[0..population.count]) |*bot| {
+        const snake_state = &sim.snakes[bot.io_slot];
+        if (!snake_state.alive) continue;
+        if (ioBotHazardAvoidance(sim, snake_state, bot.turn_bias)) |escape_angle| {
+            snake_state.target_angle = escape_angle;
+            snake_state.boosting = false;
+            // Reacquire food immediately once the short escape is clear.
+            bot.decision_ticks = 0;
+            continue;
+        }
+        if (bot.decision_ticks > 0) {
+            bot.decision_ticks -= 1;
+            continue;
+        }
+        const wander = @as(f32, @floatFromInt(bot.turn_bias)) * (0.18 + rng.float(f32) * 0.42);
+        snake_state.target_angle = if (ioBotFoodAngle(sim, snake_state, rng)) |food_angle|
+            food_angle + wander
+        else
+            snake_state.angle + wander;
+        snake_state.boosting = snake_state.mass > snek.MIN_BOOST_MASS and rng.uintLessThan(u8, 5) == 0;
+        bot.decision_ticks = rng.intRangeAtMost(u8, 12, 42);
+        if (rng.uintLessThan(u8, 9) == 0) bot.turn_bias = -bot.turn_bias;
+    }
+}
+
+fn snekTickLocked(l: *Lobby, now: i64, aa: Allocator) void {
+    const sim = l.snek orelse return;
+    for (l.players.items) |player| {
+        const slot = player.io_slot orelse continue;
+        const snake_state = &sim.snakes[slot];
+        if (player.conn.steer_angle) |quantized| {
+            snake_state.target_angle = @as(f32, @floatFromInt(quantized)) / 65535.0 * (2.0 * std.math.pi);
+        }
+        snake_state.boosting = player.boosting;
+    }
+
+    var io_rng = l.rng.random();
+    tickIoBotsLocked(l, &io_rng);
+    const result = sim.tick(@as(f32, @floatFromInt(snek_tick_ns)) / std.time.ns_per_s, &io_rng);
+    for (l.players.items) |player| {
+        if (player.io_slot) |slot| {
+            const state = &sim.snakes[slot];
+            player.score = @intCast(state.mass -| snek.INITIAL_MASS);
+        }
+    }
+
+    for (result.deaths[0..result.death_count]) |death| {
+        const victim = ioPlayerForSlot(l, death.slot) orelse {
+            // Bot bodies go through the exact same collision/death/drop path as
+            // humans, then reuse their fixed slot for an allocation-free spawn.
+            if (ioBotForSlot(l, death.slot)) |bot| {
+                _ = sim.spawnSnake(bot.io_slot, &io_rng);
+                bot.decision_ticks = 0;
+            }
+            continue;
+        };
+        // The victim may already have been moved by another classified death.
+        if (spectatorIndex(l, victim.conn) != null) continue;
+        const killer = if (death.killer_slot) |slot| ioPlayerForSlot(l, slot) else null;
+        if (killer) |credited| {
+            credited.kills +|= 1;
+            credited.streak = if (now - credited.last_kill_at <= KILL_STREAK_WINDOW_MS) credited.streak +| 1 else 1;
+            credited.last_kill_at = now;
+        }
+        const focus: CellPos = .{ .x = @intFromFloat(death.x), .y = @intFromFloat(death.y) };
+        sendDeathEvent(victim.conn, victim.score, focus, aa);
+        feedDeath(l, victim, killer, 0, aa);
+        movePlayerToSpectatorsLocked(l, victim, focus, victim.score, now);
+    }
 }
 
 fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
@@ -2462,13 +2843,11 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
         scheduleFeastLocked(l, now, aa);
         simulateArcadeLocked(l, now, aa);
     } else if (l.mode == .snek_io) {
-        // Snek IO never runs the grid game paths: its snakes live in
-        // Lobby.snek (snek.zig), not Player.snake cells, and every arcade
-        // objective site in this function is gated by l.mode.isArcade() —
-        // the scheduling block above and the pickup loop below — so nothing
-        // arcs for snek_io. The sim pipeline itself is the slice-B seam;
-        // until it lands, tick as a safe no-op (see snekTickStub).
-        snekTickStub(l);
+        // Continuous IO snakes live in the 8192-square toroidal simulation,
+        // never in the grid-mode Player.snake array. Run the configured 30 Hz
+        // physics cadence as bounded substeps inside the 15 Hz worker pass.
+        const io_steps = @max(@as(u64, 1), TICK_NS / snek_tick_ns);
+        for (0..io_steps) |_| snekTickLocked(l, now, aa);
     } else {
         // Classical retains its established single-step order:
         // collision at tick start, pickup at the current head, then movement.
@@ -2549,7 +2928,26 @@ fn tickLobby(l: *Lobby, now: i64, aa: Allocator) void {
     }
     if (acquireSharedFrame()) |frame| {
         const encode_t0 = if (debug_enabled) monoNanos() else 0;
-        if (binary_snapshot.buildInto(&frame.payload, l, now, galloc)) |result| {
+        if (l.mode == .snek_io) io_snapshot: {
+            if (snek_snapshot.buildInto(&frame.payload, l, galloc)) |result| {
+                frame.keyframe = true;
+                frame.header_len = @intCast(wsHeader(&frame.header, 0x2, result.bytes.len));
+                l.stats.wire_bytes = result.bytes.len;
+                if (debug_enabled) {
+                    const encode_ns: u64 = @intCast(@max(0, monoNanos() - encode_t0));
+                    l.stats.encode_ns = encode_ns;
+                    l.stats.encode_ns_total +%= encode_ns;
+                }
+                const fanout_t0 = if (debug_enabled) monoNanos() else 0;
+                broadcastBinarySnapshot(l, frame, now, result.sequence);
+                if (debug_enabled) {
+                    const fanout_ns: u64 = @intCast(@max(0, monoNanos() - fanout_t0));
+                    l.stats.fanout_ns = fanout_ns;
+                    l.stats.fanout_ns_total +%= fanout_ns;
+                }
+            } else |_| {}
+            break :io_snapshot;
+        } else if (binary_snapshot.buildInto(&frame.payload, l, now, galloc)) |result| {
             frame.keyframe = result.kind == .keyframe;
             frame.header_len = @intCast(wsHeader(&frame.header, 0x2, result.bytes.len));
             l.stats.wire_bytes = result.bytes.len;
@@ -2811,10 +3209,14 @@ fn buildStats(aa: Allocator) !StatsPayload {
         lobby_index += 1;
     }
 
+    const real_players = totalPlayersLocked();
+    const bots = totalBotsLocked();
     const encoded = try stats_json.encode(aa, .{
         .rss = readRssBytes(),
         .uptime = @as(f64, @floatFromInt(unixMillis() - start_ms)) / 1000.0,
-        .totalPlayers = totalPlayersLocked(),
+        .totalPlayers = real_players,
+        .bots = bots,
+        .visiblePlayers = real_players + bots,
         .maxPlayers = max_players_global,
         .maxPlayersPerLobby = max_players_per_lobby,
         .maxLobbies = max_lobbies,
@@ -2863,7 +3265,7 @@ fn writePublicStatus(out: []u8, players: usize, lobby_count: usize) ![]const u8 
 /// browser caches from presenting stale population figures.
 fn sendPublicStatus(c: *Conn, aa: Allocator, keep_alive: bool, head_only: bool) void {
     var storage: [96]u8 = undefined;
-    const body = writePublicStatus(&storage, totalPlayersLocked(), lobbies.count()) catch
+    const body = writePublicStatus(&storage, totalPlayersLocked() + totalBotsLocked(), lobbies.count()) catch
         return sendServerError(c, aa);
     sendResponse(c, aa, .{
         .status = 200,
@@ -3099,7 +3501,7 @@ fn handleRawBinary(c: *Conn, aa: Allocator, payload: []const u8) void {
     }
     const packet = websocket.clientPacket(payload) orelse return;
     switch (packet) {
-        .join => |join| handleClientReady(c, aa, join.username, join.lobby_id, join.password),
+        .join => |join| handleClientReady(c, aa, join.username, join.lobby_id, join.password, join.style),
         .direction => |direction| handleKeyPress(c, direction),
         .visibility => |visible| handleVisibility(c, visible),
         .boost => |held| handleBoost(c, held),
@@ -3549,7 +3951,7 @@ pub fn main(init: std.process.Init) !void {
     galloc = init.gpa;
     debug_enabled = if (init.minimal.environ.getPosix("SNEK_DEBUG")) |v| std.mem.eql(u8, v, "1") else false;
     const port: u16 = if (init.minimal.environ.getPosix("PORT")) |v| (std.fmt.parseInt(u16, v, 10) catch 3000) else 3000;
-    max_players_global = envUsize(init.minimal.environ, "SNEK_MAX_PLAYERS", DEFAULT_MAX_PLAYERS_GLOBAL, binary_snapshot.MAX_PLAYERS);
+    max_players_global = envUsize(init.minimal.environ, "SNEK_MAX_PLAYERS", DEFAULT_MAX_PLAYERS_GLOBAL, snek.MAX_SNAKES);
     max_players_per_lobby = envUsize(init.minimal.environ, "SNEK_MAX_PLAYERS_PER_LOBBY", DEFAULT_MAX_PLAYERS_PER_LOBBY, binary_snapshot.MAX_PLAYERS);
     max_players_per_lobby = @min(max_players_per_lobby, max_players_global);
     max_lobbies = envUsize(init.minimal.environ, "SNEK_MAX_LOBBIES", DEFAULT_MAX_LOBBIES, 100_000);
@@ -3576,7 +3978,12 @@ pub fn main(init: std.process.Init) !void {
     {
         const def_id = try galloc.dupe(u8, DEFAULT_LOBBY_ID);
         errdefer galloc.free(def_id);
-        _ = try createLobbyLocked(def_id, "", .arcade, 16, false, 16);
+        const default_capacity: u8 = @intCast(@min(snek.MAX_SNAKES, snek_io_max_players));
+        const default_lobby = try createLobbyLocked(def_id, "", DEFAULT_LOBBY_MODE, default_capacity, true, default_capacity);
+        var default_rng = default_lobby.rng.random();
+        default_lobby.snek = try snek.Snek.init(galloc, snek_io_food_target, snek_io_max_food, &default_rng);
+        try initDefaultIoBotsLocked(default_lobby, &default_rng);
+        try assignGameWorker(default_lobby);
     }
 
     const addr = try std.Io.net.IpAddress.parseIp4("0.0.0.0", port);
@@ -3768,10 +4175,26 @@ test "binary client packets reject malformed and partial input" {
     try std.testing.expectEqualStrings("12345", joined.join.lobby_id);
     try std.testing.expectEqualStrings("name", joined.join.username);
     try std.testing.expectEqualStrings("pw", joined.join.password);
+    try std.testing.expectEqual(@as(?u8, null), joined.join.style);
+    const styled = websocket.clientPacket(&.{ 1, 5, 4, 2, '1', '2', '3', '4', '5', 'n', 'a', 'm', 'e', 'p', 'w', 5 }).?;
+    try std.testing.expectEqual(@as(?u8, 5), styled.join.style);
+    try std.testing.expectEqualStrings("pw", styled.join.password);
+    try std.testing.expect(websocket.clientPacket(&.{ 1, 5, 4, 2, '1', '2', '3', '4', '5', 'n', 'a', 'm', 'e', 'p', 'w', 6 }) == null);
     try std.testing.expectEqual(Direction.left, websocket.clientPacket(&.{ 2, 2 }).?.direction);
     try std.testing.expectEqual(false, websocket.clientPacket(&.{ 3, 0 }).?.visibility);
     try std.testing.expectEqual(true, websocket.clientPacket(&.{ 3, 1 }).?.visibility);
     try std.testing.expectEqual(true, websocket.clientPacket(&.{ 4, 1 }).?.boost);
+}
+
+test "player style indices resolve to stable distinct roster colors" {
+    var seen: [model.PLAYER_STYLE_COUNT][]const u8 = undefined;
+    for (&seen, 0..) |*slot, index| {
+        slot.* = playerStyleColor(@intCast(index)).?;
+        try std.testing.expect(slot.*.len == 7 and slot.*[0] == '#');
+        for (seen[0..index]) |prior| try std.testing.expect(!std.mem.eql(u8, prior, slot.*));
+    }
+    try std.testing.expectEqual(@as(?[]const u8, null), playerStyleColor(null));
+    try std.testing.expectEqual(@as(?[]const u8, null), playerStyleColor(model.PLAYER_STYLE_COUNT));
 }
 
 test "lobby passwords are bounded, validated, and authenticated exactly" {
@@ -3984,19 +4407,20 @@ test "classical lobby ticks never schedule special pickups" {
     try std.testing.expectEqual(@as(i64, 1), lobby.next_golden_at);
 }
 
-test "snek_io lobby ticks are a safe no-op until the sim pipeline slice lands" {
+test "snek_io lobby ticks continuous simulation without arcade objectives" {
     galloc = std.testing.allocator;
     g_io = std.testing.io;
     defer drainSnapshotPool();
 
-    // A real sim with a live snake: if any grid path ran, the sim or the
-    // snake would be mutated and arcade objectives would spawn.
+    // A real sim with a live snake advances while arcade objectives remain
+    // completely isolated from the continuous ruleset.
     var sim_rng_prng = std.Random.DefaultPrng.init(0x5EED);
     var sim_rng = sim_rng_prng.random();
     const sim = try snek.Snek.init(galloc, 64, snek.MAX_FOOD, &sim_rng);
     defer snek.Snek.deinit(sim, galloc);
     const snake = sim.spawnSnake(0, &sim_rng);
     const food_count_before = sim.food.count;
+    const head_before = snake.head_x;
 
     var lobby = Lobby{
         .id = @constCast("snek-io"),
@@ -4022,11 +4446,12 @@ test "snek_io lobby ticks are a safe no-op until the sim pipeline slice lands" {
     try std.testing.expectEqual(@as(usize, 0), lobby.drops.items.len);
     try std.testing.expectEqual(@as(usize, 0), lobby.bonus.items.len);
     try std.testing.expectEqual(@as(?model.Golden, null), lobby.golden);
-    // ...and the Snek sim is untouched: same ambient food, snake alive,
-    // spatial hash never rebuilt.
+    // ...while the continuous simulation moves, hashes, and retains its
+    // ambient food population.
     try std.testing.expectEqual(food_count_before, sim.food.count);
     try std.testing.expect(snake.alive);
-    try std.testing.expectEqual(@as(usize, 0), sim.hash.node_top);
+    try std.testing.expect(snake.head_x != head_before);
+    try std.testing.expect(sim.hash.node_top > 0);
 }
 
 test "keypress queues a turn for the current lobby membership" {
@@ -4324,7 +4749,7 @@ test "public Quick Join target is private by default and strictly bounded" {
 }
 
 test "lobby capacity defaults to 16 and accepts only supported sizes" {
-    try std.testing.expectEqual(binary_snapshot.MAX_PLAYERS, DEFAULT_MAX_PLAYERS_GLOBAL);
+    try std.testing.expectEqual(snek.MAX_SNAKES, DEFAULT_MAX_PLAYERS_GLOBAL);
     try std.testing.expectEqual(binary_snapshot.MAX_PLAYERS, DEFAULT_MAX_PLAYERS_PER_LOBBY);
     try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity(null, .classical));
     try std.testing.expectEqual(@as(?u8, 16), parseLobbyCapacity("", .arcade));
@@ -4386,6 +4811,362 @@ test "public landing status JSON is compact exact and bounded" {
     try std.testing.expect(maximum.len <= storage.len);
     try std.testing.expect(std.mem.startsWith(u8, maximum, "{\"players\":"));
     try std.testing.expect(std.mem.endsWith(u8, maximum, "}"));
+}
+
+test "default lobby is IO and bot names are natural distinct and bounded" {
+    try std.testing.expectEqual(model.GameMode.snek_io, DEFAULT_LOBBY_MODE);
+    try std.testing.expectEqual(@as(usize, 64), IO_BOT_NAMES.len);
+    var seen = [_]bool{false} ** IO_BOT_NAMES.len;
+    for (IO_BOT_NAMES) |name| {
+        try std.testing.expect(name.len >= 3 and name.len <= 24);
+        for (IO_BOT_NAMES, 0..) |candidate, index| {
+            if (!std.mem.eql(u8, name, candidate)) continue;
+            try std.testing.expect(!seen[index]);
+            seen[index] = true;
+            break;
+        }
+    }
+    for (seen) |present| try std.testing.expect(present);
+}
+
+test "default IO bot population is bounded distinct and allocation compact" {
+    galloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x51ec7);
+    var rng = prng.random();
+    const sim = try snek.Snek.init(galloc, 8, 64, &rng);
+    defer sim.deinit(galloc);
+    var lobby: Lobby = .{
+        .id = @constCast("default"),
+        .mode = .snek_io,
+        .snek = sim,
+        .max_players = 100,
+        .food = .{ .x = 0, .y = 0 },
+    };
+    defer lobby.roster_wire.deinit(galloc);
+    try initDefaultIoBotsLocked(&lobby, &rng);
+    defer galloc.destroy(lobby.io_bots.?);
+    const population = lobby.io_bots.?;
+    try std.testing.expect(population.count >= model.IO_BOT_MIN);
+    try std.testing.expect(population.count <= model.IO_BOT_MAX);
+    var slots = [_]bool{false} ** snek.MAX_SNAKES;
+    var names = [_]bool{false} ** IO_BOT_NAMES.len;
+    for (population.bots[0..population.count]) |bot| {
+        try std.testing.expect(!slots[bot.io_slot]);
+        try std.testing.expect(!names[bot.name_index]);
+        slots[bot.io_slot] = true;
+        names[bot.name_index] = true;
+        try std.testing.expect(sim.snakes[bot.io_slot].alive);
+    }
+    const roster = try buildRoster(&lobby);
+    try std.testing.expect(std.mem.indexOf(u8, roster, "\"bot-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, roster, ioBotName(&population.bots[0])) != null);
+}
+
+test "bot population eases one step and yields a full seat to a human" {
+    galloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(73);
+    var rng = prng.random();
+    const sim = try snek.Snek.init(galloc, 8, 64, &rng);
+    defer sim.deinit(galloc);
+    var population: model.IoBotPopulation = .{};
+    for (&population.bots, 0..) |*bot, index| {
+        bot.name_index = @intCast(index);
+        bot.turn_bias = 1;
+    }
+    var lobby: Lobby = .{
+        .id = @constCast("default"),
+        .mode = .snek_io,
+        .snek = sim,
+        .io_bots = &population,
+        .max_players = 6,
+        .food = .{ .x = 0, .y = 0 },
+    };
+    while (population.count < 5) try std.testing.expect(addIoBotLocked(&lobby, &rng));
+    population.target = 6;
+    population.retarget_ticks = 100;
+    population.change_ticks = 0;
+    tickIoBotsLocked(&lobby, &rng);
+    try std.testing.expectEqual(@as(u8, 6), population.count);
+    yieldIoBotSeatLocked(&lobby);
+    try std.testing.expectEqual(@as(u8, 5), population.count);
+    try std.testing.expect(availableIoSlotLocked(&lobby) != null);
+}
+
+test "native bot yields when a retained IO spectator holds the last slot" {
+    galloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5ea7);
+    var rng = prng.random();
+    const sim = try snek.Snek.init(galloc, 8, 64, &rng);
+    defer sim.deinit(galloc);
+    var population: model.IoBotPopulation = .{ .target = model.IO_BOT_MAX };
+    for (&population.bots, 0..) |*bot, index| {
+        bot.name_index = @intCast(index);
+        bot.turn_bias = 1;
+    }
+    var spectator_connection: Conn = .{ .fd = -1 };
+    var active_connection: Conn = .{ .fd = -1 };
+    var active_players: [44]Player = undefined;
+    var retained = Player{
+        .id = "retained",
+        .name = @constCast("Retained"),
+        .color_hex = @constCast("#fff"),
+        .io_slot = 99,
+        .conn = &spectator_connection,
+    };
+    spectator_connection.player = &retained;
+    var lobby: Lobby = .{
+        .id = @constCast("default"),
+        .mode = .snek_io,
+        .snek = sim,
+        .io_bots = &population,
+        .max_players = snek.MAX_SNAKES,
+        .food = .{ .x = 0, .y = 0 },
+    };
+    defer lobby.players.deinit(galloc);
+    defer lobby.spectators.deinit(galloc);
+    try lobby.spectators.append(galloc, &spectator_connection);
+    while (population.count < model.IO_BOT_MAX) try std.testing.expect(addIoBotLocked(&lobby, &rng));
+    for (&active_players, 0..) |*player, index| {
+        player.* = .{
+            .id = "active",
+            .name = @constCast("Active"),
+            .color_hex = @constCast("#fff"),
+            .io_slot = @intCast(model.IO_BOT_MAX + index),
+            .conn = &active_connection,
+        };
+        try lobby.players.append(galloc, player);
+    }
+
+    try std.testing.expect(availableIoSlotLocked(&lobby) == null);
+    yieldIoBotSeatLocked(&lobby);
+
+    try std.testing.expectEqual(@as(u8, model.IO_BOT_MAX - 1), population.count);
+    try std.testing.expectEqual(@as(?u8, model.IO_BOT_MAX - 1), availableIoSlotLocked(&lobby));
+    try std.testing.expect(lobby.roster_dirty);
+}
+
+test "retained IO retry reclaims an active seat filled by bot easing" {
+    var population: model.IoBotPopulation = .{ .count = 6, .target = 6 };
+    for (population.bots[0..population.count], 0..) |*bot, slot| bot.io_slot = @intCast(slot);
+    var retained_connection: Conn = .{ .fd = -1 };
+    var retained = Player{
+        .id = "retained",
+        .name = @constCast("Retained"),
+        .color_hex = @constCast("#fff"),
+        .io_slot = 6,
+        .conn = &retained_connection,
+    };
+    retained_connection.player = &retained;
+    var lobby: Lobby = .{
+        .id = @constCast("default"),
+        .mode = .snek_io,
+        .io_bots = &population,
+        .max_players = 6,
+        .food = .{ .x = 0, .y = 0 },
+    };
+
+    // The retained human owns slot 6, while a newly eased sixth bot has taken
+    // the active seat. Retry must evict only that tail bot and reuse slot 6.
+    yieldIoBotRetrySeatLocked(&lobby);
+    try std.testing.expectEqual(@as(u8, 5), population.count);
+    try std.testing.expect(lobby.roster_dirty);
+
+    // Below active capacity, Retry reuses its slot without needless churn.
+    lobby.roster_dirty = false;
+    yieldIoBotRetrySeatLocked(&lobby);
+    try std.testing.expectEqual(@as(u8, 5), population.count);
+    try std.testing.expect(!lobby.roster_dirty);
+}
+
+test "bot population leaves reached targets instead of appearing fixed" {
+    galloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xfeed55);
+    var rng = prng.random();
+    const sim = try snek.Snek.init(galloc, 8, 64, &rng);
+    defer sim.deinit(galloc);
+    var population: model.IoBotPopulation = .{
+        .count = 25,
+        .target = 25,
+        .retarget_ticks = 1000,
+        .change_ticks = 1000,
+    };
+    var lobby: Lobby = .{
+        .id = @constCast("default"),
+        .mode = .snek_io,
+        .snek = sim,
+        .io_bots = &population,
+        .max_players = 100,
+        .food = .{ .x = 0, .y = 0 },
+    };
+
+    // A reached destination can pause briefly, but never for the full
+    // 45-120 second travel window.
+    tickIoBotsLocked(&lobby, &rng);
+    try std.testing.expect(population.retarget_ticks >= 30 * 4);
+    try std.testing.expect(population.retarget_ticks <= 30 * 12);
+
+    population.retarget_ticks = 0;
+    tickIoBotsLocked(&lobby, &rng);
+    try std.testing.expect(population.target != population.count);
+    try std.testing.expect(population.target >= model.IO_BOT_MIN);
+    try std.testing.expect(population.target <= model.IO_BOT_MAX);
+}
+
+test "bot-backed IO simulation is retained on a failed join cleanup" {
+    var population: model.IoBotPopulation = .{ .count = 5, .target = 5 };
+    var lobby: Lobby = .{
+        .id = @constCast("default"),
+        .mode = .snek_io,
+        .io_bots = &population,
+        .food = .{ .x = 0, .y = 0 },
+    };
+    try std.testing.expect(!shouldReleaseLazyIoSim(&lobby));
+    lobby.io_bots = null;
+    try std.testing.expect(shouldReleaseLazyIoSim(&lobby));
+}
+
+test "dead native bots respawn in place after normal collision drops" {
+    galloc = std.testing.allocator;
+    snek_tick_ns = config.TICK_NS_IO;
+    var prng = std.Random.DefaultPrng.init(91);
+    var rng = prng.random();
+    const sim = try snek.Snek.init(galloc, 1, 64, &rng);
+    defer sim.deinit(galloc);
+    var population: model.IoBotPopulation = .{ .count = 2, .target = 2, .retarget_ticks = 1000, .change_ticks = 1000 };
+    population.bots[0] = .{ .io_slot = 0, .name_index = 0, .decision_ticks = 200, .turn_bias = 1 };
+    population.bots[1] = .{ .io_slot = 1, .name_index = 1, .decision_ticks = 200, .turn_bias = -1 };
+    const first = sim.spawnSnake(0, &rng);
+    const second = sim.spawnSnake(1, &rng);
+    second.* = first.*;
+    second.slot = 1;
+    first.shield_ticks = 0;
+    second.shield_ticks = 0;
+    const food_before = sim.food.count;
+    var lobby: Lobby = .{
+        .id = @constCast("default"),
+        .mode = .snek_io,
+        .snek = sim,
+        .io_bots = &population,
+        .max_players = 100,
+        .food = .{ .x = 0, .y = 0 },
+    };
+    snekTickLocked(&lobby, 0, std.testing.allocator);
+    try std.testing.expect(sim.snakes[0].alive);
+    try std.testing.expect(sim.snakes[1].alive);
+    try std.testing.expect(sim.food.count > food_before);
+}
+
+test "native bot hazard steering reacts every tick without blocking edible targets" {
+    galloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xb07afe);
+    var rng = prng.random();
+    const sim = try snek.Snek.init(galloc, 1, 8, &rng);
+    defer sim.deinit(galloc);
+    const obstacle = snek.OBSTACLES[0];
+    sim.obstacle_alive_mask = 1;
+    var snake_state: snek.Snake = .{
+        .alive = true,
+        .head_x = obstacle.x - 180,
+        .head_y = obstacle.y,
+        .angle = 0,
+        .target_angle = 0,
+        .mass = snek.INITIAL_MASS,
+    };
+
+    const escape = ioBotHazardAvoidance(sim, &snake_state, 1);
+    try std.testing.expect(escape != null);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.05), escape.?, 0.001);
+
+    // A smashed hazard, an active shield, and a snake wide enough to eat the
+    // crate must not create a phantom avoidance turn.
+    sim.obstacle_alive_mask = 0;
+    try std.testing.expect(ioBotHazardAvoidance(sim, &snake_state, 1) == null);
+    sim.obstacle_alive_mask = 1;
+    snake_state.shield_ticks = 1;
+    try std.testing.expect(ioBotHazardAvoidance(sim, &snake_state, 1) == null);
+    snake_state.shield_ticks = 0;
+    snake_state.mass = 633;
+    try std.testing.expect(snek.Snek.snakeRadius(snake_state.mass) >= snek.CRATE_EAT_RADIUS);
+    try std.testing.expect(ioBotHazardAvoidance(sim, &snake_state, 1) == null);
+}
+
+test "55 native bots survive churn and serialize within the pooled frame bound" {
+    galloc = std.testing.allocator;
+    snek_tick_ns = config.TICK_NS_IO;
+    var spawn_prng = std.Random.DefaultPrng.init(0x55b075);
+    var spawn_rng = spawn_prng.random();
+    const sim = try snek.Snek.init(galloc, snek.FOOD_TARGET, snek.MAX_FOOD, &spawn_rng);
+    defer sim.deinit(galloc);
+    var population: model.IoBotPopulation = .{
+        .target = model.IO_BOT_MAX,
+        .retarget_ticks = std.math.maxInt(u16),
+        .change_ticks = std.math.maxInt(u16),
+    };
+    for (&population.bots, 0..) |*bot, index| {
+        bot.name_index = @intCast(index);
+        bot.turn_bias = if (index & 1 == 0) 1 else -1;
+    }
+    var lobby: Lobby = .{
+        .id = @constCast("default"),
+        .mode = .snek_io,
+        .snek = sim,
+        .io_bots = &population,
+        .max_players = 100,
+        .rng = std.Random.DefaultPrng.init(0x55c0de),
+        .food = .{ .x = 0, .y = 0 },
+    };
+    defer lobby.roster_wire.deinit(galloc);
+    while (population.count < model.IO_BOT_MAX) try std.testing.expect(addIoBotLocked(&lobby, &spawn_rng));
+
+    // Three seconds at the authoritative 30 Hz cadence exercises decisions,
+    // boosts, body collisions, deaths, and fixed-slot respawns at peak bots.
+    var saw_boost = false;
+    var saw_turn = false;
+    var saw_mass_change = false;
+    for (0..90) |tick_index| {
+        snekTickLocked(&lobby, @intCast(tick_index * 33), std.testing.allocator);
+        try std.testing.expectEqual(@as(u8, model.IO_BOT_MAX), population.count);
+        for (population.bots[0..population.count]) |bot| {
+            const snake_state = &sim.snakes[bot.io_slot];
+            saw_boost = saw_boost or snake_state.boosting;
+            saw_turn = saw_turn or snake_state.target_angle != snake_state.angle;
+            saw_mass_change = saw_mass_change or snake_state.mass != snek.INITIAL_MASS;
+        }
+    }
+    try std.testing.expect(saw_boost);
+    try std.testing.expect(saw_turn);
+    try std.testing.expect(saw_mass_change);
+
+    var slots = [_]bool{false} ** snek.MAX_SNAKES;
+    for (population.bots[0..population.count]) |bot| {
+        try std.testing.expect(!slots[bot.io_slot]);
+        slots[bot.io_slot] = true;
+        const snake_state = &sim.snakes[bot.io_slot];
+        try std.testing.expect(snake_state.alive);
+        try std.testing.expect(std.math.isFinite(snake_state.angle));
+        try std.testing.expect(std.math.isFinite(snake_state.target_angle));
+        try std.testing.expect(snake_state.mass >= snek.MIN_BOOST_MASS);
+        try std.testing.expect(snake_state.mass <= snek.MAX_MASS);
+    }
+
+    // Exercise the high-score serialization shape too. Replicating the last
+    // valid body sample is sufficient because this checks bounded encoding,
+    // not movement geometry, and avoids another large fixture allocation.
+    for (population.bots[0..population.count]) |bot| {
+        const snake_state = &sim.snakes[bot.io_slot];
+        const sample = snake_state.body[snake_state.rb_head];
+        @memset(&snake_state.body, sample);
+        snake_state.mass = snek.MAX_MASS;
+        snake_state.rb_len = snek.MAX_MASS;
+    }
+    var wire: std.ArrayListUnmanaged(u8) = .empty;
+    defer wire.deinit(galloc);
+    const snapshot = try snek_snapshot.buildInto(&wire, &lobby, galloc);
+    try std.testing.expectEqual(@as(u8, model.IO_BOT_MAX), snapshot.bytes[5]);
+    try std.testing.expect(snapshot.bytes.len > 200 * 1024);
+    try std.testing.expect(snapshot.bytes.len <= SNAPSHOT_POOL_MAX_CAPACITY);
+    const worst_case_wire = 12 + snek.MAX_SNAKES * (11 + snek.MAX_MASS * 4) + snek.MAX_FOOD * 7;
+    try std.testing.expect(worst_case_wire <= SNAPSHOT_POOL_MAX_CAPACITY);
 }
 
 test "Arcade collision credit requires one non-head body owner" {
