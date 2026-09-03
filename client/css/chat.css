@@ -193,6 +193,7 @@
 
 @media (max-height: 420px) and (orientation: landscape) {
     .game-chat.is-open .chat-history { max-height: 32vh; }
+    .game-chat:not(.is-open) .chat-message:nth-last-child(n + 3) { display: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {
