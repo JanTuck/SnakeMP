@@ -101,6 +101,11 @@ export default class GameOverMenu extends Menu {
         this.context = context;
         this.retry = retry;
         if (this.compact) return;
+        // Death can happen while the snake coasts behind an open Chat panel.
+        // This region is deliberately non-modal, so keep the player's editing
+        // focus instead of redirecting their next keystroke to Retry.
+        const chat = document.getElementById("game_chat");
+        if (chat !== null && chat.contains(this.previousFocus)) return;
         const focusRetry = () => retry.focus({ preventScroll: true });
         if (typeof requestAnimationFrame === "function") requestAnimationFrame(focusRetry);
         else focusRetry();
@@ -173,12 +178,17 @@ export default class GameOverMenu extends Menu {
     }
 
     destroy() {
+        const restoreFocus = this.overlay !== null && typeof document !== "undefined" &&
+            this.overlay.contains(document.activeElement);
         this.overlay?.remove();
         this.overlay = null;
         this.scoreOutput = null;
         this.context = null;
         this.retry = null;
-        if (typeof HTMLElement !== "undefined" && this.previousFocus instanceof HTMLElement) {
+        // Do not yank focus away from the still-live Chat control when a
+        // reconnect tears down this non-modal overlay. Restore only when the
+        // removed overlay itself owned focus.
+        if (restoreFocus && typeof HTMLElement !== "undefined" && this.previousFocus instanceof HTMLElement) {
             this.previousFocus.focus({ preventScroll: true });
         }
     }
