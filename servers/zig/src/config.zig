@@ -16,9 +16,9 @@ pub const TICK_NS_IO: u64 = 33_333_333;
 /// to stay warm without paying the foreground 15 Hz fan-out cost.
 pub const BACKGROUND_SNAPSHOT_MS: i64 = 1_000;
 
-/// One process intentionally maps to one protocol-sized arena. Operators can
-/// lower these limits, but cannot raise them beyond the 32-player wire cap.
-pub const DEFAULT_MAX_PLAYERS_GLOBAL: usize = 32;
+/// One process intentionally maps to one protocol-sized arena. Grid lobbies
+/// remain capped at 32 by snapshot v5; the process and IO protocol allow 100.
+pub const DEFAULT_MAX_PLAYERS_GLOBAL: usize = 100;
 pub const DEFAULT_MAX_PLAYERS_PER_LOBBY: usize = 32;
 /// Includes the permanent default lobby. Empty generated lobbies are cheap,
 /// but still retain ids, maps, and debug-metric rows until their idle TTL.
