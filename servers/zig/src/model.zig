@@ -9,6 +9,30 @@ pub const CELL: i32 = 16;
 pub const SID_LEN = 22;
 pub const MAX_REMAINS: usize = 63;
 pub const MAX_SPECTATORS: usize = 16;
+pub const IO_BOT_MIN: usize = 5;
+pub const IO_BOT_MAX: usize = 55;
+/// The public join UI exposes this many server-authoritative color styles.
+/// The selection travels as one bounded byte and does not add heap state.
+pub const PLAYER_STYLE_COUNT: u8 = 6;
+
+/// An IO bot is only simulation metadata: its body and mass already live in
+/// the fixed Snek arrays. Keeping names and colors as process-lifetime table
+/// indexes makes the complete default-lobby population a single small
+/// allocation, with no socket or per-player heap graph.
+pub const IoBot = struct {
+    io_slot: u8 = 0,
+    name_index: u8 = 0,
+    decision_ticks: u8 = 0,
+    turn_bias: i8 = 0,
+};
+
+pub const IoBotPopulation = struct {
+    count: u8 = 0,
+    target: u8 = 0,
+    retarget_ticks: u16 = 0,
+    change_ticks: u16 = 0,
+    bots: [IO_BOT_MAX]IoBot = [_]IoBot{.{}} ** IO_BOT_MAX,
+};
 
 pub const CHAT_TOKEN_CAPACITY: u8 = 4;
 pub const CHAT_REFILL_MS: i64 = 750;
@@ -83,6 +107,8 @@ pub const Player = struct {
     kills: u16 = 0,
     streak: u16 = 0,
     last_kill_at: i64 = 0,
+    /// Stable Snek IO simulation slot. Grid players leave this null.
+    io_slot: ?u8 = null,
     conn: *Conn,
 
     pub fn pushTurn(player: *Player, direction: Direction) bool {
@@ -203,6 +229,12 @@ test "tail shedding preserves the configured minimum length" {
     try std.testing.expectEqual(@as(usize, 2), player.snake.items.len);
 }
 
+test "native IO bot metadata remains a tiny fixed allocation" {
+    try std.testing.expectEqual(@as(usize, 4), @sizeOf(IoBot));
+    try std.testing.expectEqual(@as(usize, 226), @sizeOf(IoBotPopulation));
+    try std.testing.expectEqual(@as(usize, 8), @sizeOf(?*IoBotPopulation));
+}
+
 pub const BonusApple = struct { pos: CellPos };
 pub const Drop = struct { pos: CellPos, expires_at: i64 };
 pub const Golden = struct { pos: CellPos, expires_at: i64 };
@@ -290,6 +322,9 @@ pub const Lobby = struct {
     /// main.createLobbyLocked and freed by main.destroyLobby. Null for
     /// classical/arcade lobbies, which pay zero cost for the snek module.
     snek: ?*snek.Snek = null,
+    /// Present only on the permanent public IO lobby. Private/generated rooms
+    /// remain bot-free and pay only for this nullable pointer.
+    io_bots: ?*IoBotPopulation = null,
     /// Optional arena rule chosen by the lobby creator. Crossing any edge
     /// re-enters on the opposite edge instead of counting as a wall death.
     wrap_walls: bool = false,
