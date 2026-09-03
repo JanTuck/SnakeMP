@@ -64,8 +64,8 @@ const path = require('node:path');
       { translate: '0 -50px', opacity: 0 },
       { translate: '0 0', opacity: 1 },
     ],
-    timing: { duration: 500, easing: 'cubic-bezier(0.333333, 1.533333, 0.666667, 1)' },
-  }, 'popup entrance must retain the 50px Back-out(1.6) choreography');
+    timing: { duration: 420, easing: 'cubic-bezier(0.22, 1, 0.36, 1)' },
+  }, 'popup entrance must retain the 50px quintic ease-out choreography');
   assert.equal(Motion.popup(null), null, 'missing optional popup is a safe no-op');
 
   preference.matches = true;

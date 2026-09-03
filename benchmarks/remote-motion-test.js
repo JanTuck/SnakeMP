@@ -16,6 +16,10 @@ function near(actual, expected, message, epsilon = 1e-9) {
   const source = fs.readFileSync(path.join(__dirname, '..', 'client', 'js', 'snake.js'), 'utf8');
   const moduleUrl = 'data:text/javascript;base64,' + Buffer.from(source).toString('base64');
   const { RemoteInterpolationClock } = await import(moduleUrl);
+  const ioWorldSource = fs.readFileSync(path.join(__dirname, '..', 'client', 'js', 'ioWorld.js'), 'utf8');
+  const { ioInterpolateAngle } = await import(
+    'data:text/javascript;base64,' + Buffer.from(ioWorldSource).toString('base64')
+  );
   assert.equal(typeof RemoteInterpolationClock, 'function',
     'the production remote interpolation clock must remain directly testable');
 
@@ -80,12 +84,32 @@ function near(actual, expected, message, epsilon = 1e-9) {
   const local60 = sampleAt(60, 'local');
   const remote120 = sampleAt(120, 'remote');
   const local120 = sampleAt(120, 'local');
+  const remote144 = sampleAt(144, 'remote/IO');
+  const remote240 = sampleAt(240, 'remote/IO');
   assert.deepEqual(local60.samples, remote60.samples,
     'local and remote straight-line presentation must be identical at 60 Hz');
   assert.deepEqual(local120.samples, remote120.samples,
     'local and remote straight-line presentation must be identical at 120 Hz');
   near(remote60.expectedStep, 0.25, '60 Hz renders four equal frames per server cell');
   near(remote120.expectedStep, 0.125, '120 Hz renders eight equal frames per server cell');
+  near(remote144.expectedStep, 15 / 144, '144 Hz motion remains display-refresh paced over 15 Hz snapshots');
+  near(remote240.expectedStep, 15 / 240, '240 Hz motion remains display-refresh paced over 15 Hz snapshots');
+  assert(remote240.samples.length > remote144.samples.length && remote144.samples.length > remote120.samples.length,
+    'faster monitors receive more interpolated positions rather than repeating a 15 Hz presentation');
+
+  for (const refreshHz of [60, 120, 144, 240]) {
+    const step = 15 / refreshHz;
+    const angles = [];
+    for (let frame = 0; frame <= Math.ceil(1 / step); frame++) {
+      angles.push(ioInterpolateAngle(350 / 180 * Math.PI, 10 / 180 * Math.PI,
+        Math.min(1, frame * step)));
+    }
+    const deltas = angles.slice(1).map((angle, index) => angle - angles[index]);
+    assert(deltas.every(delta => delta > 0),
+      `${refreshHz} Hz IO heading must advance smoothly through the 360-degree seam`);
+    near(angles.at(-1), 370 / 180 * Math.PI,
+      `${refreshHz} Hz IO heading reaches the authoritative angle by its short arc`, 1e-8);
+  }
 
   const bounded = new RemoteInterpolationClock(TICK_MS);
   bounded.snapshot(0, 65535);
@@ -99,7 +123,7 @@ function near(actual, expected, message, epsilon = 1e-9) {
   bounded.reset();
   assert.equal(bounded.progress(10_000), 1, 'reset cannot leave stale interpolation running');
 
-  console.log('local/remote motion tests: PASS (60/120 Hz, jitter continuity, bounded recovery)');
+  console.log('local/remote motion tests: PASS (60/120/144/240 Hz, jitter continuity, bounded recovery)');
 })().catch((error) => {
   console.error(error.stack || error);
   process.exitCode = 1;
