@@ -33,7 +33,10 @@ pub const LobbyStats = struct {
 pub const Stats = struct {
     rss: u64,
     uptime: f64,
+    /// Human WebSocket players; retained for capacity/benchmark compatibility.
     totalPlayers: usize,
+    bots: usize,
+    visiblePlayers: usize,
     maxPlayers: usize,
     maxPlayersPerLobby: usize,
     maxLobbies: usize,
@@ -81,6 +84,8 @@ test "typed stats JSON escapes strings and preserves field names" {
         .rss = 1,
         .uptime = 2,
         .totalPlayers = 3,
+        .bots = 5,
+        .visiblePlayers = 8,
         .maxPlayers = 4,
         .maxPlayersPerLobby = 5,
         .maxLobbies = 64,
