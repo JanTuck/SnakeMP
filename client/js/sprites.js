@@ -6,6 +6,20 @@ const FILES = {
     apple: 'apple.png',
     golden: 'golden.png',
     crate: 'crate.png',
+    ioHead: 'io-360-head.png',
+    ioBody: 'io-360-body.png',
+    ioTail: 'io-360-tail.png',
+    ioBoost: 'io-360-boost-ring.png',
+    ioApple: 'io/apple.png',
+    ioStrawberry: 'io/strawberry.png',
+    ioCheese: 'io/cheese.png',
+    ioDonut: 'io/donut.png',
+    ioGoldenApple: 'io/golden-apple.png',
+    ioLightning: 'io/lightning-berry.png',
+    ioRainbow: 'io/rainbow-candy.png',
+    ioFeast: 'io/feast-platter.png',
+    ioCrate: 'io/crate.png',
+    ioMine: 'io/spike-mine.png',
 };
 
 function loadImage(file) {
@@ -16,6 +30,8 @@ function loadImage(file) {
         img.src = '/img/' + file;
     });
 }
+
+const IO_STYLE_COLORS = ['#51cf66', '#ff6b6b', '#fcc419', '#339af0', '#845ef7', '#f6e6c7'];
 
 // Procedural fallbacks, drawn once into offscreen canvases.
 function procedural(name) {
@@ -61,12 +77,18 @@ function procedural(name) {
         g.moveTo(6, 10); g.lineTo(58, 58);
         g.moveTo(58, 10); g.lineTo(6, 58);
         g.stroke();
+    } else {
+        g.fillStyle = '#a8ec18';
+        g.beginPath();
+        g.arc(32, 32, name === 'ioBody' ? 25 : 29, 0, Math.PI * 2);
+        g.fill();
     }
     return c;
 }
 
 export const Sprites = {
     images: new Map(),
+    ioVariants: new Map(),
 
     async load() {
         const pairs = await Promise.all(Object.values(FILES).map(loadImage));
@@ -79,5 +101,45 @@ export const Sprites = {
 
     get(name) {
         return this.images.get(name);
+    },
+
+    getIo(name, styleIndex) {
+        const source = this.images.get(name);
+        if (source === undefined) return undefined;
+        const palette = Math.max(0, Math.min(IO_STYLE_COLORS.length - 1, styleIndex | 0));
+        let variants = this.ioVariants.get(name);
+        if (variants === undefined) {
+            variants = new Array(IO_STYLE_COLORS.length);
+            this.ioVariants.set(name, variants);
+        }
+        const cached = variants[palette];
+        if (cached !== undefined) return cached;
+        const canvas = document.createElement('canvas');
+        canvas.width = 64;
+        canvas.height = 64;
+        const context = canvas.getContext('2d');
+        context.imageSmoothingEnabled = true;
+        context.drawImage(source, 0, 0, 64, 64);
+        context.globalCompositeOperation = 'source-atop';
+        context.globalAlpha = 0.72;
+        context.fillStyle = IO_STYLE_COLORS[palette];
+        context.fillRect(0, 0, 64, 64);
+        context.globalAlpha = palette === 5 ? 0.7 : 0.3;
+        context.fillStyle = '#151914';
+        if (palette === 1) {
+            for (let x = 6; x < 64; x += 15) context.fillRect(x, 0, 5, 64);
+        } else if (palette === 2 || palette === 4 || palette === 5) {
+            for (const [x, y, radius] of [[17, 18, 5], [42, 35, 7], [24, 53, 4]]) {
+                context.beginPath();
+                context.arc(x, y, palette === 5 ? radius : radius * 0.62, 0, Math.PI * 2);
+                context.fill();
+            }
+        } else if (palette === 3) {
+            for (let y = 10; y < 64; y += 16) context.fillRect(0, y, 64, 4);
+        }
+        context.globalCompositeOperation = 'source-over';
+        context.globalAlpha = 1;
+        variants[palette] = canvas;
+        return canvas;
     },
 };
