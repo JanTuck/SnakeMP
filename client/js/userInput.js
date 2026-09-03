@@ -26,6 +26,35 @@ const queuedDirections = [];
 let gameMode = "arcade";
 let boostHeld = false;
 let gameplayEnabled = false;
+let steerFrame = 0;
+let pendingSteer = null;
+let predictedSteer = null;
+const ioBoostButton = document.getElementById?.("io_boost") ?? null;
+const ioCanvas = document.getElementById?.("canvas") ?? null;
+let steeringCenterX = null;
+let steeringCenterY = null;
+
+function invalidateSteeringCenter() {
+    steeringCenterX = null;
+    steeringCenterY = null;
+}
+
+function refreshSteeringCenter() {
+    if (steeringCenterX !== null && steeringCenterY !== null) return;
+    const rect = ioCanvas?.getBoundingClientRect?.();
+    if (rect !== undefined && rect.width > 0 && rect.height > 0) {
+        steeringCenterX = rect.left + rect.width / 2;
+        steeringCenterY = rect.top + rect.height / 2;
+        return;
+    }
+    steeringCenterX = globalThis.innerWidth / 2;
+    steeringCenterY = globalThis.innerHeight / 2;
+}
+
+function cancelPendingSteer() {
+    pendingSteer = null;
+    predictedSteer = null;
+}
 
 function isEditingTarget(target) {
     const tag = target && typeof target.tagName === "string" ? target.tagName.toUpperCase() : "";
@@ -36,7 +65,15 @@ function isEditingTarget(target) {
 function emitBoost(active) {
     if (boostHeld === active) return;
     boostHeld = active;
+    ioBoostButton?.setAttribute("aria-pressed", active ? "true" : "false");
     socket.emit("boost", active);
+}
+
+function syncIoBoostButton() {
+    if (ioBoostButton === null) return;
+    const available = gameplayEnabled && gameMode === "snek_io";
+    ioBoostButton.hidden = !available;
+    ioBoostButton.disabled = !available;
 }
 
 export function releaseBoost() {
@@ -44,13 +81,25 @@ export function releaseBoost() {
 }
 
 export function setGameMode(mode) {
-    gameMode = mode === "arcade" ? "arcade" : mode === "classical" ? "classical" : "arcade";
-    if (gameMode !== "arcade") releaseBoost();
+    // An init/rejoin starts a fresh input session. Clear any held state before
+    // switching modes so a lost key/pointer-up cannot poison the next round.
+    releaseBoost();
+    cancelPendingSteer();
+    invalidateSteeringCenter();
+    gameMode = mode === "arcade" || mode === "snek_io" ? mode : "classical";
+    syncIoBoostButton();
 }
 
 export function setGameplayEnabled(enabled) {
     gameplayEnabled = enabled === true;
-    if (!gameplayEnabled) releaseBoost();
+    if (!gameplayEnabled) {
+        releaseBoost();
+        // A queued requestAnimationFrame may run after a very fast reconnect
+        // and re-init. Drop its old-life steering intent now so that callback
+        // cannot turn the newly spawned snake before the player moves again.
+        cancelPendingSteer();
+    }
+    syncIoBoostButton();
 }
 
 // Reconcile the local turn predictor with authoritative movement. Keeping
@@ -73,6 +122,11 @@ export function syncDirection(direction) {
 export function resetDirection() {
     observedDirection = null;
     queuedDirections.length = 0;
+    cancelPendingSteer();
+}
+
+export function getPredictedSteerAngle() {
+    return predictedSteer === null ? null : predictedSteer / 65535 * Math.PI * 2;
 }
 
 function predictedDirection() {
@@ -102,7 +156,7 @@ function handleDirection(event) {
     const input = INPUTS.get(event.code);
     if (input === undefined || !gameplayEnabled) return;
 
-    if (isEditingTarget(event.target)) return;
+    if (isEditingTarget(event.target) || gameMode === "snek_io") return;
 
     event.preventDefault();
     if (event.repeat) return;
@@ -111,10 +165,27 @@ function handleDirection(event) {
 }
 
 function handleBoostDown(event) {
-    if (event.code !== "Space" || !gameplayEnabled || gameMode !== "arcade" || isEditingTarget(event.target)) return;
+    if (event.code !== "Space" || !gameplayEnabled || gameMode === "classical" || isEditingTarget(event.target)) return;
     event.preventDefault();
     if (event.repeat || boostHeld) return;
     emitBoost(true);
+}
+
+function flushSteer() {
+    steerFrame = 0;
+    const angle = pendingSteer;
+    pendingSteer = null;
+    if (angle === null || !gameplayEnabled || gameMode !== "snek_io") return;
+    socket.emit("steer", angle);
+}
+
+function handlePointer(event) {
+    if (!gameplayEnabled || gameMode !== "snek_io" || isEditingTarget(event.target)) return;
+    refreshSteeringCenter();
+    const angle = Math.atan2(event.clientY - steeringCenterY, event.clientX - steeringCenterX);
+    pendingSteer = Math.round(((angle + Math.PI * 2) % (Math.PI * 2)) / (Math.PI * 2) * 65535);
+    predictedSteer = pendingSteer;
+    if (!steerFrame) steerFrame = requestAnimationFrame(flushSteer);
 }
 
 function handleBoostUp(event) {
@@ -123,10 +194,38 @@ function handleBoostUp(event) {
     emitBoost(false);
 }
 
+function handleTouchBoostDown(event) {
+    if (!gameplayEnabled || gameMode !== "snek_io") return;
+    event.preventDefault();
+    ioBoostButton?.setPointerCapture?.(event.pointerId);
+    emitBoost(true);
+}
+
+function handleTouchBoostEnd(event) {
+    if (!boostHeld) return;
+    event.preventDefault?.();
+    emitBoost(false);
+}
+
 document.addEventListener("keydown", handleDirection);
 document.addEventListener("keydown", handleBoostDown);
 document.addEventListener("keyup", handleBoostUp);
+document.addEventListener("pointermove", handlePointer, { passive: true });
+document.addEventListener("pointerdown", handlePointer, { passive: true });
+ioBoostButton?.addEventListener("pointerdown", handleTouchBoostDown);
+ioBoostButton?.addEventListener("pointerup", handleTouchBoostEnd);
+ioBoostButton?.addEventListener("pointercancel", handleTouchBoostEnd);
+ioBoostButton?.addEventListener("lostpointercapture", handleTouchBoostEnd);
+ioBoostButton?.addEventListener("contextmenu", (event) => event.preventDefault());
 document.addEventListener("visibilitychange", () => {
-    if (document.hidden) releaseBoost();
+    if (document.hidden) {
+        releaseBoost();
+        cancelPendingSteer();
+    }
 });
-if (typeof window !== "undefined") window.addEventListener("blur", releaseBoost);
+if (typeof window !== "undefined") window.addEventListener("blur", () => {
+    releaseBoost();
+    cancelPendingSteer();
+});
+if (typeof window !== "undefined") window.addEventListener("resize", invalidateSteeringCenter, { passive: true });
+window.visualViewport?.addEventListener?.("resize", invalidateSteeringCenter, { passive: true });
