@@ -14,6 +14,8 @@
     ];
     const visibilityPacket = [Uint8Array.of(3, 0), Uint8Array.of(3, 1)];
     const boostPacket = [Uint8Array.of(4, 0), Uint8Array.of(4, 1)];
+    const steerPacket = new Uint8Array(3);
+    steerPacket[0] = 6;
 
     class SnekSocket {
         constructor() {
@@ -25,6 +27,8 @@
             // that attaches late instead of silently dropping it.
             this.hasInit = false;
             this.lastInit = undefined;
+            this.hasRoster = false;
+            this.lastRoster = undefined;
             this.pendingJoin = null;
             this.retryMs = 250;
             this.connect();
@@ -34,6 +38,7 @@
             if (handlers === undefined) this.listeners.set(name, handlers = []);
             handlers.push(handler);
             if (name === 'init' && this.hasInit) handler(this.lastInit);
+            else if (name === 'r' && this.hasRoster) handler(this.lastRoster);
             return this;
         }
         reconnect() {
@@ -88,9 +93,14 @@
                 if (event[0] === 'init') {
                     this.hasInit = true;
                     this.lastInit = event[1];
+                } else if (event[0] === 'r') {
+                    this.hasRoster = true;
+                    this.lastRoster = event[1];
                 } else if (event[0] === 'game_error') {
                     this.hasInit = false;
                     this.lastInit = undefined;
+                    this.hasRoster = false;
+                    this.lastRoster = undefined;
                 }
                 this.dispatch(event[0], event[1]);
             };
@@ -99,13 +109,15 @@
                 this.id = '';
                 this.hasInit = false;
                 this.lastInit = undefined;
+                this.hasRoster = false;
+                this.lastRoster = undefined;
                 this.dispatch('disconnect', 'transport close');
                 const delay = this.retryMs;
                 this.retryMs = Math.min(5000, this.retryMs * 2);
                 setTimeout(() => this.connect(), delay);
             };
         }
-        emit(name, first, second, third) {
+        emit(name, first, second, third, fourth) {
             if (name === 'keyPress') {
                 const code = directionCode[first];
                 // Stale direction input is worse than dropped input: after a
@@ -119,6 +131,14 @@
             if (name === 'boost') {
                 if (this.ws.readyState !== WebSocket.OPEN) return false;
                 this.ws.send(boostPacket[first === true ? 1 : 0]);
+                return true;
+            }
+            if (name === 'steer') {
+                if (this.ws.readyState !== WebSocket.OPEN || !Number.isFinite(first)) return false;
+                const angle = Math.max(0, Math.min(65535, Math.round(first)));
+                steerPacket[1] = angle & 0xff;
+                steerPacket[2] = angle >>> 8;
+                this.ws.send(steerPacket);
                 return true;
             }
             if (name === 'chat') {
@@ -138,14 +158,19 @@
             // while the request is in flight.
             this.hasInit = false;
             this.lastInit = undefined;
+            this.hasRoster = false;
+            this.lastRoster = undefined;
             const username = encoder.encode(String(first));
             const lobby = encoder.encode(String(second));
             // Passwords are opaque user input. Preserve whitespace and other
             // characters exactly; only the protocol's UTF-8 byte bound applies.
             const password = encoder.encode(third == null ? '' : String(third));
+            // The optional appearance byte extends the original packet without
+            // changing it for older markup or benchmark clients.
+            const hasStyle = Number.isInteger(fourth) && fourth >= 0 && fourth < 6;
             if (username.length === 0 || username.length > 255 ||
                 lobby.length === 0 || lobby.length > 255 || password.length > 64) return false;
-            const packet = new Uint8Array(4 + lobby.length + username.length + password.length);
+            const packet = new Uint8Array(4 + lobby.length + username.length + password.length + (hasStyle ? 1 : 0));
             packet[0] = 1;
             packet[1] = lobby.length;
             packet[2] = username.length;
@@ -153,6 +178,7 @@
             packet.set(lobby, 4);
             packet.set(username, 4 + lobby.length);
             packet.set(password, 4 + lobby.length + username.length);
+            if (hasStyle) packet[packet.length - 1] = fourth;
             if (this.ws.readyState === WebSocket.OPEN) {
                 this.pendingJoin = null;
                 this.ws.send(packet);
