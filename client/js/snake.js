@@ -5,6 +5,23 @@ const HEADING_VECTOR = Object.freeze({
     ArrowUp: Object.freeze([0, -1])
 });
 
+export const SNAKE_STYLE_COLORS = Object.freeze([
+    '#51cf66', '#ff6b6b', '#fcc419', '#339af0', '#845ef7', '#f6e6c7'
+]);
+
+// The server-authoritative roster color carries the selected bounded style.
+// The id hash is only a stable fallback for an older server/color.
+export function snakeStyleIndex(color, id = '') {
+    const exact = SNAKE_STYLE_COLORS.indexOf(String(color).toLowerCase());
+    if (exact >= 0) return exact;
+    let hash = 2166136261;
+    for (let index = 0; index < id.length; index++) {
+        hash ^= id.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0) % SNAKE_STYLE_COLORS.length;
+}
+
 // Keep remote presentation time independent from packet-arrival jitter. The
 // server still advances at 15 Hz; this clock merely lets requestAnimationFrame
 // distribute each authoritative cell step evenly across the display refreshes.
@@ -60,6 +77,7 @@ export default class Snake {
         this.id = meta[0];
         this.displayName = meta[1];
         this.color = meta[2];
+        this.style = snakeStyleIndex(meta[2], meta[0]);
         this.score = 0;
         this.bodyLength = 0;
         this.interpolate = false;
@@ -101,6 +119,7 @@ export default class Snake {
         this.id = meta[0];
         this.displayName = meta[1];
         this.color = meta[2];
+        this.style = snakeStyleIndex(meta[2], meta[0]);
         this.score = player.score;
         this.bodyLength = player.cells;
         // A recovery keyframe may jump several cells after dropped deltas;
@@ -141,6 +160,7 @@ export default class Snake {
         this.id = meta[0];
         this.displayName = meta[1];
         this.color = meta[2];
+        this.style = snakeStyleIndex(meta[2], meta[0]);
         this.score = player.score;
         this.bodyLength = player.cells;
     }
@@ -159,6 +179,28 @@ export default class Snake {
         ctx.arcTo(x, y, x + w, y, r);
         ctx.closePath();
         ctx.fill();
+    }
+
+    drawStyleMark(x, y, size, segmentIndex, head = false) {
+        if (this.style === 0) return;
+        const ctx = this.ctx;
+        ctx.save();
+        ctx.globalAlpha = this.style === 5 ? 0.72 : 0.34;
+        ctx.fillStyle = this.style === 5 ? '#20231e' : '#090d0b';
+        if (this.style === 1) {
+            ctx.fillRect(x + size * 0.2, y + size * 0.18, size * 0.18, size * 0.64);
+        } else if (this.style === 2) {
+            ctx.beginPath();
+            ctx.arc(x + size * (segmentIndex % 2 ? 0.36 : 0.64), y + size * 0.5, size * 0.12, 0, Math.PI * 2);
+            ctx.fill();
+        } else if (this.style === 3) {
+            ctx.fillRect(x + size * 0.18, y + size * (segmentIndex % 2 ? 0.58 : 0.28), size * 0.64, size * 0.12);
+        } else {
+            ctx.beginPath();
+            ctx.arc(x + size * (head ? 0.38 : segmentIndex % 2 ? 0.35 : 0.65), y + size * 0.42, size * (this.style === 5 ? 0.18 : 0.13), 0, Math.PI * 2);
+            ctx.fill();
+        }
+        ctx.restore();
     }
 
     // t in [0, 1]: interpolation between the previous and current tick.
@@ -201,6 +243,7 @@ export default class Snake {
                 ctx.lineWidth = 1.25;
                 ctx.stroke();
                 ctx.restore();
+                this.drawStyleMark(x - 1, y - 1, s + 2, i, true);
                 const predicted = isLocal && localDirection !== null ? HEADING_VECTOR[localDirection] : undefined;
                 const dx = c.x - (prev[0] ? prev[0].x : c.x);
                 const dy = c.y - (prev[0] ? prev[0].y : c.y);
@@ -227,6 +270,7 @@ export default class Snake {
                 ctx.globalAlpha = i % 2 === 0 ? 1 : 0.78;
                 ctx.fillStyle = this.color;
                 this.roundRect(x + 1, y + 1, s - 2, s - 2, 3);
+                this.drawStyleMark(x + 1, y + 1, s - 2, i);
                 ctx.globalAlpha = 1;
             }
         }
