@@ -18,7 +18,7 @@ const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)');
 // let the browser's compositor run it directly through the Web Animations API.
 const POWER3_OUT = 'cubic-bezier(0.165, 0.84, 0.44, 1)';
 const QUAD_OUT = 'cubic-bezier(0.333333, 0.666667, 0.666667, 1)';
-const BACK_OUT_1_6 = 'cubic-bezier(0.333333, 1.533333, 0.666667, 1)';
+const QUINT_OUT = 'cubic-bezier(0.22, 1, 0.36, 1)';
 
 function play(element, keyframes, timing) {
     if (reducedMotion.matches || typeof element?.animate !== 'function') return null;
@@ -52,7 +52,7 @@ export const Motion = Object.freeze({
         return play(popup, [
             { translate: '0 -50px', opacity: 0 },
             { translate: '0 0', opacity: 1 },
-        ], { duration: 500, easing: BACK_OUT_1_6 });
+        ], { duration: 420, easing: QUINT_OUT });
     },
 });
 
@@ -69,6 +69,7 @@ function setText(element, value) {
 
 function modeLabel() {
     if (gameMode === 'classical') return 'Classical';
+    if (gameMode === 'snek_io') return 'IO';
     return 'Arcade';
 }
 
@@ -194,7 +195,7 @@ export const Hud = {
     setMode(mode) {
         gameMode = mode === true || mode === 'classical'
             ? 'classical'
-            : mode === 'arcade' ? 'arcade' : 'arcade';
+            : mode === 'snek_io' ? 'snek_io' : 'arcade';
         if (els === null) return;
         delete els.mode.dataset.feast;
         setText(els.mode, modeLabel());
@@ -206,7 +207,8 @@ export const Hud = {
         }
         els.board.setAttribute('aria-label', gameMode === 'classical'
             ? 'Classical mode standings; special pickups are disabled'
-            : `${modeLabel()} standings; special pickups are enabled`);
+            : gameMode === 'snek_io' ? 'IO mode standings; continuous arena mass ranking'
+            : 'Arcade standings; special pickups are enabled');
     },
 
     setMuted(muted) {
