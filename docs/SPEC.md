@@ -37,7 +37,7 @@ The worker packing threshold is configurable with `SNEK_LOBBIES_PER_WORKER`.
 The default of 128 was validated at 750 active lobbies: six game workers held
 the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
 
-## Board and movement
+## Boards and movement
 
 - Board: 2048 x 1152 logical pixels, an exact 16:9 playfield that maps directly
   to 1280 x 720, 1920 x 1080, and 2560 x 1440 displays. The browser maps the
@@ -49,6 +49,11 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
 - Input is a queue of at most two turns. A new turn is rejected if it repeats
   or reverses the last queued/applied direction. One queued turn is applied per
   tick.
+- IO uses a separate 8192 x 8192 continuous toroidal world. Its simulation runs
+  two 30 Hz physics substeps per 15 Hz publication tick. Absolute pointer/touch
+  angles turn at a length-scaled rate; the browser presents those snapshots on
+  every display refresh. Held boost doubles speed while burning mass above the
+  playable minimum. Base movement is 180 world units per second.
 
 ## Lobbies and capacity
 
@@ -63,8 +68,24 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
   adds length-funded boost, collectible remains, feast periods, leader
   bounties, credited kill streaks, proximity danger cues, and a remains-aware
   wreckage focus.
-- The two modes are first-class rulesets: playing one never changes the other's
-  behavior.
+- **IO** has 5,000 ambient pellets by default, eight sparse illustrated party
+  pickups, mass-scaled snake width, smooth continuous bodies, corpse pellets,
+  spatial-hash body collision, camera-follow rendering, seamless world
+  wrapping, and a default 100-player room ceiling. Its fixed landmark field has
+  large snake-piñata crates and spike bombs. Small snakes crash into them;
+  sufficiently massive or rainbow-shielded snakes smash them, piñatas bursting
+  into 24 feed pickups, and each landmark respawns after a safe 30-second
+  cooldown. Lightning berries
+  grant four seconds of free turbo and rainbow candy grants five seconds of
+  hazard-smashing shield. Held IO boost doubles speed and costs one mass per
+  eight active 30 Hz steps; releases preserve the partial cost, so feathering
+  cannot create free movement, and boost stops at mass 22. Growth queued at
+  the 1,000-mass cap is discarded rather than becoming a hidden boost reserve.
+  Corpse trails keep a fixed maximum of 150 slots and give two growth each:
+  the collectible recovery is 100% for a mass-300 victim, 47.4% at the
+  mass-633 / 128 px piñata milestone, and 30% at the mass-1,000 cap.
+- The three modes are first-class rulesets: playing one never changes another's
+  behavior. Arcade is the former Arcade v2 ruleset and is now the only Arcade.
 - Lobby `12345` always exists and is never deleted.
 - At most 4096 lobbies exist by default, including `12345`
   (`SNEK_MAX_LOBBIES`). At capacity, `POST /generateid` returns HTTP 503 without
@@ -77,22 +98,23 @@ the 15 Hz cadence with a per-lobby tick p99 of 0.244 ms.
   authoritative counter. Death converts an active identity in place, Retry
   converts it back, and disconnect/eviction releases it. The `/debug/stats`
   player count remains active snakes only.
-- Default lobby capacity is 16 players (`SNEK_MAX_PLAYERS_PER_LOBBY`). Snapshot
-  v5 has a five-bit player count, but the canonical browser deliberately
-  enforces the tested 16-player lobby bound; do not raise the per-lobby value
-  without changing and testing both protocol peers.
+- Generated grid-lobby capacity defaults to 16 players
+  (`SNEK_MAX_PLAYERS_PER_LOBBY`). Snapshot v5 has a five-bit player count, but
+  the canonical browser deliberately enforces the tested 16-player grid bound.
+  IO uses its separate 100-player protocol bound.
 - A lobby retains at most 16 post-death spectator identities. A seventeenth
   eviction removes the oldest spectator membership but does not close that
-  socket or prevent it from joining again. Together with 16 active players,
-  this makes the 32-color live identity palette sufficient without reuse. The
-  process-wide retained-identity cap may reject new membership before these
-  per-lobby limits are reached.
+  socket or prevent it from joining again. The process-wide retained-identity
+  cap may reject new membership before these per-lobby limits are reached.
 - Passwordless lobbies are automatically advertised to Quick Join until their
   active-snake count reaches the selected lobby capacity. Retained game-over
   chat spectators do not make a lobby look full. Password-protected lobbies
   are always stored as unlisted. Legacy clients may still submit `publicTarget`
   0 or 2..32 explicitly, bounded by the selected capacity. The
-  permanent `12345` lobby is an open Arcade lobby advertised to 16 players.
+  permanent `12345` lobby is an open IO lobby advertised to 100 players. It
+  starts with 5–55 native opponents and periodically eases one opponent at a
+  time toward a new random target in that range. Bots yield full-lobby slots to
+  human joins and never consume the process-wide retained-identity limit.
 - Full-server rejection is `game_error: "Server is full, try again later"`.
 - Full-lobby rejection is `game_error: "This game is full"`.
 
@@ -179,15 +201,20 @@ chat:
   message:[u8; remaining_frame_bytes]  // validated single-line UTF-8
 ```
 
-The join frame is `[1,lobby_len,username_len,password_len,lobby,username,password]`
-and its length must be exactly `4 + lobby_bytes + username_bytes + password_bytes`.
+The original join frame is `[1,lobby_len,username_len,password_len,lobby,username,password]`.
+Current clients may append one appearance byte (`0...5`); omitting it preserves the
+original server-selected color behavior. The server validates the bounded index and
+publishes the resolved color in immutable roster identity metadata. Its length must
+therefore be exactly `4 + lobby_bytes + username_bytes + password_bytes`, plus one
+when the appearance byte is present.
 Lobby and username must be non-empty and are limited to 255 UTF-8 bytes;
 password is exact (not trimmed), may be empty, and is limited to 64 UTF-8 bytes.
-Input, visibility, and boost frames must be exactly two bytes. Directions are
+Input, visibility, and boost frames must be exactly two bytes. IO steer frames
+are packet type 6 plus one little-endian `u16` absolute angle quantum. Directions are
 absolute;
 the server rejects repeated/reversing turns and owns the two-turn queue. The
 visibility hint changes snapshot delivery cadence, never authoritative
-simulation. Boost is a held state, is effective only in Arcade, and is reset
+simulation. Boost is a held state, is effective in Arcade and IO, and is reset
 when player ownership ends. Unknown packet types/directions and WebSocket text
 messages from a client have no game effect.
 
@@ -217,8 +244,9 @@ Each event is one JSON array whose first element is the event name:
 
 The `r` roster is sent only when membership changes. Snapshot player rows use
 the same insertion order, eliminating per-tick ids, names, colors, keys, and
-object nesting. Every concurrently connected player receives a distinct roster
-color; chat renders the sender name in that same color, including while the
+object nesting. A player's selected six-look appearance resolves to its roster
+color and remains stable across roster and bot-population changes; old clients
+receive a random bounded look. Chat uses that roster color, including while the
 sender is a post-death spectator. Feed types include `join`, `death`, `golden`,
 `drop-incoming`, `drop-open`, feast, bounty, and streak events, with only the
 fields needed by that event.
@@ -236,7 +264,7 @@ header:
   sequence:u16
   kind_and_players:u8
     // bit 7: 0 keyframe, 1 dependent delta
-    // bits 0..4: player count (0..16)
+    // bits 0..4: player count (0..32)
     // bits 5..6: reserved and zero
 
 keyframe player, repeated player_count times:
@@ -310,6 +338,40 @@ state.
 Drops and remains have no identity allocation: the game and browser consume
 only position and TTL. Game TTLs are lower than the wire bound.
 
+### Server-to-client IO snapshot v2
+
+IO uses full independent frames so it never depends on grid deltas and hidden
+tabs can resume immediately. All multibyte fields are little-endian.
+
+```text
+magic:[u8;2] = "SI", version:u8 = 2, sequence:u16
+player_count:u8, food_count:u16, obstacle_alive_mask:u32
+
+repeat player_count times:
+  score:u32, mass:u16, body_count:u16, angle:u16, effect_flags:u8
+    // bit 0: boosting (held boost or lightning turbo)
+    // bit 1: rainbow shield active
+    // bits 2..7: reserved and zero
+  repeat body_count times: x:u16, y:u16
+
+repeat food_count times:
+  stable_slot:u16, x:u16, y:u16, food_kind:u8
+```
+
+Coordinates are in `0..8191`; bodies are capped at 1,000 samples, food at
+8,192 slots, and active players at 100. The low 27 obstacle-mask bits correspond
+exactly to the immutable landmark table; high bits are invalid. Food kinds 1..10
+cover corpse/ambient pellets and eight illustrated pickups. One immutable frame
+is built per lobby publication and shared by every recipient. The roughly
+1.9 MiB fixed simulation is allocated only when the first player joins a
+generated IO lobby; the permanent populated IO lobby initializes it at startup.
+Empty generated lobby records remain cheap. Its native population is one
+optional 226-byte fixed metadata allocation: names/colors are static table
+indexes, bodies reuse simulation slots, and steering, collision, corpse drops,
+and immediate respawn allocate nothing during play. Generated/private lobbies
+remain bot-free. Per-lobby obstacle state is one mask plus 27 bounded cooldown
+counters and does not allocate during play.
+
 ## Tick order
 
 For each lobby, under its ownership lock:
@@ -367,7 +429,7 @@ kill resets the streak to one.
   100 messages retained during that browser session. Escape returns to the
   fading presentation. Keyboard game controls do not fire while the input has
   focus. Chat remains available on the Game Over/replay state.
-- Sender names use their distinct roster colors. Message text is inserted as
+- Sender names use their roster colors. Message text is inserted as
   text, never interpreted as HTML.
 - The pre-join dialog presents one canonical invite URL derived from the
   current origin and encoded lobby id. Share prefers the Web Share API and
@@ -385,7 +447,7 @@ kill resets the streak to one.
 - `GET /game.html`: `302 /` (lobby gate)
 - `GET` or `HEAD /status`: public, cache-disabled
   `application/json; charset=utf-8` containing
-  `{"players":<active-snakes>,"lobbies":<retained-lobbies>}`. The landing
+  `{"players":<visible-humans-plus-native-bots>,"lobbies":<retained-lobbies>}`. The landing
   header requests it with `no-store` every 15 seconds while visible, announces
   loading/retry states, and preserves the last valid totals across failures.
 - `POST /quickjoin`: choose an eligible passwordless listed lobby and return
@@ -394,7 +456,7 @@ kill resets the streak to one.
   and the final binary WebSocket join rechecks the lobby and the global retained
   identity cap.
 - `POST /generateid`: URL-encoded optional `password` and required `mode` value
-  `classical` or `arcade`; create the immutable-mode lobby and
+  `classical`, `arcade`, or `snek_io`; create the immutable-mode lobby and
   return `303 /game/<id>`. Without a `publicTarget`, passwordless lobbies are
   listed through their selected capacity and passworded lobbies are unlisted.
   The legacy `publicTarget` field remains accepted as 0 or 2..32. The legacy
@@ -407,8 +469,9 @@ kill resets the streak to one.
 - `/css/*`, `/js/*`, and `/img/*`: compile-time embedded
   canonical client assets
 - `GET /debug/stats`: available only with `SNEK_DEBUG=1`; includes RSS,
-  connections, players, worker packing, network/frame counters, input timing,
-  and per-lobby tick/serialization/wire statistics
+  connections, real active `totalPlayers`, native `bots`, combined
+  `visiblePlayers`, worker packing, network/frame counters, input timing, and
+  per-lobby tick/serialization/wire statistics
 
 Responses include `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
 and `Referrer-Policy: no-referrer`, and do not expose an `x-powered-by` header.

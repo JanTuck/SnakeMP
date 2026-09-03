@@ -16,9 +16,10 @@ docs/         protocol specification and measured performance history
 ```
 
 One edge-triggered epoll reactor owns connections and HTTP/WebSocket I/O. Game
-workers are created only when a lobby gains a player and process up to 128
-active lobbies each by default. At 12,000 players in 750 lobbies this is six game
-workers, not 750 threads.
+workers process up to 128 active lobbies each by default. The permanent IO room
+owns one worker from startup for its native population; generated rooms acquire
+one only when they gain a player. At 12,000 players in 750 lobbies this is six
+game workers, not 750 threads.
 
 The hot path no longer uses Socket.IO, Engine.IO, or JSON snapshots. Browser
 inputs use five small, bounds-checked binary packet types and each 15 Hz world
@@ -26,22 +27,33 @@ update is a bounds-checked binary snapshot. JSON is reserved for infrequent
 control events such as initialization, roster changes, errors, the activity
 feed, and chat.
 
-Lobby creators choose one immutable ruleset. **Classical** is apples-only;
-**Arcade** keeps the golden-apple and supply-drop game and adds length-funded
-boost, collectible remains, feasts, leader bounties, kill streaks, danger
-cues, and a short wreckage focus.
+Lobby creators choose one of exactly three immutable rulesets. **Classical**
+is apples-only. **Arcade** is the former Arcade v2 ruleset: golden apples,
+supply drops, length-funded boost, collectible remains, feasts, leader
+bounties, kill streaks, danger cues, and a short wreckage focus. **IO** is a
+continuous 8192 x 8192 wrapping battle arena with pointer/touch steering,
+mass-funded boost, mass-scaled width, thousands of pellets, illustrated party
+pickups, smashable hazards, corpse food, camera follow, and up to 100 players.
+The permanent `12345` room is IO and carries a slowly fluctuating population of
+5–55 in-process opponents. They use the same fixed simulation slots as people,
+never open sockets, and yield seats to real joins.
 
-Chat uses each player's roster color. Unfocused play shows a Minecraft-like
+The shared join screen offers six persisted snake looks. One optional bounded
+join byte selects the look; the server resolves it to roster color, keeping the
+same appearance through reconnects and bot/roster reordering without unbounded
+state. Chat uses each player's roster color. Unfocused play shows a Minecraft-like
 bottom-left stream that fades away without an opaque chat panel; focusing the
 input reveals the latest 100 messages of scrollable session history. The idle
 stream shows at most five messages. An eliminated player remains a lobby
 spectator and may keep chatting until retry or disconnect.
 
-The authoritative playfield is 2048 x 1152 logical pixels: 128 x 72 square
+Classical and Arcade use a 2048 x 1152 logical playfield: 128 x 72 square
 cells at 16 pixels per cell. Its exact 16:9 shape maps directly to 720p,
 1080p, and 1440p displays. The browser preserves the legacy full-viewport
 presentation at other window shapes, so every visible edge remains the real
 collision boundary rather than a decorative extension or hidden crop.
+IO uses a separate continuous world and binary snapshot format so its large
+map, smooth movement, and 100-player bodies do not weaken the grid modes.
 
 ## Build and run
 
@@ -106,6 +118,8 @@ Useful runtime overrides are:
 - `SNEK_MAX_PLAYERS` for retained lobby identities: active players plus
   game-over chat members (default `100`)
 - `SNEK_MAX_PLAYERS_PER_LOBBY` (default and supported browser value `16`)
+- `SNEK_IO_MAX_PLAYERS_PER_LOBBY` (default `100`)
+- `SNEK_IO_FOOD_TARGET` / `SNEK_IO_MAX_FOOD` (defaults `5000` / `8000`)
 - `SNEK_MAX_LOBBIES` (default `4096`, including the permanent default lobby)
 - `SNEK_LOBBIES_PER_WORKER` (default `128`)
 - `SNEK_LOBBY_IDLE_MS` (default `1800000`, keeping an empty waiting room alive for 30 minutes)
@@ -129,7 +143,8 @@ same link; Copy falls back from the Clipboard API to legacy copy and finally a
 selected URL for manual copying. Lobby passwords are deliberately shared
 separately and never placed in the invite URL.
 
-The landing header reads `GET /status` for live active-player and lobby totals.
+The landing header reads `GET /status` for visible human-plus-native-bot and
+lobby totals.
 The cache-disabled JSON is refreshed every 15 seconds; the compact counters
 show loading, retrying, and last-known states instead of replacing a good value
 with an error.
@@ -144,12 +159,41 @@ npm install
 npm run check
 npm run parity
 npm run test:memory
+npm run test:universe-memory
 npm run test:lobbies
 npm run bench:http-pipeline
 npm run bench:lobby-reap
 npm run bench:player-container
 node benchmarks/wire-format-bench.js
 ```
+
+`npm run check` includes a real Chromium layout regression across desktop,
+tablet, narrow mobile, and landscape-phone viewports. It fails on horizontal
+page overflow, headings or action labels escaping their boxes, clipped mode
+cards, cropped mode artwork, gameplay HUD/chat/overlay overflow, or a join
+screen snake facing away from its action. It also samples compositor frame
+pacing; the render-loop unit test separately guards against duplicate animation
+loops and repeated steady-frame layout reads. Install Chromium once with
+`npx playwright-core install chromium`, or point `SNEK_CHROMIUM` at an existing
+Chromium executable.
+
+`npm run test:universe-memory` accelerates a 1,000,000-second virtual timeline
+through 12,000 cumulative real WebSocket user lifecycles. Each user upgrades,
+joins the authoritative IO arena, receives a snapshot, sends steering and boost
+input, and disconnects. Concurrency stays within the 100-player arena limit;
+the report never mislabels cumulative users as simultaneous players. The audit
+reports actual server-process RSS from `/debug/stats` separately from the Node
+load generator, warms first-use pages before its baseline, verifies player,
+connection, and lobby cleanup, and writes full evidence to
+`.scratch/universe-memory-test.json`.
+
+The native IO population adds exactly 226 bytes of bot metadata to the default
+lobby (plus the 8-byte nullable pointer already present in each lobby). Names,
+colors, decisions, collisions, corpse drops, and respawns reuse static tables
+and the existing fixed Snek simulation, with no per-bot connection/process and
+no per-tick allocation. `/debug/stats` keeps `totalPlayers` as real active
+WebSocket players for capacity and memory-test compatibility, and exposes
+`bots` plus `visiblePlayers` alongside it.
 
 The raw protocol, worker ownership rules, HTTP routes, and safety bounds are in
 [`docs/SPEC.md`](docs/SPEC.md). The 12,000-player scaling run, accelerated

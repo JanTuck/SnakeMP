@@ -8,7 +8,7 @@
     "build:zig": "bash servers/zig/build-assets.sh && cd servers/zig && ${ZIG_BIN:-zig} build-exe -O ReleaseFast -fstrip src/main.zig -femit-bin=snek-zig --cache-dir .zig-cache --global-cache-dir .zig-global-cache",
     "format": "zig fmt servers/zig/src/*.zig",
     "test": "npm run check",
-    "check": "npm run check:zig && npm run test:transport && npm run test:join-recovery && npm run test:chat && npm run test:auth-interaction && npm run test:discovery-share && npm run test:status && npm run test:snapshot && npm run test:input && npm run test:motion && npm run test:remote-motion && npm run test:render-loop && npm run test:client-assets && npm run test:docker-contract",
+    "check": "npm run check:zig && npm run test:transport && npm run test:join-recovery && npm run test:chat && npm run test:auth-interaction && npm run test:discovery-share && npm run test:status && npm run test:frontend-layout && npm run test:snapshot && npm run test:io-snapshot && npm run test:input && npm run test:motion && npm run test:remote-motion && npm run test:render-loop && npm run test:client-assets && npm run test:docker-contract",
     "check:zig": "bash servers/zig/build-assets.sh && cd servers/zig && ${ZIG_BIN:-zig} fmt --check src/*.zig && ${ZIG_BIN:-zig} test src/main.zig --cache-dir .zig-cache --global-cache-dir .zig-global-cache",
     "test:transport": "node benchmarks/transport-test.js",
     "test:join-recovery": "node benchmarks/join-recovery-test.js",
@@ -16,8 +16,10 @@
     "test:auth-interaction": "node benchmarks/auth-interaction-test.js",
     "test:discovery-share": "node benchmarks/discovery-share-test.js",
     "test:status": "node benchmarks/status-test.js",
+    "test:frontend-layout": "node benchmarks/frontend-layout-test.js",
     "test:discovery-integration": "npm run build:zig && node benchmarks/discovery-integration-test.js",
     "test:snapshot": "node benchmarks/snapshot-test.js",
+    "test:io-snapshot": "node benchmarks/io-snapshot-test.js",
     "test:input": "node benchmarks/input-test.js",
     "test:motion": "node benchmarks/motion-test.js",
     "test:remote-motion": "node benchmarks/remote-motion-test.js",
@@ -26,6 +28,7 @@
     "test:docker-contract": "bash -n docker-runtime.sh start-docker.sh refresh-docker.sh tests/refresh-docker-test.sh tests/support/mock-docker.sh && node benchmarks/docker-contract-test.js && bash tests/refresh-docker-test.sh",
     "test:memory": "npm run build:zig && node benchmarks/run-memory-ramp.js",
     "test:lifecycle": "npm run build:zig && node benchmarks/run-memory-lifecycle-audit.js",
+    "test:universe-memory": "npm run build:zig && node benchmarks/run-universe-memory-test.js",
     "test:lobbies": "npm run build:zig && node benchmarks/run-lobby-resource-audit.js",
     "parity": "npm run build:zig && bash benchmarks/run-parity.sh",
     "benchmark:build": "node benchmarks/build-release.js",
@@ -38,5 +41,8 @@
   },
   "dependencies": {
     "ws": "~7.4.2"
+  },
+  "devDependencies": {
+    "playwright-core": "1.62.1"
   }
 }
