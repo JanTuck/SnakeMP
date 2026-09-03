@@ -14,8 +14,8 @@
     <div class="popup" role="dialog" aria-modal="true" aria-labelledby="join_title" aria-describedby="join_context">
         <section class="popup_content">
             <div class="popup-heading">
-                <h1 id="join_title">Enter the arena</h1>
-                <p id="join_context">Lobby <strong id="lobby_ref">12345</strong> is ready. Choose how you appear to the other players.</p>
+                <h1 id="join_title"><span>Enter the</span><span>Arena</span></h1>
+                <p id="join_context" class="lobby-ready">Lobby <strong id="lobby_ref">12345</strong> is ready.</p>
             </div>
             <section class="invite-panel" aria-labelledby="invite_title">
                 <div class="invite-heading">
@@ -45,15 +45,57 @@
                            autocomplete="nickname" spellcheck="false">
                 </div>
                 <div class="field">
-                    <label for="lobby_password">Lobby password <span>Optional</span></label>
-                    <input id="lobby_password" name="lobby_password" type="password"
-                           placeholder="Leave blank for open lobbies" maxlength="64"
-                           autocomplete="current-password">
+                    <label for="lobby_password">Password <span>Optional</span></label>
+                    <div class="join-password-wrap">
+                        <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+                        <input id="lobby_password" name="lobby_password" type="password"
+                               placeholder="Leave blank for open lobbies" maxlength="64"
+                               autocomplete="current-password">
+                        <button id="toggle_lobby_password" type="button" aria-label="Show password" aria-pressed="false">
+                            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
+                        </button>
+                    </div>
                 </div>
+                <fieldset class="skin-field">
+                    <legend>Choose your Snek <span>Six looks</span></legend>
+                    <div class="skin-picker">
+                        <label class="skin-choice" style="--skin-color:#51cf66" title="Leaf green">
+                            <input type="radio" name="snake_style" value="0" aria-label="Leaf green" checked>
+                            <span class="skin-snake" aria-hidden="true"><i></i><i></i><i></i></span>
+                        </label>
+                        <label class="skin-choice" style="--skin-color:#ff6b6b" title="Berry red">
+                            <input type="radio" name="snake_style" value="1" aria-label="Berry red">
+                            <span class="skin-snake" aria-hidden="true"><i></i><i></i><i></i></span>
+                        </label>
+                        <label class="skin-choice skin-style-sun" style="--skin-color:#fcc419" title="Sun yellow">
+                            <input type="radio" name="snake_style" value="2" aria-label="Sun yellow">
+                            <span class="skin-snake" aria-hidden="true"><i></i><i></i><i></i></span>
+                        </label>
+                        <label class="skin-choice" style="--skin-color:#339af0" title="River blue">
+                            <input type="radio" name="snake_style" value="3" aria-label="River blue">
+                            <span class="skin-snake" aria-hidden="true"><i></i><i></i><i></i></span>
+                        </label>
+                        <label class="skin-choice skin-style-grape" style="--skin-color:#845ef7" title="Grape purple">
+                            <input type="radio" name="snake_style" value="4" aria-label="Grape purple">
+                            <span class="skin-snake" aria-hidden="true"><i></i><i></i><i></i></span>
+                        </label>
+                        <label class="skin-choice skin-style-cow" style="--skin-color:#f6e6c7" title="Cow spots">
+                            <input type="radio" name="snake_style" value="5" aria-label="Cow spots">
+                            <span class="skin-snake" aria-hidden="true"><i></i><i></i><i></i></span>
+                        </label>
+                    </div>
+                </fieldset>
                 <button type="submit" class="btn"><span>Join lobby</span><span aria-hidden="true">&rarr;</span></button>
                 <p id="join_status" class="join-status" role="status" aria-live="polite"></p>
             </form>
-            <p class="popup-footnote">Arrow keys or WASD to steer. Space activates your boost.</p>
+            <form method="post" action="/quickjoin" class="popup-quick-form">
+                <button type="submit">
+                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z"/></svg>
+                    <span>Find an open game</span>
+                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 12h15M13 6l6 6-6 6"/></svg>
+                </button>
+            </form>
+            <p class="popup-footnote"><strong>Grid:</strong> WASD or arrows &middot; <strong>IO:</strong> point or touch &middot; Space or Boost surges</p>
         </section>
     </div>
 </div>
@@ -61,6 +103,9 @@
 </canvas>
 <div id="nameplates" aria-hidden="true"></div>
 <aside id="hud" aria-label="Game status"></aside>
+<button id="io_boost" class="io-boost" type="button" aria-label="Hold to boost" aria-pressed="false" hidden>
+    <span>Boost</span><small>Hold</small>
+</button>
 <section id="game_chat" class="game-chat" aria-label="Lobby chat" hidden>
     <div id="chat_history" class="chat-history" role="log" aria-live="polite"
          aria-relevant="additions" aria-label="Chat history"></div>
@@ -91,12 +136,42 @@
     const joinForm = document.getElementById('join_form');
     const joinButton = joinForm.querySelector('button[type="submit"]');
     const joinStatus = document.getElementById('join_status');
+    const passwordToggle = document.getElementById('toggle_lobby_password');
     let savedUsername = null;
     let savedPassword = '';
+    let savedStyle = null;
     let hasJoined = false;
     let joinPending = false;
     let joinTimeout = 0;
     const JOIN_TIMEOUT_MS = 5000;
+    if (domPassword != null && passwordToggle != null) {
+        passwordToggle.addEventListener('click', () => {
+            const showing = domPassword.type === 'text';
+            domPassword.type = showing ? 'password' : 'text';
+            passwordToggle.setAttribute('aria-pressed', showing ? 'false' : 'true');
+            passwordToggle.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+            domPassword.focus();
+        });
+    }
+    const styleInputs = typeof document.querySelectorAll === 'function'
+        ? Array.from(document.querySelectorAll('input[name="snake_style"]'))
+        : [];
+    if (styleInputs.length > 0) {
+        let initialStyle = null;
+        try {
+            const storedValue = localStorage.getItem('snek:snake-style');
+            const stored = Number(storedValue);
+            if (storedValue !== null && Number.isInteger(stored) && stored >= 0 && stored < styleInputs.length) initialStyle = stored;
+        } catch (e) { /* storage unavailable; choose a fresh style below */ }
+        if (initialStyle === null) initialStyle = Math.floor(Math.random() * styleInputs.length);
+        for (const input of styleInputs) {
+            input.checked = Number(input.value) === initialStyle;
+            input.addEventListener('change', () => {
+                if (!input.checked) return;
+                try { localStorage.setItem('snek:snake-style', input.value); } catch (e) { /* optional preference */ }
+            });
+        }
+    }
     try {
         savedUsername = localStorage.getItem("snake_username");
         if (savedUsername !== null) {
@@ -154,6 +229,18 @@
         }, JOIN_TIMEOUT_MS);
     }
 
+    function selectedStyle() {
+        const input = styleInputs.find((candidate) => candidate.checked);
+        if (input === undefined) return null;
+        const value = Number(input.value);
+        return Number.isInteger(value) && value >= 0 && value < 6 ? value : null;
+    }
+
+    function emitJoin(username, password, style) {
+        if (style === null) socket.emit('clientReady', username, LOBBY_ID, password);
+        else socket.emit('clientReady', username, LOBBY_ID, password, style);
+    }
+
     joinForm.addEventListener('submit', (event) => {
         event.preventDefault(); // Stay on the page; the form must not reload it.
         if (joinPending) return;
@@ -180,12 +267,14 @@
         }
         savedUsername = username;
         savedPassword = password;
+        savedStyle = selectedStyle();
         hasJoined = true;
         setJoinPending(true, 'Joining lobby…');
         armJoinTimeout();
-        socket.emit('clientReady', username, LOBBY_ID, password);
+        emitJoin(username, password, savedStyle);
         try {
             localStorage.setItem("snake_username", username);
+            if (savedStyle !== null) localStorage.setItem('snek:snake-style', String(savedStyle));
         } catch (e) { /* storage unavailable */ }
         try {
             sessionStorage.setItem(`snek:lobby-password:${LOBBY_ID}`, password);
@@ -198,7 +287,7 @@
         if (hasJoined && savedUsername !== null) {
             setJoinPending(true, 'Reconnecting…');
             armJoinTimeout();
-            socket.emit('clientReady', savedUsername, LOBBY_ID, savedPassword);
+            emitJoin(savedUsername, savedPassword, savedStyle);
         }
     });
     socket.on('init', () => setJoinPending(false));
