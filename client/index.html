@@ -2,13 +2,21 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <meta name="theme-color" content="#11151d">
     <title>Snek — Multiplayer snake</title>
     <link rel="icon" href="/img/snek.png">
     <link rel="stylesheet" href="/css/index.css?v=__SNEK_ASSET_REV__">
 </head>
 <body>
+    <!--
+    THESIS: Snek is a physical arcade cabinet and illustrated arena, not a generic game launcher.
+    OWN-WORLD: Charcoal, cream, leaf, tomato and gold; clipped cabinet edges, chunky illustrated controls, Montserrat Black display type.
+    STORY: See the room, choose the fastest way in, then join or build an arena without leaving the cabinet.
+    FIRST VIEWPORT: Arena artwork owns the left; one tall cabinet owns the right; Quick Join is the first and strongest action.
+    FORM: Reference-led split arcade cabinet, seed snek-arcade-room.
+    FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, DESIGN.md, and every shipping raster carrying its provenance
+    -->
     <a class="skip-link" href="#play">Skip to game controls</a>
 
     <header class="site-header">
@@ -26,145 +34,172 @@
     </header>
 
     <main class="landing">
-        <section class="arena-intro" aria-labelledby="page-title">
-            <div class="intro-copy">
-                <h1 id="page-title">Outmove<br>the room.</h1>
-                <p>Fast multiplayer snake. Open a lobby, send the link, and make every turn count.</p>
-            </div>
-
-            <div class="arena-window" aria-label="A Snek game board with apples and a supply crate" role="img">
-                <div class="arena-bar" aria-hidden="true">
-                    <span>Live arena</span>
-                    <span class="arena-readout">128 × 72</span>
-                </div>
-                <div class="board-preview" aria-hidden="true">
-                    <span class="snake-cell snake-head"></span>
-                    <span class="snake-cell snake-2"></span>
-                    <span class="snake-cell snake-3"></span>
-                    <span class="snake-cell snake-4"></span>
-                    <span class="snake-cell snake-5"></span>
-                    <span class="snake-cell snake-6"></span>
-                    <img class="pickup pickup-apple" src="/img/apple.png" alt="" width="72" height="72">
-                    <img class="pickup pickup-crate" src="/img/crate.png" alt="" width="72" height="72">
-                    <img class="pickup pickup-golden" src="/img/golden.png" alt="" width="72" height="72">
-                </div>
-            </div>
-
-            <ul class="game-notes" aria-label="Game highlights">
-                <li><strong>Instant</strong><span>No account needed</span></li>
-                <li><strong>Private</strong><span>Optional password</span></li>
-                <li><strong>Flexible</strong><span>Classical or powered-up</span></li>
-            </ul>
+        <section class="arena-stage" aria-label="Snek arena preview">
+            <img class="arena-art" src="/img/landing-arena.png" alt="Illustrated multiplayer Snek arena with green, red and gold snakes, apples and supply crates" width="900" height="748">
         </section>
 
-        <section class="play-console" id="play" aria-labelledby="play-title">
-            <header class="console-header">
-                <div>
-                    <h2 id="play-title">Enter the arena</h2>
-                    <p>Join an existing room or launch your own.</p>
-                </div>
-                <span class="console-mark" aria-hidden="true">Lobby control</span>
-            </header>
-
+        <section class="play-console" id="play" aria-label="Lobby controls">
             <p class="form-error" id="join_error" role="alert" hidden></p>
 
-            <form method="post" action="/quickjoin" class="quick-join-form">
-                <button class="button button-quick" type="submit">
-                    <span class="button-copy">
-                        <strong>Quick Join</strong>
-                        <small>Jump into an open lobby that still has room.</small>
-                    </span>
-                    <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><path d="M4 10h12M11 5l5 5-5 5"/></svg>
+            <section class="console-view console-menu" id="console_menu" data-console-view="menu">
+                <header class="console-title">
+                    <h1 id="page-title"><span>Outmove</span> the room.</h1>
+                    <p>Fast multiplayer snake. Open a lobby, send the link, and make every turn count.</p>
+                </header>
+                <div class="action-deck">
+                    <form method="post" action="/quickjoin" class="quick-join-form">
+                        <button class="cabinet-action action-quick" type="submit">
+                            <span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m9 6 9 6-9 6Z"/></svg></span>
+                            <span>Quick join</span>
+                            <svg class="action-arrow" aria-hidden="true" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>
+                        </button>
+                    </form>
+                    <button class="cabinet-action action-code" type="button" data-open-panel="join">
+                        <span class="action-icon action-hash" aria-hidden="true">#</span>
+                        <span>Join with code</span>
+                        <svg class="action-arrow" aria-hidden="true" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>
+                    </button>
+                    <button class="cabinet-action action-create" type="button" data-open-panel="create">
+                        <span class="action-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="8" cy="8" r="3"/><circle cx="16" cy="9" r="2.5"/><path d="M2.5 19c.7-4 2.5-6 5.5-6s4.8 2 5.5 6M13 14c3.8-1.4 7 .4 8 5"/></svg></span>
+                        <span>Create a lobby</span>
+                        <svg class="action-arrow" aria-hidden="true" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>
+                    </button>
+                </div>
+                <div class="cabinet-controls" aria-hidden="true">
+                    <span class="joystick"><i></i></span>
+                    <span class="cabinet-button cabinet-button-green"></span>
+                    <span class="cabinet-button cabinet-button-gold"></span>
+                    <span class="cabinet-button cabinet-button-red"></span>
+                    <span class="speaker"></span>
+                </div>
+            </section>
+
+            <section class="console-view join-panel" id="console_join" data-console-view="join" hidden>
+                <button class="panel-back" type="button" data-open-panel="menu">
+                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></svg>
+                    Back
                 </button>
-            </form>
-
-            <div class="console-divider console-divider-invite" aria-hidden="true"><span>or use an invite</span></div>
-
-            <form method="post" action="/joingame" class="console-form join-form">
-                <fieldset>
-                    <legend>Join a lobby</legend>
-                    <div class="form-row join-fields">
+                <header class="panel-title">
+                    <h2>Join the <span>arena</span></h2>
+                    <p>Enter a lobby code or paste the invite link.</p>
+                </header>
+                <form method="post" action="/joingame" class="console-form join-form">
+                    <fieldset>
+                        <legend class="visually-hidden">Join an existing lobby</legend>
                         <div class="field field-code">
-                            <label for="gameId">Lobby code or link</label>
-                            <input id="gameId" name="gameId" type="text" placeholder="12345" maxlength="128" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="next" required>
+                            <label for="gameId">Lobby code</label>
+                            <div class="code-input-wrap">
+                                <span aria-hidden="true">#</span>
+                                <input id="gameId" name="gameId" type="text" placeholder="84729" maxlength="128" autocomplete="off" autocapitalize="none" spellcheck="false" enterkeyhint="next" required>
+                            </div>
                         </div>
                         <div class="field">
                             <label for="joinPassword">Password <span>optional</span></label>
-                            <input id="joinPassword" name="password" type="password" maxlength="64" autocomplete="current-password" placeholder="If required" enterkeyhint="go">
+                            <div class="password-input-wrap">
+                                <svg aria-hidden="true" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>
+                                <input id="joinPassword" name="password" type="password" maxlength="64" autocomplete="current-password" placeholder="Enter password" enterkeyhint="go">
+                                <button id="toggle_join_password" type="button" aria-label="Show password" aria-pressed="false">
+                                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
+                                </button>
+                            </div>
                         </div>
-                    </div>
-                    <button class="button button-primary" type="submit">
-                        <span>Join lobby</span>
-                        <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><path d="m7 4 6 6-6 6"/></svg>
-                    </button>
-                </fieldset>
-            </form>
-
-            <div class="console-divider" aria-hidden="true"><span>or create</span></div>
-
-            <form method="post" action="/generateid" class="console-form create-form">
-                <fieldset>
-                    <legend>New lobby</legend>
-                    <div class="field">
-                        <label for="createPassword">Lobby password <span>optional</span></label>
-                        <input id="createPassword" name="password" type="password" maxlength="64" autocomplete="new-password" placeholder="Leave blank for open access" aria-describedby="createPassword_help">
-                        <small class="field-help" id="createPassword_help">Passwordless lobbies appear in Quick Join until full.</small>
-                    </div>
-
-                    <div class="room-settings">
-                        <div class="field">
-                            <label for="capacity">Arena size</label>
-                            <select id="capacity" name="capacity" aria-describedby="capacity_help">
-                                <option value="16" selected>16 players</option>
-                                <option value="32">32 players</option>
-                            </select>
-                            <small class="field-help" id="capacity_help">Maximum players.</small>
+                        <div class="join-snake" aria-hidden="true">
+                            <img src="/img/classic-green-tail.png" alt=""><i></i><i></i><i></i><img src="/img/classic-green-head.png" alt="">
                         </div>
-                        <div class="field">
-                            <label for="walls">Arena walls</label>
-                            <select id="walls" name="walls" aria-describedby="walls_help">
-                                <option value="solid" selected>Solid walls</option>
-                                <option value="wrap">Wraparound</option>
-                            </select>
-                            <small class="field-help" id="walls_help">Wrap crosses edges.</small>
-                        </div>
-                    </div>
-
-                    <fieldset class="mode-picker">
-                        <legend>Game mode</legend>
-                        <div class="mode-options">
-                            <label class="mode-option" for="mode_classical">
-                                <input id="mode_classical" name="mode" type="radio" value="classical"
-                                       aria-labelledby="mode_classical_label" aria-describedby="mode_classical_description">
-                                <span class="mode-surface">
-                                    <span class="mode-heading"><span id="mode_classical_label">Classical</span><span class="radio-mark" aria-hidden="true"></span></span>
-                                    <small id="mode_classical_description">Apples only. Pure snake rules.</small>
-                                </span>
-                            </label>
-                            <label class="mode-option" for="mode_arcade">
-                                <input id="mode_arcade" name="mode" type="radio" value="arcade"
-                                       aria-labelledby="mode_arcade_label" aria-describedby="mode_arcade_description" checked>
-                                <span class="mode-surface">
-                                    <span class="mode-heading"><span id="mode_arcade_label">Arcade</span><span class="radio-mark" aria-hidden="true"></span></span>
-                                    <small id="mode_arcade_description">Golden apples, boost, remains, bounties and feasts.</small>
-                                </span>
-                            </label>
-                        </div>
+                        <button class="join-submit" type="submit">
+                            <span>Join lobby</span>
+                            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 12h15M13 6l6 6-6 6"/></svg>
+                        </button>
                     </fieldset>
-
-                    <button class="button button-secondary" type="submit">
-                        <span>Create lobby</span>
-                        <svg aria-hidden="true" viewBox="0 0 20 20" width="20" height="20"><path d="M10 4v12M4 10h12"/></svg>
+                </form>
+                <form method="post" action="/quickjoin" class="find-game-form">
+                    <button type="submit">
+                        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z"/></svg>
+                        <span>Find an open game</span>
+                        <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m9 5 7 7-7 7"/></svg>
                     </button>
-                    <p class="form-note">You’ll get a shareable link immediately.</p>
-                </fieldset>
-            </form>
+                </form>
+            </section>
+
+            <section class="console-view create-panel" id="console_create" data-console-view="create" hidden>
+                <button class="panel-back" type="button" data-open-panel="menu">
+                    <svg aria-hidden="true" viewBox="0 0 24 24"><path d="m15 5-7 7 7 7"/></svg>
+                    Back
+                </button>
+                <header class="panel-title create-title">
+                    <h2>Build your <span>arena</span></h2>
+                    <p>Pick the rules, share the link, and bring the room.</p>
+                </header>
+                <form method="post" action="/generateid" class="console-form create-form">
+                    <fieldset>
+                        <legend class="visually-hidden">Create a new lobby</legend>
+                        <fieldset class="mode-picker">
+                            <legend>Game mode</legend>
+                            <div class="mode-options">
+                                <label class="mode-option" for="mode_classical">
+                                    <input id="mode_classical" name="mode" type="radio" value="classical" aria-labelledby="mode_classical_label" aria-describedby="mode_classical_description">
+                                    <span class="mode-surface">
+                                        <img class="mode-preview" src="/img/mode-classical.png" alt="" width="420" height="348">
+                                        <span class="mode-heading"><span id="mode_classical_label">Classical</span><span class="radio-mark" aria-hidden="true"></span></span>
+                                        <small id="mode_classical_description">Apples only. Pure grid snake.</small>
+                                    </span>
+                                </label>
+                                <label class="mode-option" for="mode_arcade">
+                                    <input id="mode_arcade" name="mode" type="radio" value="arcade" aria-labelledby="mode_arcade_label" aria-describedby="mode_arcade_description" checked>
+                                    <span class="mode-surface">
+                                        <img class="mode-preview" src="/img/mode-arcade.png" alt="" width="420" height="346">
+                                        <span class="mode-heading"><span id="mode_arcade_label">Arcade</span><span class="radio-mark" aria-hidden="true"></span></span>
+                                        <small id="mode_arcade_description">Boost, drops, bounties and feasts.</small>
+                                    </span>
+                                </label>
+                                <label class="mode-option" for="mode_io">
+                                    <input id="mode_io" name="mode" type="radio" value="snek_io" aria-labelledby="mode_io_label" aria-describedby="mode_io_description">
+                                    <span class="mode-surface">
+                                        <img class="mode-preview" src="/img/mode-io.png" alt="" width="420" height="311">
+                                        <span class="mode-heading"><span id="mode_io_label">IO</span><span class="radio-mark" aria-hidden="true"></span></span>
+                                        <small id="mode_io_description">Huge world, smooth steering, mass and battles.</small>
+                                    </span>
+                                </label>
+                            </div>
+                        </fieldset>
+                        <div class="room-settings">
+                            <div class="field">
+                                <label for="capacity">Players</label>
+                                <select id="capacity" name="capacity" aria-describedby="capacity_help">
+                                    <option value="16" selected>16 players</option>
+                                    <option value="32">32 players</option>
+                                    <option id="capacity_io" value="100" hidden>100 players</option>
+                                </select>
+                                <small class="field-help" id="capacity_help">Maximum players.</small>
+                            </div>
+                            <div class="field">
+                                <label for="walls">Walls</label>
+                                <select id="walls" name="walls" aria-describedby="walls_help">
+                                    <option value="solid" selected>Solid walls</option>
+                                    <option value="wrap">Wraparound</option>
+                                </select>
+                                <small class="field-help" id="walls_help">Wrap crosses edges.</small>
+                            </div>
+                        </div>
+                        <div class="field create-password-field">
+                            <label for="createPassword">Password <span>optional</span></label>
+                            <input id="createPassword" name="password" type="password" maxlength="64" autocomplete="new-password" placeholder="Leave blank for open access" aria-describedby="createPassword_help">
+                            <small class="field-help" id="createPassword_help">Passwordless lobbies appear in Quick Join until full.</small>
+                        </div>
+                        <button class="create-submit" type="submit">
+                            <span>Create lobby</span>
+                            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 4v16M4 12h16"/></svg>
+                        </button>
+                    </fieldset>
+                </form>
+            </section>
         </section>
     </main>
 
-    <footer class="site-footer">
-        <span>Snek multiplayer</span>
-        <span>One link. One arena.</span>
+    <footer class="site-footer" aria-label="Game highlights">
+        <span><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m12 3 2.7 5.5 6.1.9-4.4 4.3 1 6.1-5.4-2.9-5.4 2.9 1-6.1-4.4-4.3 6.1-.9Z"/></svg>Easy to learn</span>
+        <span><svg aria-hidden="true" viewBox="0 0 24 24"><path d="m13 2-8 12h6l-1 8 9-13h-6Z"/></svg>Fast rounds</span>
+        <span><svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><circle cx="17" cy="9" r="2.5"/><path d="M3 20c.7-4.6 2.7-7 6-7s5.3 2.4 6 7M14 14c3.8-1.2 6.5.8 7 5"/></svg>Play together</span>
     </footer>
 
     <script>
@@ -187,7 +222,49 @@
             var createPassword = document.getElementById('createPassword');
             var joinSubmitting = false;
             var createSubmitting = false;
+            var capacity = document.getElementById('capacity');
+            var walls = document.getElementById('walls');
+            var capacityHelp = document.getElementById('capacity_help');
+            var wallsHelp = document.getElementById('walls_help');
+            var ioCapacity = document.getElementById('capacity_io');
+            var previousCapacity = '16';
+            var previousWalls = 'solid';
             var handoffPrefix = 'snek-password-handoff:';
+
+            function setupConsolePanels() {
+                if (!document.getElementById('console_menu')) return;
+                var views = Array.from(document.querySelectorAll('[data-console-view]'));
+                var triggers = Array.from(document.querySelectorAll('[data-open-panel]'));
+                var passwordToggle = document.getElementById('toggle_join_password');
+
+                function openPanel(name) {
+                    views.forEach(function (view) {
+                        view.hidden = view.dataset.consoleView !== name;
+                    });
+                    var target = document.querySelector('[data-console-view="' + name + '"]');
+                    if (!target) return;
+                    var focusTarget = target.querySelector('input, button');
+                    if (focusTarget) focusTarget.focus({ preventScroll: true });
+                }
+
+                triggers.forEach(function (trigger) {
+                    trigger.addEventListener('click', function () {
+                        openPanel(trigger.dataset.openPanel);
+                    });
+                });
+
+                if (passwordToggle) {
+                    passwordToggle.addEventListener('click', function () {
+                        var revealing = joinPassword.type === 'password';
+                        joinPassword.type = revealing ? 'text' : 'password';
+                        passwordToggle.setAttribute('aria-pressed', revealing ? 'true' : 'false');
+                        passwordToggle.setAttribute('aria-label', revealing ? 'Hide password' : 'Show password');
+                        joinPassword.focus({ preventScroll: true });
+                    });
+                }
+
+                if (error === 'unknown-game') openPanel('join');
+            }
 
             function passwordFits(input) {
                 var valid = new TextEncoder().encode(input.value).length <= 64;
@@ -226,6 +303,34 @@
                 if (normalized) gameId.value = normalized;
             });
 
+            function syncModeSettings() {
+                var io = document.getElementById('mode_io').checked;
+                if (io) {
+                    if (capacity.value !== '100') previousCapacity = capacity.value;
+                    previousWalls = walls.value;
+                    ioCapacity.hidden = false;
+                    capacity.value = '100';
+                    walls.value = 'wrap';
+                    capacity.disabled = true;
+                    walls.disabled = true;
+                    capacityHelp.textContent = 'IO arenas support up to 100 players.';
+                    wallsHelp.textContent = 'The continuous world always wraps.';
+                } else {
+                    ioCapacity.hidden = true;
+                    if (capacity.value === '100') capacity.value = previousCapacity;
+                    walls.value = previousWalls;
+                    capacity.disabled = false;
+                    walls.disabled = false;
+                    capacityHelp.textContent = 'Maximum players.';
+                    wallsHelp.textContent = 'Wrap crosses edges.';
+                }
+            }
+            document.querySelectorAll('input[name="mode"]').forEach(function (input) {
+                input.addEventListener('change', syncModeSettings);
+            });
+            syncModeSettings();
+            setupConsolePanels();
+
             joinForm.addEventListener('submit', function (event) {
                 if (joinSubmitting) {
                     event.preventDefault();
@@ -252,6 +357,10 @@
                     event.preventDefault();
                     return;
                 }
+                // Disabled selects communicate fixed IO settings in the UI;
+                // enable them for native form serialization at submit time.
+                capacity.disabled = false;
+                walls.disabled = false;
                 rememberPassword('snek:create-password', createPassword.value,
                     { kind: 'create', password: createPassword.value });
                 createSubmitting = true;
